@@ -107,6 +107,28 @@ export const DCFG={
  *  heavy    — flying-wing UCAV: heavy one-way hit
  *  intercept — PATRIOT-drone: orbits and fires interceptors at incoming missiles */
 
+export const TCFG={
+ /* ── TANK DIVISIONS (TASK-302 — WW2 German low-poly pack) ──
+ * Each purchase = ONE DIVISION (a formation of `tanks` vehicles sharing
+ * an hp pool; vehicles visually knock out as hp drops).
+ * speed  : km per frame (light 1.9 ≈ 114 km/s game-time — slower than ships)
+ * gunDmg : per shot vs enemy armor (structures × structMul, troops × troopMul×12)
+ * armor  : flat damage reduction fraction on everything incoming
+ * engageR: target acquisition radius (km) — gunRange is the firing envelope */
+ light:  {name:'فرقة استطلاع',  key:'light',  icon:'🛻', cost:300, cap:6, hp:360,
+          speed:1.9, gunDmg:34,  gunRange:110, fireRate:150, engageR:340, sightR:520,
+          armor:0.15, structMul:0.8, troopMul:2.2, tanks:5, scale:0.9, lenM:4.5,
+          tip:'ليختتراكتور — سريعة رخيصة تكشف الطرق وتستولي على الممرات وتأكل المشاة'},
+ medium: {name:'فرقة قتال',    key:'medium', icon:'🚙', cost:450, cap:5, hp:640,
+          speed:1.4, gunDmg:60,  gunRange:150, fireRate:190, engageR:400, sightR:460,
+          armor:0.30, structMul:1.4, troopMul:1.4, tanks:4, scale:1.0, lenM:5.9,
+          tip:'Pz-III — العمود الفقري: متوازنة تسحق المباني وتصلح للجبهات كلها'},
+ heavy:  {name:'فرقة اختراق',  key:'heavy',  icon:'🐘', cost:700, cap:3, hp:1100,
+          speed:1.0, gunDmg:105, gunRange:180, fireRate:240, engageR:430, sightR:420,
+          armor:0.50, structMul:2.0, troopMul:1.0, tanks:3, scale:1.1, lenM:6.3,
+          tip:'Tiger — بطيئة ومدرعة بشدة: تحطم التحصينات وتشق جبهة العدو وحدها'},
+};
+
 export const GAME_CONSTANTS = {
   RESOURCE_TICK: 0.2,
   AI_TICK_RATE: 200,
@@ -281,6 +303,16 @@ export const GAME_CONSTANTS = {
   // ── Fleet behavior ──
   ESCORT_LEASH_KM: 240,             // escorts shadow their capital inside this radius
   NAVAL_MISSILE_DMG_MUL: 2.0,       // missile blasts hit ships at ×2 (anti-ship precision)
+  // ── TASK-302: Land units / tank divisions ──
+  TANK_CAP_TOTAL: 12,               // hard cap per owner across all divisions
+  TANK_CORRIDOR_R_KM: 22,           // spearhead paint radius while advancing (mode 1)
+  TANK_CORRIDOR_EVERY: 20,          // frames between spearhead paints
+  TANK_BATTLE_DEV_R: 45,            // devastation radius painted by ongoing tank battles
+  TANK_WRECK_DEV_R: 70,             // devastation radius when a division is destroyed
+  TANK_ALT: 0.8,                    // world units above the sphere (tracks on the ground)
+  TANK_AI_CAP: 4,                   // bot divisions per rival
+  TANK_MISSILE_DMG_MUL: 0.6,        // generic missile blasts vs armor (blast shrugs off)
+  TANK_PICK_R_KM: 70,               // click-select radius for divisions
   // ── TASK-301: Economy Depth ──
   // 1) WAR UPKEEP: standing armies above the free threshold drain gold/sec.
   //    Counts home troops + cohorts in the field. Makes booming vs fighting
@@ -436,6 +468,7 @@ export const SDEFS={
  base:      {name:'قاعدة رئيسية', w:52,h:28,hp:300,cost:0,    reload:0},
  nuke_plant:{name:'منشأة نووية',  w:58,h:46,hp:400,cost:3000, reload:14400},
   warship:  {name:'مدمرة حربية',   w:0,h:0, hp:1000,cost:800,   reload:0},  // mobile unit (hotbar V) — not a Structure
+  tank:     {name:'فرقة مدرعة',    w:0,h:0, hp:640, cost:450,   reload:0},  // mobile division (hotbar H) — priced per class in TCFG
 };
 
 export const ITEM_ICONS={
