@@ -1,6 +1,7 @@
 import { MCFG, MTAGS, PCFG, DCFG, TCFG, GAME_CONSTANTS, WORLD_CITIES, SDEFS, ITEM_ICONS, TECH_TREE, BOT_COUNTRIES, BOTS_MAX } from './data/constants.js';
 import { ConquestGrid, ConquestAttack, CONQUEST_CFG, registerOwner, clearRegisteredOwners, setBiomeFlatMode, setBiomeBandColor, getBiomeBandColor, getBiomeBands, attackLogic, attackTilesPerTickCtx } from './core/conquest.js';
 import { initNewUI, uiToast } from './ui.js';
+import { createWorldRender } from './world/render.js';   // TASK-406: world render layer
 window.GEO_DATA_ROADS = [];
 
 // ═══ CONQUEST SYSTEM (Mode 1 — OpenFront-style territory conquest) ═══
@@ -38,6 +39,7 @@ function buildConquestCtx() {
     // it are CAPTURED by the tile's new owner (level kept). Previously null — a
     // captured enemy port kept spawning enemy trade ships and paying enemy gold forever.
     onConquerCell: (cell, newOwnerStr) => {
+      WORLD_RENDER.onCellConquered(cell, newOwnerStr);   // TASK-406: capture-flash VFX
       if (!structs.length || !conquestGrid) return;
       for (let i = 0; i < structs.length; i++) {
         const s = structs[i];
@@ -3865,167 +3867,31 @@ function quantizeBiomePixel(r, g, b) {
 }
 
 // ── Territory overlay upload pipeline (PERFORMANCE) ──
-// The grid canvas is 7200×3600 (~104MB RGBA). Binding it directly as a
-// CanvasTexture meant a FULL 104MB GPU re-upload on every conquest flush
-// (10×/s during wars ≈ 1GB/s). Instead: blit (downscaled) into a small
-// 2048×1024 display canvas (8MB) and upload THAT, at most every 100ms.
-// Territory fills are flat colors — the 3.5× downscale is invisible, and
-// the crisp vector frontier lines still carry the borders.
-let _overlayCanvas = null, _overlayCtx = null;
-let _lastOverlayUpload = 0, _overlayDirty = false;
-const OVERLAY_TEX_W = 2048, OVERLAY_TEX_H = 1024;
-function _uploadTerritoryOverlay(gridCanvas, force) {
-    const now = performance.now();
-    if (!force && now - _lastOverlayUpload < 100) { _overlayDirty = true; return false; }  // ≤10 uploads/s
-    _overlayDirty = false;
-    _lastOverlayUpload = now;
-    if (!_overlayCanvas) {
-        _overlayCanvas = document.createElement('canvas');
-        _overlayCanvas.width = OVERLAY_TEX_W;
-        _overlayCanvas.height = OVERLAY_TEX_H;
-        _overlayCtx = _overlayCanvas.getContext('2d');
-        _overlayCtx.imageSmoothingEnabled = true;
-        window.__overlayCanvas = _overlayCanvas;   // debug/verification handle
-    }
-    // GPU-accelerated scaled blit of the full grid canvas (~1-2ms)
-    _overlayCtx.clearRect(0, 0, OVERLAY_TEX_W, OVERLAY_TEX_H);
-    _overlayCtx.drawImage(gridCanvas, 0, 0, OVERLAY_TEX_W, OVERLAY_TEX_H);
-    return true;
-}
+// ═══ TASK-406 — WORLD RENDER LAYER ═══
+// Everything that paints conquest state onto the globe now lives in
+// src/world/render.js: the territory overlay upload pipeline (downscaled
+// 2048×1024 canvas — a full 7200×3600 bind meant a ~104MB GPU re-upload per
+// conquest flush — now with SUB-RECT blits from the grid's shared dirty-region
+// queue), crisp vector frontier lines (150ms throttle), devastation scorch
+// layer, capture flashes, frontline heat glow and drone selection rings.
+// main.js keeps thin delegates below so every existing call site (and the
+// window.renderMode1Territory debug handle) is unchanged.
+const WORLD_RENDER = createWorldRender({
+    grid: () => conquestGrid,
+    scene: () => scene,
+    bots: () => bots,
+    R: () => EARTH_RADIUS,
+    latLonToVec3,
+    ownerHexColor,
+    hideTerritoryMesh: () => { if (territoryMesh) territoryMesh.visible = false; },
+});
 
-function renderMode1Territory() {
-    if (!conquestGrid || !scene) return;
-    const changed = conquestGrid.flushRender();
-
-    // ── Territory OVERLAY (transparent) ──
-    // The gridCanvas carries ONLY territory fills; water/neutral are transparent
-    // so the biome globe shows through. Bound to the DOWNSCALED display canvas.
-    const _gridCanvas = conquestGrid.getCanvas();
-    let repainted = false;
-    if (changed) repainted = _uploadTerritoryOverlay(_gridCanvas, false);
-    else if (_overlayDirty) repainted = _uploadTerritoryOverlay(_gridCanvas, false); // retry pending upload
-    const _texSource = _overlayCanvas || _gridCanvas;
-    if (!conquestTexture || conquestTexture.image !== _texSource) {
-        // REBIND whenever the underlying display canvas changed (e.g. a fresh grid
-        // after a failed-spawn retry) — previously the overlay kept pointing at
-        // the DEAD grid's canvas and territory stayed invisible for the session.
-        if (conquestTexture) conquestTexture.dispose();
-        _uploadTerritoryOverlay(_gridCanvas, true);   // forced initial paint
-        conquestTexture = new THREE.CanvasTexture(_texSource);
-        conquestTexture.wrapS = THREE.RepeatWrapping;
-        conquestTexture.wrapT = THREE.ClampToEdgeWrapping;
-        conquestTexture.colorSpace = THREE.SRGBColorSpace;
-        // Magnification = NearestFilter: hard pixel edges on territory fills (no
-        // green→transparent bleed into the biome). Minification Linear, no mipmaps.
-        conquestTexture.magFilter = THREE.NearestFilter;
-        conquestTexture.minFilter = THREE.LinearFilter;
-        conquestTexture.generateMipmaps = false;
-        repainted = true;
-    }
-    if (!conquestOverlayMesh) {
-        const overlayGeo = new THREE.SphereGeometry(EARTH_RADIUS + 2.0, 256, 128);
-        const overlayMat = new THREE.MeshBasicMaterial({
-            map: conquestTexture,
-            transparent: true,
-            depthWrite: false,   // never occlude structures/roads on the surface
-            side: THREE.FrontSide
-        });
-        conquestOverlayMesh = new THREE.Mesh(overlayGeo, overlayMat);
-        conquestOverlayMesh.renderOrder = 1;
-        scene.add(conquestOverlayMesh);
-
-        // Legacy country-fill overlay not needed in mode1.
-        if (territoryMesh) territoryMesh.visible = false;
-    } else if (conquestOverlayMesh.material.map !== conquestTexture) {
-        conquestOverlayMesh.material.map = conquestTexture;
-        conquestOverlayMesh.material.needsUpdate = true;
-    }
-
-    // Upload ONLY when the display canvas was actually repainted this call.
-    if (repainted && conquestTexture) conquestTexture.needsUpdate = true;
-
-    // Crisp VECTOR frontier lines — throttled to every 150ms (the rebuild
-    // reallocates the full segment geometry; at war-time flush rates it ran
-    // 10×/s over 50k+ border cells for visually identical output).
-    if (changed) {
-        const now = performance.now();
-        if (now - (renderMode1Territory._lastFL || 0) >= 150) {
-            renderMode1Territory._lastFL = now;
-            renderMode1Territory._flPending = false;
-            rebuildFrontierLines();
-        } else {
-            renderMode1Territory._flPending = true;
-        }
-    }
-    if (renderMode1Territory._flPending && performance.now() - (renderMode1Territory._lastFL || 0) >= 150) {
-        renderMode1Territory._lastFL = performance.now();
-        renderMode1Territory._flPending = false;
-        rebuildFrontierLines();
-    }
-}
+function renderMode1Territory() { WORLD_RENDER.tickTerritory(); }
 window.renderMode1Territory = renderMode1Territory;
 
-// ── Vector territory borders ──
-// Build/update a LineSegments mesh from the grid's frontier edges. These render as
-// crisp 1px geometry lines on the sphere (infinitely sharp when zooming, like the 3D
-// buildings) instead of soft texture cells. Rebuilt only when the grid reports a change.
-const _FRONTIER_DEG2RAD = Math.PI / 180;
-function rebuildFrontierLines() {
-    if (!conquestGrid || !scene) return;
-    const { segs, own } = conquestGrid.getFrontierEdges();
-    const n = own.length;
-    if (n === 0) { if (frontierLine) frontierLine.visible = false; return; }
-
-    const R = EARTH_RADIUS + 3.0; // sit just above the overlay (+2.0) so it never z-fights
-    const positions = new Float32Array(n * 6);
-    const colors = new Float32Array(n * 6);
-    const pCol = CONQUEST_CFG.COLOR.player, eCol = CONQUEST_CFG.COLOR.enemy;
-    const PLAYER = CONQUEST_CFG.PLAYER, ENEMY = CONQUEST_CFG.ENEMY;
-    for (let i = 0; i < n; i++) {
-        const lat1 = segs[i * 4], lon1 = segs[i * 4 + 1];
-        const lat2 = segs[i * 4 + 2], lon2 = segs[i * 4 + 3];
-        // Inline latLonToVec3 to avoid a per-vertex Vector3 allocation.
-        let phi = (90 - lat1) * _FRONTIER_DEG2RAD, th = (lon1 + 180) * _FRONTIER_DEG2RAD, sp = Math.sin(phi);
-        positions[i * 6]     = -(R * sp * Math.cos(th));
-        positions[i * 6 + 1] = R * Math.cos(phi);
-        positions[i * 6 + 2] = R * sp * Math.sin(th);
-        phi = (90 - lat2) * _FRONTIER_DEG2RAD; th = (lon2 + 180) * _FRONTIER_DEG2RAD; sp = Math.sin(phi);
-        positions[i * 6 + 3] = -(R * sp * Math.cos(th));
-        positions[i * 6 + 4] = R * Math.cos(phi);
-        positions[i * 6 + 5] = R * sp * Math.sin(th);
-        // Darkened owner colour → reads as a territory outline (OpenFront-style).
-        // Bots use their registered nation color (code 4+).
-        let cr, cg, cb;
-        if (own[i] === PLAYER) { cr = pCol[0]; cg = pCol[1]; cb = pCol[2]; }
-        else if (own[i] === ENEMY) { cr = eCol[0]; cg = eCol[1]; cb = eCol[2]; }
-        else {
-            const b = bots.find(bb => bb.code === own[i]);
-            if (b) { cr = b.colorRGB[0]; cg = b.colorRGB[1]; cb = b.colorRGB[2]; }
-            else { cr = 20; cg = 20; cb = 24; }
-        }
-        cr = (cr * 0.45) / 255; cg = (cg * 0.45) / 255; cb = (cb * 0.45) / 255;
-        colors[i * 6] = cr; colors[i * 6 + 1] = cg; colors[i * 6 + 2] = cb;
-        colors[i * 6 + 3] = cr; colors[i * 6 + 4] = cg; colors[i * 6 + 5] = cb;
-    }
-
-    if (!frontierLine) {
-        const geo = new THREE.BufferGeometry();
-        const mat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.95, depthWrite: false });
-        frontierLine = new THREE.LineSegments(geo, mat);
-        frontierLine.renderOrder = 2; // above the territory overlay (renderOrder 1)
-        scene.add(frontierLine);
-    }
-    // Dispose the OLD geometry entirely — GL buffers are NOT garbage-collected;
-    // only geometry.dispose() actually frees them (the old 'B5' fix nulled .array,
-    // which only released CPU memory and leaked 2 GPU buffers per rebuild ~10×/s).
-    frontierLine.geometry.dispose();
-    const _geo2 = new THREE.BufferGeometry();
-    _geo2.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    _geo2.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    frontierLine.geometry = _geo2;
-    frontierLine.geometry.computeBoundingSphere();
-    frontierLine.visible = true;
-}
+// ── Vector territory borders ── delegate to the world render layer (TASK-406);
+// identical geometry + owner colors, see src/world/render.js rebuildFrontierLines.
+function rebuildFrontierLines() { WORLD_RENDER.rebuildFrontierLines(); }
 
 // ════════════════════════════════════════════════════════════════════════
 //  UNIFIED TILE-PAINTED GLOBE
@@ -8684,10 +8550,8 @@ function fireSAMPlane(src, plane) {
 // ═══ STATE ═══
 let territoryCanvas, territoryCtx, territoryTexture, territoryMesh;
 let territoryProjection, territoryPath;
-// Dedicated conquest overlay (mode1): texture wraps conquest gridCanvas directly,
-// bypassing the legacy 4096 territoryCanvas copy that was producing a white globe.
-let conquestOverlayMesh, conquestTexture;
-let frontierLine = null;          // crisp vector territory-border LineSegments
+// Dedicated conquest overlay (mode1) + frontier lines: state lives in
+// WORLD_RENDER (src/world/render.js) since TASK-406 — no locals here anymore.
 let countryOwnership = {};   // ISO3 → 'neutral'|'player'|'enemy'
 let countryFeatures = {};    // ISO3 → GeoJSON feature
 let countryCityCount = {};   // ISO3 → {total, player, enemy}
@@ -10031,24 +9895,10 @@ function cleanupTerritory() {
         }
         territoryMesh = null;
     }
-    // Reset the conquest globe-texture so the next game rebinds a fresh texture
-    // (pointing at the new gridCanvas) to the newly created globe material.
-    if (conquestTexture) { conquestTexture.dispose(); conquestTexture = null; }
-    if (conquestOverlayMesh) {
-        scene.remove(conquestOverlayMesh);   // was only nulled — orphan mesh + GPU leak per restart
-        if (conquestOverlayMesh.geometry) conquestOverlayMesh.geometry.dispose();
-        if (conquestOverlayMesh.material) {
-            if (conquestOverlayMesh.material.map) conquestOverlayMesh.material.map.dispose();
-            conquestOverlayMesh.material.dispose();
-        }
-        conquestOverlayMesh = null;
-    }
-    if (frontierLine) {
-        scene.remove(frontierLine);
-        frontierLine.geometry.dispose();
-        frontierLine.material.dispose();
-        frontierLine = null;
-    }
+    // TASK-406: conquest overlay mesh/texture, frontier lines, devastation scorch,
+    // capture flashes, frontline heat + drone rings are ALL owned by the world
+    // render layer now — one reset call disposes everything (no orphan meshes).
+    WORLD_RENDER.reset();
     _disposeLineMesh(borderLinesMesh); borderLinesMesh = null;
     _disposeLineMesh(provinceBorderMesh); provinceBorderMesh = null;
     _disposeLineMesh(cityPointsMesh); cityPointsMesh = null;
@@ -13181,6 +13031,11 @@ function loop(now) {
     if (conquestGrid && conquestGrid.decayDevastation && frame % 2 === 0) {
         conquestGrid.decayDevastation(1600);
     }
+
+    // TASK-406: world-layer VFX upkeep — capture-flash aging, frontline heat
+    // pulse + drone selection rings (all safe no-ops before their meshes exist).
+    WORLD_RENDER.tickVfx(frame);
+    WORLD_RENDER.updateDroneRings(drones, frame);
 
     _applyKeyboardNavigation();
     _applyKeyboardZoom();

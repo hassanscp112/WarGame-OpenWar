@@ -26,6 +26,13 @@
 - **Task: AI-Context Bootstrap & Development Ledger Setup**
   - **Status**: Compiling `AI_BOOTSTRAP.md` and `DEVELOPMENT_LEDGER.md` in the workspace root.
   - **Progress**: Mapped codebase specifications, math pipelines, class specifications, and tasks.
+- **Task: TASK-406 — World Render Layer (feature/world-system)**
+  - **Status**: ✅ COMPLETE — ready-for-merge
+  - **What**: Grid painting + frontier-line rendering extracted from `src/main.js` into `src/world/render.js` (the world-feature slice of the TASK-407 great split).
+  - **New in `src/core/conquest.js`**: shared dirty-region queue (`takeOverlayRect()` — full/null/rect semantics), fused paint+border full pass, devastation VISUAL layer (scorch canvas, bucketed repaints), frontline heat map (`getHotEdges`).
+  - **New in `src/world/render.js`**: territory overlay with SUB-RECT blits (was: full 2048×1024 re-blit per flush), crisp frontier lines (150ms throttle preserved), devastation scorch sphere, capture flash point pool (512, shader-faded), frontline heat glow (pulsing additive line), drone selection rings.
+  - **`main.js` integration**: thin delegates (`renderMode1Territory`/`rebuildFrontierLines`), capture-flash hook in `conquestCtx.onConquerCell`, `WORLD_RENDER.reset()` in `cleanupTerritory`, `tickVfx`+`updateDroneRings` in the render loop; ~160 lines of inline state/pipeline deleted.
+  - **Verified**: `scripts/test_world_render.mjs` — 48/48 headless checks (queue semantics, scorch lifecycle, heat pruning, mesh creation/disposal); `vite build` clean; browser smoke test — mode1 game spawned, territories painting green+red, 0 page errors over 12s of conquest ticks.
 
 ### [⏳ BACKLOG & FUTURE IMPROVEMENTS]
 - **1. Region Selection Interface**: Design a sleek, tactical dropdown or map panel in the menu screen to load custom regions (`iraq`, `usa`, etc.) using `GeoDataManager.loadRegion(regionName)`.
