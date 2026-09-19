@@ -2449,11 +2449,23 @@ class Warship {
         spawnExp(this.curLat, this.curLon, 8, '#ff5522');
         this.shells.forEach(s => scene.remove(s.mesh));
         this.shells.length = 0;
+        // Tethered swarm dies with the bay (lost comms — no orphan drones)
+        for (const d of drones) {
+            if (!d.dead && d.home === this) d._crash();
+        }
         if (this.selRing && this.selRing.material) this.selRing.material.dispose();
         scene.remove(this.mesh);
         disposeMeshDeep(this.mesh);   // accents disposed; shared hull mats survive
         if (this.owner === 'player') logEvent(`💥 غرقت ${this.name} لدينا!`, 'err');
         else logEvent(`💥 ${this.name} ${_ownerName(this.owner)} غرقت!`, 'info');
+    }
+
+    // Public damage API (Structure.hit parity) — TASK-204 drones and any
+    // external system call this; it routes to a proper _sink() at zero.
+    hit(dmg) {
+        if (this.dead) return;
+        this.hp -= dmg;
+        if (this.hp <= 0) this._sink();
     }
 
     // ── main tick (60fps logic) ──
@@ -2577,9 +2589,8 @@ class Warship {
         for (const d of drones) {
             if (d.dead || d.owner === this.owner) continue;
             if (haversineDist(this.curLat, this.curLon, d.lat, d.lon) < 55) {
-                d.hp -= 45;
+                d.hit(45);                    // TASK-204 Drone API (kills at hp<=0)
                 spawnExp(d.lat, d.lon, 2, '#ffcc44');
-                if (d.hp <= 0) d._kill();
                 this.ciwsCd = 55;
                 return;
             }
@@ -2638,6 +2649,12 @@ class Warship {
     // missile system — the bay calls it and tethers the swarm to this hull.)
     _updateDroneBay() {
         const mine = drones.filter(d => !d.dead && d.home === this);
+        // Tether upkeep: the swarm's station follows the moving hull (the
+        // generic Drone patrols a FIXED homeLat/homeLon — refresh it so the
+        // screen keeps station over a sailing carrier).
+        if (frame % 30 === (this.id % 30)) {
+            for (const d of mine) { d.homeLat = this.curLat; d.homeLon = this.curLon; }
+        }
         if (mine.length >= this.hull.swarmCap || this.droneCd > 0) return;
         // Bay loadout: nanos for screening, swarm for punch, kamikazes vs hulls
         const kamCnt = mine.filter(d => d.cfg.type === 'kamikaze').length;
@@ -2648,7 +2665,8 @@ class Warship {
             { homeLat: this.curLat, homeLon: this.curLon, engageR: GAME_CONSTANTS.DRONE_ENGAGE_RANGE_KM });
         if (squad) squad.forEach(d => { d.home = this; });   // tether to the bay (sinks with the ship)
         this.droneCd = this.hull.droneCd;
-        if (this.owner === 'player' && squad) logEvent(`🛩️ ${this.name}: أطلقت ${squad.length}× ${DCFG[key].name}`, 'info');
+        this._bayLogN = (this._bayLogN || 0) + 1;
+        if (this.owner === 'player' && squad && this._bayLogN % 3 === 1) logEvent(`🛩️ ${this.name}: أطلقت ${squad.length}× ${DCFG[key].name}`, 'info');
     }
 
     // MISSILE SHIP — mobile VLS: fires the player's SELECTED missile type
@@ -13751,7 +13769,7 @@ window.navalBattleTest = async function () {
     // ── isolate: clear every hull/drone (and their meshes) ──
     clearSelection();
     for (const w of warships) { if (!w.dead) w._sink(); }
-    for (const d of drones) d._kill(true);
+    for (const d of drones) { if (!d.dead) d._crash(); }   // TASK-204 Drone API
     warships.length = 0; drones.length = 0;
     // strip leftover SAM missiles so interception counting is clean
     for (let i = missiles.length - 1; i >= 0; i--) {
