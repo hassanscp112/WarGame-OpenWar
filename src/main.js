@@ -3011,6 +3011,24 @@ window.__ffaProbe = {
             impactErrKm: Math.round(haversineDist(t.m.lat, t.m.lon, t.click.lat, t.click.lon))
         };
     },
+    // air-defense intercept test: player SAM + enemy ballistic inbound at it.
+    // Success = attacker dead with progress < 0.9 (killed mid-flight, not landed).
+    samTest: () => {
+        const sam = new Structure(25, -40, 'sam', 'player');
+        structs.push(sam);
+        const atk = new Missile(28, -36, 25, -40, MCFG['ballistic'], 'enemy');
+        missiles.push(atk);
+        window.__samT = { atk, sam };
+        return { fired: true, flightKm: Math.round(atk.dist), etaS: +(atk.dist / atk.speed).toFixed(1) };
+    },
+    samResult: () => {
+        const t = window.__samT; if (!t) return null;
+        return {
+            attackerDead: t.atk.dead, progress: +t.atk.progress.toFixed(2),
+            intercepted: t.atk.dead && t.atk.progress < 0.95,
+            samAlive: !t.sam.dead
+        };
+    },
     missileCount: () => missiles.filter(m => !m.dead).length,
     // bow-first orientation check: dot(bow-stern vector, toward-patrol vector) > 0
     orientation: () => warships.filter(w => !w.dead).map(w => {
@@ -5834,13 +5852,25 @@ class Structure {
             if (this.anim.barrels && this.type === 'ciws') this.anim.barrels.rotation.x -= 0.08;
         }
         if(this.reload > 0) this.reload--;
-        // P6 FIX: Throttle SAM missile scan to every 5 frames (missiles move slowly enough)
+        // Air-defense scan — every 2 frames (was 5: fast missiles spent only
+        // ~7-30 ticks inside short-range envelopes like CIWS 15km and could
+        // exit between scans). missiles[] is small (<50) — trivial cost.
         // Stealth missiles are radar-invisible and hypersonics too fast to lock —
         // auto-defense skips both (they must be absorbed or dodged).
-        if(this.reload === 0 && this.fireRange > 0 && frame % 5 === 0) {
-            let trg = missiles.find(m => !m.dead && m.owner !== this.owner
-                && m.cfg.type !== 'stealth' && m.cfg.type !== 'hyper'
-                && dst(this, m) < this.fireRange);
+        if(this.reload === 0 && this.fireRange > 0 && frame % 2 === 0) {
+            // Target selection: the enemy missile CLOSEST TO IMPACT on anything
+            // we own (i.e., most progress) inside our envelope — defends what
+            // matters instead of whichever missile the array order finds first.
+            // RANGE = GROUND distance: ballistic missiles fly high arcs (up to
+            // 40% of range in altitude) — 3D distance only brings them "in
+            // range" during the final descent, far too late to intercept.
+            let trg = null, bestProg = -1;
+            for (const m of missiles) {
+                if (m.dead || m.owner === this.owner) continue;
+                if (m.cfg.type === 'stealth' || m.cfg.type === 'hyper') continue;
+                if (haversineDist(this.lat, this.lon, m.lat, m.lon) >= this.fireRange) continue;
+                if (m.progress > bestProg) { bestProg = m.progress; trg = m; }
+            }
             if(trg) { fireSAM(this, trg); this.reload = this.maxReload; }
         }
     }
@@ -5873,10 +5903,23 @@ class Missile {
         if(this.isSAM && this.tgt && !this.tgt.dead) {
             this.tlat = this.tgt.lat; this.tlon = this.tgt.lon;
             this.targetVec.copy(this.tgt.pos || latLonToVec3(this.tlat, this.tlon));
-            if(this.pos && this.pos.distanceTo(this.targetVec) < 1.5) {
-                this.tgt.dead = true;
-                this.explode();
-                return;
+            // INTERCEPT CHECK — speed-scaled hit radius (tunneling fix): with
+            // attacker missiles at 2.5-16.5 units/tick and the SAM at 15, the
+            // old fixed 1.5-unit radius let both jump PAST each other in a
+            // single tick — missiles were never intercepted. The radius now
+            // covers one full tick of closing speed + margin.
+            if (this.pos) {
+                const tgtSpeedPerTick = (this.tgt.speed ? this.tgt.speed / 60 : 0.5);
+                const mySpeedPerTick = this.speed / 60;
+                const hitR = 2 + tgtSpeedPerTick + mySpeedPerTick;
+                if (this.pos.distanceTo(this.targetVec) < hitR) {
+                    this.tgt.dead = true;
+                    // Interception flash at the kill point (visible confirmation)
+                    spawnExp(this.tgt.lat, this.tgt.lon, 3, '#88ffcc');
+                    logEvent('🛡️ اعتراض ناجح! أسقطت الدفاع الجوي صاروخاً معادياً', 'info');
+                    this.explode();
+                    return;
+                }
             }
         }
         
