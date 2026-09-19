@@ -17626,3 +17626,175 @@ window.tankRiverProbe = function () {
     console.log('[TANK-RIVER]', out);
     return out;
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+//  TASK-505 MASTERY QA PROBES
+//  tankQaPerf(n) — OPTIMIZE harness: n divisions (default 24) marching
+//    over land under the real game loop; reports gameFrame cost + JS-heap
+//    delta (allocation churn) so before/after numbers are comparable.
+//  tankQaTest() — ANALYZE/QA/FINISH summary: constants sanity, player
+//    SPG cycle, bot fuel-gate (live aiTick check), strait crossings,
+//    reset-path deep-state cleanliness. Self-cleaning.
+// ═══════════════════════════════════════════════════════════════════════
+window.tankQaPerf = async function (n = 24) {
+    const log = (m) => console.log('%c[TANK-PERF] ' + m, 'color:#66ccff;font-weight:bold');
+    if (!scene || gOver) { log('Start a game first (mode 1).'); return 'no scene'; }
+    clearSelection();
+    // Player's blob: one bounded strided scan of the grid owner array (the
+    // seed circle is ~20 cells wide — stride 7 cannot step over it).
+    let home = null;
+    if (conquestGrid && conquestGrid.owner) {
+        const own = conquestGrid.owner;
+        for (let cell = 0; cell < own.length; cell += 7) {
+            if (own[cell] === CONQUEST_CFG.PLAYER) { const ll = conquestGrid.cellToLatLon(cell); home = { lat: ll.lat, lon: ll.lon }; break; }
+        }
+    }
+    if (!home) { log('No player territory found — expand a little first.'); return 'no home'; }
+    // Supply hub for the run: without one, attrition kills the divisions
+    // mid-march (grace 10s → ~2.4%/s drain) and the measurement goes flat.
+    const hub = new Structure(home.lat, home.lon, 'city', 'player');
+    structs.push(hub);
+    // March objective: a LAND point 3-5° away (retry directions; fallback =
+    // whatever we found — coast-following is part of real at-scale cost).
+    let tgt = null;
+    for (let a = 0; a < 12 && !tgt; a++) {
+        const t = { lat: home.lat + Math.cos(a * 0.52) * 3.5, lon: home.lon + Math.sin(a * 0.52) * 3.5 };
+        if (isLand(t.lat, t.lon)) tgt = t;
+    }
+    tgt = tgt || { lat: home.lat + 3.5, lon: home.lon + 3.5 };
+    const spawned = [];
+    const KEYS = ['light', 'medium', 'heavy', 'spg'];
+    try {
+        for (let i = 0; i < n; i++) {
+            const k = KEYS[i % KEYS.length];
+            const la = home.lat + Math.cos(i) * 0.2, lo = home.lon + Math.sin(i) * 0.2;
+            const t = spawnTankDivision(la, lo, k, 'player', { tgtLat: tgt.lat, tgtLon: tgt.lon });
+            t.entrench = 0;   // perf path: marching, not dug in
+            spawned.push(t);
+        }
+        await window.__pumpGame(60);   // settle: spawn FX / first retarget
+        const heap0 = performance.memory ? performance.memory.usedJSHeapSize : 0;
+        const t0 = performance.now();
+        const frames = 3600;
+        await window.__pumpGame(frames);   // 60 game-seconds of marching
+        const dt = performance.now() - t0;
+        const heap1 = performance.memory ? performance.memory.usedJSHeapSize : 0;
+        const marching = spawned.filter(t => !t.dead).length;
+        const R = {
+            divisions: n, aliveAfterMarch: marching,
+            framesPumped: frames,
+            wallMs: Math.round(dt),
+            msPerGameFrame: +(dt / frames).toFixed(3),
+            heapDeltaMB: heap0 ? +((heap1 - heap0) / 1048576).toFixed(2) : 'n/a',
+            movedKm: Math.round(haversineDist(home.lat, home.lon, spawned[0].lat, spawned[0].lon)),
+        };
+        window.__tankPerfResult = R;
+        log(JSON.stringify(R));
+        return R;
+    } finally {
+        clearSelection();
+        for (const t of spawned) { if (!t.dead) t._destroy(); }
+        // wreck/shell deep state dies with the divisions — purge after
+        _clearTankDeep();
+        for (const t of spawned) { const i = tanks.indexOf(t); if (i >= 0) tanks.splice(i, 1); }
+        const iHub = structs.indexOf(hub);
+        if (iHub >= 0) structs.splice(iHub, 1);
+        if (!hub.dead) { hub.dead = true; scene.remove(hub.mesh); scene.remove(hub.selRing); if (hub.accents) hub.accents.forEach(m => m.dispose()); }
+    }
+};
+
+window.tankQaTest = async function () {
+    const log = (m) => console.log('%c[TANK-QA] ' + m, 'color:#77ff99;font-weight:bold');
+    const C = GAME_CONSTANTS;
+    const R = { phase: 'static' };
+    window.__tankQaResult = R;
+    if (!scene || gOver) { log('Start a game first (mode 1).'); R.phase = 'no-scene'; return R; }
+    logEvent('🧪 اختبار إتقان المدرعات (TASK-505) بدأ', 'info');
+
+    // ── 1. constants sanity (QC): caps exist, TCFG coherent ──
+    R.cfgCoherent = Object.values(TCFG).every(c => c.cost > 0 && c.hp > 0 && c.cap > 0 && c.gunRange <= c.engageR);
+
+    // ── 2. player SPG cycle (ANALYZE fix): H cycles all 4 classes ──
+    R.spgPlayerCycle = TANK_ORDER.includes('spg');
+
+    // ── 3. reset-path cleanliness: no stale wrecks/shells mid-game ──
+    R.deepStateClean = tankWrecks.length === 0 && spgShells.length === 0;
+
+    // ── 4. straits: natural crossings pass, oceans blocked ──
+    R.phase = 'river';
+    R.river = window.tankRiverProbe();
+    R.straitsOk = (R.river.crossings.dover === true && R.river.crossings.gibraltar === true)
+        && R.river.ocean === false && R.river.atlantic === false;
+
+    // ── 5. bot fuel-gate (FINISH): a fuel-starved rich rival must NOT
+    //    buy armor via runAI §6; a fueled one must. Deterministic: every
+    //    random roll gate passes (Math.random→0), frame aligned to the
+    //    AI_TICK_RATE cadence so §6 actually runs, probe base as muster. ──
+    R.phase = 'fuel-gate';
+    try {
+        const riv = bots[0];
+        if (!riv || !riv.alive) throw new Error('no live rival');
+        const homeS = structs.find(s => !s.dead && s.owner === riv.str) || { lat: 22, lon: 78 };
+        const probeBase = new Structure(homeS.lat, homeS.lon, 'base', riv.str);
+        structs.push(probeBase);
+        const res0 = riv.res;
+        riv.res = 5000;                                     // rich: cost can never block
+        const structsBefore = new Set(structs.map(s => s.id));
+        const countRivTanks = () => tanks.filter(t => !t.dead && t.owner === riv.str).length;
+        const tanks0 = countRivTanks();
+        // align to the §6 cadence (runAI gates on frame % AI_TICK_RATE)
+        econState.fuel[riv.str] = 0;                        // starved DURING alignment too
+        let guard = 0;
+        while (frame % C.AI_TICK_RATE !== 0 && guard++ < C.AI_TICK_RATE) await window.__pumpGame(1);
+        const origRandom = Math.random;
+        Math.random = () => 0;                              // every roll gate passes
+        // phase A — starved: 0 fuel must block the §6 purchase
+        econState.fuel[riv.str] = 0;
+        runAI();
+        const tanksStarved = countRivTanks();
+        // phase B — fueled: the same deterministic roll must buy
+        econState.fuel[riv.str] = 500;
+        runAI();
+        const tanksFueled = countRivTanks();
+        Math.random = origRandom;
+        // cleanup: the probe base + anything runAI bought/built for the rival
+        for (const t of tanks.slice()) {
+            if (t.owner === riv.str && !t.dead) { t.dead = true; t.selected = false; scene.remove(t.mesh); disposeMeshDeep(t.mesh); const i = tanks.indexOf(t); if (i >= 0) tanks.splice(i, 1); }
+        }
+        for (const p of planes.slice()) {
+            if (p.owner === riv.str && !p.dead) { p.dead = true; p.selected = false; scene.remove(p.mesh); disposeMeshDeep(p.mesh); const i = planes.indexOf(p); if (i >= 0) planes.splice(i, 1); }
+        }
+        for (const s of structs.slice()) {
+            if (!structsBefore.has(s.id) && !s.dead) { s.dead = true; scene.remove(s.mesh); scene.remove(s.selRing); if (s.accents) s.accents.forEach(m => m.dispose()); const i = structs.indexOf(s); if (i >= 0) structs.splice(i, 1); }
+        }
+        const iBase = structs.indexOf(probeBase);
+        if (iBase >= 0) structs.splice(iBase, 1);
+        if (!probeBase.dead) { probeBase.dead = true; scene.remove(probeBase.mesh); scene.remove(probeBase.selRing); if (probeBase.accents) probeBase.accents.forEach(m => m.dispose()); }
+        riv.res = res0;
+        R.fuelGate = { starvedBought: tanksStarved - tanks0, fueledBought: tanksFueled - tanksStarved };
+        R.fuelGateHolds = tanksStarved === tanks0 && tanksFueled > tanksStarved;
+        log(`fuel-gate: 0-fuel bought ${R.fuelGate.starvedBought}, fueled bought ${R.fuelGate.fueledBought}`);
+    } catch (e) {
+        R.fuelGateHolds = 'skip: ' + e.message;
+        log('fuel-gate skipped: ' + e.message);
+    }
+
+    // ── 6. player purchase path: fuel-gate message (cheap, non-spawning) ──
+    R.playerGateFn = typeof econFuelSpend === 'function';
+
+    // ── verdict ──
+    const checks = [
+        ['CFG coherence (TCFG)', R.cfgCoherent === true],
+        ['SPG in player H-cycle', R.spgPlayerCycle === true],
+        ['Deep state clean', R.deepStateClean === true],
+        ['Straits (Dover+Gibraltar cross / oceans blocked)', R.straitsOk === true],
+        ['Bot fuel-gate (0-fuel blocked, fueled buys)', R.fuelGateHolds === true],
+        ['Player fuel gate present', R.playerGateFn === true],
+    ];
+    let ok = 0;
+    for (const [name, pass] of checks) { if (pass) ok++; log(`${pass ? '✅' : '❌'} ${name}`); }
+    R.pass = ok === checks.length;
+    log(`RESULT: ${R.pass ? 'PASS' : 'FAIL'} (${ok}/${checks.length}) — window.__tankQaResult`);
+    logEvent(R.pass ? '🧪 اختبار إتقان المدرعات: نجح ✅' : '🧪 اختبار إتقان المدرعات: فشل ❌ — انظر الكونسول', R.pass ? 'info' : 'err');
+    return R;
+};
