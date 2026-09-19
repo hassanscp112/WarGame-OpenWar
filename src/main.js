@@ -7870,7 +7870,24 @@ class Plane {
                     return;
                 }
             } else {
-                this.mode = 'patrol'; 
+                // TASK-501 (soak finding): base destroyed mid-sortie → DIVERT to
+                // the nearest live own airport instead of patrolling in place
+                // until fuel-out (the old path guaranteed a crash chain, with a
+                // "returning to base" toast that lied). With no field left, the
+                // plane fights on until bingo — and the crash log says why.
+                let divert = null, bestD = Infinity;
+                for (const s of structs) {
+                    if (s.owner !== this.owner || s.dead || s.type !== 'airport') continue;
+                    const d = haversineDist(this.lat, this.lon, s.lat, s.lon);
+                    if (d < bestD) { bestD = d; divert = s; }
+                }
+                if (divert) {
+                    this.baseStruct = divert;
+                    if (this.owner === myRole) logEvent(`🔁 ${this.cfg.name}: القاعدة دُمرت — تحويل إلى أقرب مطار`, 'warn');
+                } else {
+                    this.mode = 'patrol';
+                    if (this.owner === myRole) logEvent(`⚠️ ${this.cfg.name}: لا قاعدة — ستتحطم عند نفاد الوقود`, 'err');
+                }
             }
         } else if (this.mode === 'patrol' && !isOnline && this.owner !== myRole && dist < 10) {
             // AI patrol plane reached its waypoint → new mission (CAP or strike)
