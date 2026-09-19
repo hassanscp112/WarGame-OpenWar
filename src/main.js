@@ -3574,6 +3574,9 @@ window.__ffaProbe = {
         camera.position.copy(latLonToVec3(lat, lon, EARTH_RADIUS + alt));
         controls.target.set(0, 0, 0);
         controls.update();
+        // TASK-505: refresh the world matrix so click-raycasts land even when
+        // RAF is starved (hidden tab — the render loop normally does this)
+        camera.updateMatrixWorld(true);
         return 'ok';
     },
     // plane selection/mode state
@@ -9123,26 +9126,40 @@ function _updateSpgShells() {
     }
 }
 
-// Burning wrecks: fire + smoke for TANK_WRECK_FRAMES, then shrink-fade.
+// Burning wrecks: fire + smoke for TANK_WRECK_FRAMES, then a settling
+// fade (shrink + sink into the scorch) with the smoke tapering off.
+// TASK-505 OPTIMIZE: puff math rides two module scratches — the retained
+// velocity is the only per-puff allocation left (transients hold it by ref).
+const _wreckV1 = new THREE.Vector3();
+const _wreckV2 = new THREE.Vector3();
 function _updateTankWrecks() {
     for (let i = tankWrecks.length - 1; i >= 0; i--) {
         const w = tankWrecks[i];
         w.t--;
         if (w.t <= 0) {
+            // final settle: one dust ring where the hull went in
+            _puffAt(latLonToVec3(w.lat, w.lon, EARTH_RADIUS + 3, _wreckV1), 0x5a5048, 3.0, null, 26);
             scene.remove(w.mesh);
             disposeMeshDeep(w.mesh);
             if (w.tex) w.tex.dispose();
             tankWrecks.splice(i, 1);
             continue;
         }
-        if (frame % 14 === (w.id % 14)) {
+        const fading = w.t < 90;
+        if (fading) {
+            // settle: shrink + sink ~4 world units into the scorch beneath
+            w.mesh.scale.multiplyScalar(0.94);
+            w.mesh.position.setLength(w.mesh.position.length() - 0.045);
+        }
+        // fire gutters out and smoke thins as the wreck cools
+        if (!fading && frame % 14 === (w.id % 14)) {
             spawnExp(w.lat + rnd(-0.15, 0.15), w.lon + rnd(-0.15, 0.15), 1.6, '#ff7733');
         }
-        if (frame % 10 === (w.id % 10)) {
-            _puffAt(latLonToVec3(w.lat, w.lon, EARTH_RADIUS + 6), 0x2b2b30, 3.2,
-                new THREE.Vector3().copy(latLonToVec3(w.lat, w.lon, 1)).normalize().multiplyScalar(0.5), 40);
+        if (frame % 10 === (w.id % 10) && (!fading || frame % 30 === (w.id % 30))) {
+            const pos = latLonToVec3(w.lat, w.lon, EARTH_RADIUS + 6, _wreckV1);
+            const vel = new THREE.Vector3().copy(latLonToVec3(w.lat, w.lon, 1, _wreckV2)).normalize().multiplyScalar(0.5);
+            _puffAt(pos, 0x2b2b30, fading ? 2.2 : 3.2, vel, 40);
         }
-        if (w.t < 90) w.mesh.scale.multiplyScalar(0.94);   // fade-out by shrink
     }
 }
 
@@ -9364,12 +9381,14 @@ class Tank {
         this.fireCd = this.cfg.fireRate * (this.unsupplied ? C.TANK_SUPPLY_RELOAD_MUL : 1);
         this.shots++;
         if (this.behavior.indirect) { this._fireArc(t, tp, dmg); return; }
-        const muzzle = this.mesh.position.clone().addScaledVector(this.mesh.position.clone().normalize(), 4);
+        // TASK-505 OPTIMIZE: gunnery runs on scratch vectors (_tkV1-2 —
+        // _tracer clones its endpoints, so passing scratches is safe).
+        const nrm = _tkV1.copy(this.mesh.position).normalize();
+        const muzzle = _tkV2.copy(this.mesh.position).addScaledVector(nrm, 4);
         _tracer(muzzle, latLonToVec3(tp.lat, tp.lon, EARTH_RADIUS + 2), 0xffcc55);
         spawnExp(this.lat, this.lon, 1.4, '#ffee99');   // muzzle flash
         // TASK-405 polish: muzzle blast ring + ejected shell casing
         _puffAt(muzzle, 0xffd27a, 2.2, null, 10);
-        const nrm = this.mesh.position.clone().normalize();
         const side = new THREE.Vector3().crossVectors(this._faceVec || nrm, nrm).normalize();
         _puffAt(muzzle.clone().addScaledVector(side, 2.5).addScaledVector(nrm, 2), 0xd8c34a, 0.8,
             side.multiplyScalar(0.5).addScaledVector(nrm, 0.7), 22);   // casing pops out
@@ -9477,8 +9496,12 @@ class Tank {
             return false;
         }
         this.lat = ll.lat; this.lon = ll.lon;
-        this.mesh.position.copy(next.clone().multiplyScalar(this._radius));
-        this._lastDir = d.clone();
+        // TASK-505 OPTIMIZE: was next.clone()×2 per step (~2 Vector3 per
+        // division per frame ≈ 2.9k allocs/s at 24 divisions) — copy into
+        // the live position + a persistent per-division heading instead.
+        this.mesh.position.copy(next).multiplyScalar(this._radius);
+        if (this._lastDir) this._lastDir.copy(d);
+        else this._lastDir = d.clone();
         return true;
     }
 
@@ -13187,6 +13210,11 @@ function initWorld(difficulty, pCountryKey='usa', eCountryKey='random', gameMode
     transportShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
     warships.forEach(w => { if(w.mesh) { scene.remove(w.mesh); disposeMeshDeep(w.mesh); } w.shells.forEach(sh => scene.remove(sh.mesh)); });
     drones.forEach(d => { if(d.mesh) { scene.remove(d.mesh); disposeMeshDeep(d.mesh); } });
+    // TASK-505: tank meshes + deep-pass state (wrecks/SPG shells) reset with
+    // the world — initWorld previously cleared the ARRAY but never disposed
+    // the meshes, and _clearTankDeep was missing from BOTH reset paths.
+    _clearTankDeep();
+    tanks.forEach(t => { if(t.mesh) { scene.remove(t.mesh); disposeMeshDeep(t.mesh); } if(t.selRing && t.selRing.material) t.selRing.material.dispose(); });
 
     structs = []; missiles = []; planes = []; drones = []; aamMissiles = []; exps = []; particles = [];
     tradeShips = []; trains = []; troopCohorts = []; transportShips = []; warships = [];
@@ -15922,6 +15950,9 @@ function backToMenu() {
     tradeShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
     transportShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
     warships.forEach(w => { if(w.mesh) { scene.remove(w.mesh); disposeMeshDeep(w.mesh); } w.shells.forEach(sh => scene.remove(sh.mesh)); });
+    // TASK-505: purge burning wrecks + in-flight SPG shells (deep-pass
+    // state — stale entries used to leak meshes/fire into the next game)
+    _clearTankDeep();
     tanks.forEach(t => { if(t.mesh) { scene.remove(t.mesh); disposeMeshDeep(t.mesh); } if(t.selRing && t.selRing.material) t.selRing.material.dispose(); });   // TASK-302
     drones.forEach(d => { if(d.mesh) { scene.remove(d.mesh); disposeMeshDeep(d.mesh); } });
     trains.forEach(t => { if(t.mesh) { scene.remove(t.mesh); disposeMeshDeep(t.mesh); } if(t.pathLine) { scene.remove(t.pathLine); disposeMeshDeep(t.pathLine); } });
@@ -16402,7 +16433,9 @@ window.__UI_API = {
 const HULL_ORDER = ['destroyer', 'escort', 'submarine', 'missile', 'drone', 'carrier', 'transport'];   // TASK-402: submarine joins the V cycle
 let warshipBuildClass = 'destroyer';
 // TASK-302: tank division classes cycle on repeated H while the slot is armed
-const TANK_ORDER = ['light', 'medium', 'heavy'];
+// TASK-505: SPG joins the player cycle (was bot-only — the player could
+// never field artillery while rivals bought it at 15%).
+const TANK_ORDER = ['light', 'medium', 'heavy', 'spg'];
 let tankBuildClass = 'medium';
 
 const HOTBAR_SLOTS = [
@@ -16420,7 +16453,7 @@ const HOTBAR_SLOTS = [
     { key: 'V', type: 'warship',    icon: '🛳️', label: 'أسطول',  tip: 'V للتبديل: مدمرة/فرقاطة/غواصة/طراد/درون/حاملة/إنزال — انقر ماءً للنشر' },
     { key: 'Z', type: 'mine',       icon: '💣', label: 'ألغام',  tip: 'وضع الألغام البحرية [Z] — انقر ماءً لنشر حقل ألغام يفجّر سفن العدو وناقلات إنزاله' },
     { key: 'N', type: 'drone',     icon: '🛸', label: 'درون',   tip: 'وضع الدرونات — أنقر الخريطة لنشر أسراب/استطلاع/صائدة صواريخ' },
-    { key: 'H', type: 'tank',      icon: '🚜', label: 'مدرعات',  tip: 'H للتبديل: استطلاع/قتال/اختراق — انقر أرضاً لنشر الفرقة من أقرب مصنع حربي' },
+    { key: 'H', type: 'tank',      icon: '🚜', label: 'مدرعات',  tip: 'H للتبديل: استطلاع/قتال/اختراق/مدفعية — المدفعية تقصف من بعيد لكن تحتاج كشفاً (درون استطلاع/فرقة استطلاع/رادار) — انقر أرضاً لنشر الفرقة من أقرب مصنع حربي' },
 ];
 
 function _buildHotbarDom() {
@@ -17640,14 +17673,22 @@ window.tankQaPerf = async function (n = 24) {
     const log = (m) => console.log('%c[TANK-PERF] ' + m, 'color:#66ccff;font-weight:bold');
     if (!scene || gOver) { log('Start a game first (mode 1).'); return 'no scene'; }
     clearSelection();
-    // Player's blob: one bounded strided scan of the grid owner array (the
-    // seed circle is ~20 cells wide — stride 7 cannot step over it).
+    // Player's blob: bounded strided scan of the grid owner array. Homes must
+    // be INLAND (land 1.5° out in all 4 directions) — a coastal seed puts the
+    // divisions in a coast-following box and the run measures holds, not march.
     let home = null;
     if (conquestGrid && conquestGrid.owner) {
         const own = conquestGrid.owner;
         for (let cell = 0; cell < own.length; cell += 7) {
-            if (own[cell] === CONQUEST_CFG.PLAYER) { const ll = conquestGrid.cellToLatLon(cell); home = { lat: ll.lat, lon: ll.lon }; break; }
+            if (own[cell] !== CONQUEST_CFG.PLAYER) continue;
+            const ll = conquestGrid.cellToLatLon(cell);
+            if (isLand(ll.lat + 1.5, ll.lon) && isLand(ll.lat - 1.5, ll.lon)
+                && isLand(ll.lat, ll.lon + 1.5) && isLand(ll.lat, ll.lon - 1.5)) {
+                home = { lat: ll.lat, lon: ll.lon };
+                break;
+            }
         }
+        if (!home) { log('Player territory is coastal-only — no inland cell for a clean march. SKIP.'); return 'coastal-only'; }
     }
     if (!home) { log('No player territory found — expand a little first.'); return 'no home'; }
     // Supply hub for the run: without one, attrition kills the divisions
