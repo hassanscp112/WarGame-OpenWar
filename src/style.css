@@ -704,3 +704,26 @@ html, body {
 #econTip .etSpark { margin-top: 6px; }
 #econTip .etSpark canvas { width: 216px; height: 48px; display: block;
     border: 1px solid rgba(255, 255, 255, .1); border-radius: 6px; background: rgba(0, 0, 0, .3); }
+
+
+/* ═══════════════════════════════════════════════════════════════
+   TASK-303 UI SWEEP — dark-theme scrollbars + focus visibility.
+   Native white scrollbars clash with the dark panels in the
+   scrollable regions (menu, research list, selection panel).
+   ═══════════════════════════════════════════════════════════════ */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.04); border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: rgba(138, 160, 181, 0.35); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(138, 160, 181, 0.6); }
+* { scrollbar-width: thin; scrollbar-color: rgba(138, 160, 181, 0.35) rgba(255, 255, 255, 0.04); }
+
+/* keyboard accessibility: visible focus ring on interactive elements */
+button:focus-visible, select:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--accent, #3b82f6);
+    outline-offset: 1px;
+}
+
+/* respect users who prefer no motion (medals, ripples, flashes) */
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}

@@ -39,6 +39,12 @@
     - **Live E2E in browser**: spawn → build launcher (hotbar 4, $180) → R-mode rings+pips → fire volley → HUD "منصات جاهزة 1/1→0/1 · المخزون 6/6→5/6". No console errors; probes leave no leaked entities (`__ffaProbe.droneCheck()` clean).
     - Remaining: audit **#15 drone selection panel** — explicitly coordination with TASK-406 agent or lead, not solo work.
   - **Next**: TASK-407 refactor (lead-led, after 401-406).
+- **Task: TASK-303 — Visual Polish (branch `feature/visual-polish` off main `abbbc09`)** ✅ ready-for-merge (commit `2ddcefc`, visualTest 9/9 PASS live 2026-09-19):
+  - **Clouds**: procedural x-wrapped fBm value-noise canvas (no lon-seam), translucent Lambert shell R*1.022, slow eastward drift. **Sun glare**: additive core+halo sprites at 58k units along key-light dir (occluded by globe = natural sunset). **Ocean shimmer**: additive ShaderMaterial shell R*1.0006 sampling the LIVE biome map (pointer-synced per frame — survives territory repaints); ocean mask by blue-dominance; animated glints + Blinn specular (exp70) + limb fresnel.
+  - **Explosions**: polish wired INSIDE `spawnExp` — r≥2.5 white flash core (pooled), r≥4 expanding shockwave ring. **Wakes**: `_wakeFxTick` every 4f — READ-ONLY observation of warships+tradeShips (navy's class untouched), foam puffs behind movers, per-ship 10f cooldown.
+  - **Guardrail**: rolling rAF fps (`__perfState.fpsAvg`), draw-call readout in `visualTest`, `__polishToggle()` emergency hatch. Cost ≤4 draw calls (27 total frame).
+  - **UI sweep**: dark-theme scrollbars, `:focus-visible` rings, `prefers-reduced-motion`.
+  - Scene-rebuild safe: initWorld's dispose sweep nulls polish refs → `_ensurePolishAtmosphere` rebuilds. All polish meshes `raycast = () => {}` (never intercept globe clicks).
 - **TASK-401: Air Force Deep Pass (AirCombat module + main.js integration)**
   - **Status**: Module extraction + integration COMPLETE (commits `0950a3f` → `770df7c`).
   - **Architecture**: `src/air/aircombat.js` owns all air doctrine (dogfight, strike, SEAD, squadrons, veterancy, tanking, VFX, wrecks). `main.js` Plane class delegates through the **AIRW bridge** (live getters → module scope; module never imports the game).
