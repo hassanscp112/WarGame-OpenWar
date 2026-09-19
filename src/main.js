@@ -6654,6 +6654,7 @@ class Plane {
                  // ── TASK-201: rearm + refuel on the ramp ──
                  const C = GAME_CONSTANTS;
                  if (this.fuel < this.maxFuel) this.fuel = Math.min(this.maxFuel, this.fuel + this.maxFuel / C.AIR_REARM_FUEL_FRAMES);
+                 if (this.fuel >= this.maxFuel * 0.9) this._rtbForFuel = false;   // re-arm the one-shot warn after topping up
                  if (this.maxAa > 0) this.aaAmmo = Math.min(this.maxAa, this.aaAmmo + this.maxAa / C.AIR_REARM_AMMO_FRAMES);
                  if (this.maxAg > 0) this.agAmmo = Math.min(this.maxAg, this.agAmmo + this.maxAg / C.AIR_REARM_AMMO_FRAMES);
                  if (this.maxGun > 0) this.gunAmmo = Math.min(this.maxGun, this.gunAmmo + this.maxGun / C.AIR_REARM_AMMO_FRAMES);
@@ -6709,7 +6710,8 @@ class Plane {
         // ── TASK-201: fuel — burn airborne, force RTB at 25%, crash at 0 ──
         this.fuel -= GAME_CONSTANTS.AIR_BURN_RATE;
         if (this.fuel <= 0) { this._crash(); return; }
-        if (this.fuel < this.maxFuel * GAME_CONSTANTS.AIR_RTB_FUEL_PCT && this.mode !== 'return') {
+        if (this.fuel < this.maxFuel * GAME_CONSTANTS.AIR_RTB_FUEL_PCT && !this._rtbForFuel) {
+            this._rtbForFuel = true;   // one-shot: combat scans can flip mode back — don't re-toast each tick
             this.mode = 'return';
             this.airTgt = null;
             if (this.owner === myRole) logEvent(`⛽ ${this.cfg.name}: وقود منخفض — عودة للقاعدة`, 'info');
