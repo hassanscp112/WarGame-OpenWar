@@ -17635,6 +17635,14 @@ window.tankDeepTest = async function () {
 // Standalone river-crossing checker (map-editor companion): probes every
 // major strait the armor should be able to wade + two open-ocean controls
 // that must stay blocked. Run any time: window.tankRiverProbe()
+// TASK-505: coordinates corrected to the TRUE narrow crossings. The old
+// TASK-405 lines ran oblique/parallel to the coast (through the North Sea
+// / Gulf of Cádiz) — they were authored when the mask blanket-over-watered
+// everything and never validated against a good mask. Expected on the
+// post-cac6969 mask: suez/dover/gibraltar TRUE; bering FALSE (82km > the
+// 48km far-bank limit — armor has no business wading an ocean gap);
+// bosporus/messina are sub-resolution straits dilated as interior water
+// (their shores erode) — reported, not expected.
 window.tankRiverProbe = function () {
     const probe = (flat, flon, tlat, tlon) => {
         const nrm = latLonToVec3(flat, flon, 1).normalize();
@@ -17645,12 +17653,12 @@ window.tankRiverProbe = function () {
         return Tank.prototype._probeFarBank.call(null, nrm, dir.normalize());
     };
     const CROSSINGS = [
-        ['suez',    30.4, 32.35,  30.1, 32.35],   // painted canal — guaranteed water
-        ['gibraltar', 35.95, -5.6, 36.4, -5.6],
-        ['bosporus', 41.05, 28.95, 41.25, 29.1],
-        ['messina', 38.22, 15.62, 38.05, 15.6],
-        ['bering',  65.8, -168.9, 66.0, -169.2],
-        ['dover',   51.0, 1.45,   51.3, 1.35],
+        ['suez',      30.4,  32.35, 30.1,  32.35],  // painted canal — guaranteed water
+        ['dover',     50.96, 1.85,  51.13, 1.33],   // Calais→Dover true crossing (~13km water in-mask)
+        ['gibraltar', 35.93, -5.55, 36.05, -5.38],  // Morocco→Spain across the narrows (dry bridge in-mask)
+        ['bosporus',  41.04, 28.98, 41.06, 29.08],  // sub-resolution strait — dilated as a river channel
+        ['messina',   38.20, 15.58, 38.27, 15.67],  // sub-resolution strait — shores eroded by dilation
+        ['bering',    65.8, -168.9, 66.0, -169.2],  // 82km ocean gap — must stay blocked
     ];
     const out = { crossings: {}, ocean: null, atlantic: null };
     for (const [name, fla, flo, tla, tlo] of CROSSINGS) out.crossings[name] = probe(fla, flo, tla, tlo);
@@ -17750,6 +17758,7 @@ window.tankQaTest = async function () {
     const R = { phase: 'static' };
     window.__tankQaResult = R;
     if (!scene || gOver) { log('Start a game first (mode 1).'); R.phase = 'no-scene'; return R; }
+    if (window.startSpawnPhase) { log('Still in the spawn phase — place your start first.'); R.phase = 'spawn-phase'; return R; }
     logEvent('🧪 اختبار إتقان المدرعات (TASK-505) بدأ', 'info');
 
     // ── 1. constants sanity (QC): caps exist, TCFG coherent ──
@@ -17761,11 +17770,15 @@ window.tankQaTest = async function () {
     // ── 3. reset-path cleanliness: no stale wrecks/shells mid-game ──
     R.deepStateClean = tankWrecks.length === 0 && spgShells.length === 0;
 
-    // ── 4. straits: natural crossings pass, oceans blocked ──
+    // ── 4. straits: FINISH-list crossings pass, oceans blocked. Bosphorus/
+    //    Messina are sub-resolution straits (dilated as interior water —
+    //    their shores erode): reported, not asserted (world-agent domain). ──
     R.phase = 'river';
     R.river = window.tankRiverProbe();
-    R.straitsOk = (R.river.crossings.dover === true && R.river.crossings.gibraltar === true)
+    R.straitsOk = (R.river.crossings.dover === true && R.river.crossings.gibraltar === true
+        && R.river.crossings.suez === true && R.river.crossings.bering === false)
         && R.river.ocean === false && R.river.atlantic === false;
+    R.straitsSubRes = { bosporus: R.river.crossings.bosporus, messina: R.river.crossings.messina };
 
     // ── 5. bot fuel-gate (FINISH): a fuel-starved rich rival must NOT
     //    buy armor via runAI §6; a fueled one must. Deterministic: every
