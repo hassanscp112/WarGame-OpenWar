@@ -11,11 +11,11 @@
 //              tanks, transportShips, tradeShips, torpedoes, mineFields,
 //              SFX, Missile, Plane, ConquestAttack
 //    fns     : fireSAM, launchDrone, logEvent, spawnExp, haversineDist,
-//              ownerName, navalSpend, sendAction, renderMode1Territory,
-//              _tracer, latLonToVec3, targetLivePos, killTradeShip,
-//              missileScatter, newId, buildTorpedoMesh, buildMineModel,
-//              puffAt, disposeMesh, pushAttack, fleetStanceIdx,
-//              sonarPingFX (TASK-502 — contact/reveal rings)
+//              ownerName, ownerHexColor, navalSpend, sendAction,
+//              renderMode1Territory, _tracer, latLonToVec3, targetLivePos,
+//              killTradeShip, missileScatter, newId, buildTorpedoMesh,
+//              buildMineModel, puffAt, disposeMesh, pushAttack,
+//              fleetStanceIdx, sonarPingFX (TASK-502 — contact/reveal rings)
 // ══════════════════════════════════════════════════════════════════════
 import { PCFG, MCFG, DCFG, GAME_CONSTANTS } from '../data/constants.js';
 
@@ -366,7 +366,9 @@ export class Torpedo {
         this._radius = shooter._radius;
         this.dead = false;
         this._bubbleT = 0;
-        this.mesh = ctx.buildTorpedoMesh(owner);
+        // TASK-502 fix: the builders take a hex COLOR — the owner STRING used
+        // to land in THREE.Color ("Unknown color bot0" + dead-black accents)
+        this.mesh = ctx.buildTorpedoMesh(ctx.ownerHexColor(owner));
         this.mesh.position.copy(ctx.latLonToVec3(this.lat, this.lon, this._radius));
         ctx.scene.add(this.mesh);
     }
@@ -508,7 +510,8 @@ export class NavalMineField {
         this.armT = C.MINE_ARM_FRAMES;
         this.life = C.MINE_LIFE_FRAMES;
         this.dead = false;
-        this.mesh = ctx.buildMineModel(owner);
+        // TASK-502 fix: builder takes a hex COLOR (was the owner string — see Torpedo)
+        this.mesh = ctx.buildMineModel(ctx.ownerHexColor(owner));
         this.mesh.position.copy(ctx.latLonToVec3(this.lat, this.lon, 0.8));
         this.mesh.up.copy(this.mesh.position.clone().normalize());
         ctx.scene.add(this.mesh);

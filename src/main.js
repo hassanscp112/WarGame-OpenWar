@@ -2962,6 +2962,7 @@ const NAVAL_CTX = {
     pushAttack: (atk) => activeAttacks.push(atk),
     fleetStanceIdx: () => fleetStanceIdx,
     sonarPingFX: _sonarPingFX,   // TASK-502: sonar-contact ring visuals
+    ownerHexColor,              // TASK-502: hulls.js mesh builders take COLORS (Torpedo/mine accents)
 };
 
 // TASK-502 (FINISH item — sub sonar ring visibility): before this, a sonar
@@ -17542,6 +17543,183 @@ window.navalQATest = async function () {
     logEvent(R.pass ? '🧪 اختبار جودة البحرية: نجح ✅' : '🧪 اختبار جودة البحرية: فشل ❌ — انظر الكونسول', R.pass ? 'info' : 'err');
     return R;
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+//  NAVAL SOAK (TASK-502 REFINE probe) — window.navalSoak(minutes=10)
+//  A paced 1× real-time fleet battle: the player's full-cap fleet vs TWO
+//  bot fleets, with player-like actions (stance cycling, formation orders,
+//  mine re-laying) and balance telemetry. Hidden-page safe (pumps
+//  gameFrame at 60/s wall clock). Collects per-class survival/sink
+//  shares, torpedo/mine/AA event counts, carrier-wing health and the
+//  combat log-line rate (rate-limit verification) into
+//  window.__navalSoakResult. Friction/imbalance notes go to the board.
+// ═══════════════════════════════════════════════════════════════════════
+//  ── soak session state (module scope so __navalSoakStep can drive it) ──
+let _soak = null;
+
+window.navalSoak = async function (minutes = 10) {
+    const log = (m) => console.log('%c[NAVAL-SOAK] ' + m, 'color:#7fffd4;font-weight:bold');
+    if (!scene || gOver) { log('Start a game first (mode 1).'); return; }
+    logEvent(`🧪 نقع بحري ${minutes} دقيقة بدأ — راقب الكونسول`, 'info');
+    const C = GAME_CONSTANTS;
+    const R = { minutes, startedAt: new Date().toISOString(), samples: [], events: { torpHit: 0, mineHit: 0, aaKill: 0, sink: {} }, notes: [], alive: null, logRatePerMin: null };
+    window.__navalSoakResult = R;
+    window.__navalSoakAbort = false;
+    const pump = async (n) => { for (let i = 0; i < n; i++) { gameFrame(); if (i % 300 === 299) await new Promise(r => setTimeout(r, 0)); } };
+    const fakePort = (ll) => ({ lat: ll.lat, lon: ll.lon });
+
+    // ── clean slate ──
+    clearSelection();
+    for (const w of warships) if (!w.dead) w._sink();
+    for (const tp of torpedoes) tp._fizzle(NAVAL_CTX, true);
+    for (const f of mineFields) f._expire(NAVAL_CTX, true);
+    warships.length = 0; torpedoes.length = 0;
+    await pump(20);
+
+    // ── theater: mid-Pacific scrap zone (~200-350km mutual separations →
+    //    immediate contact), ports on real land FAR away so port healing
+    //    can't bias the balance readout (heal range is 400km) ──
+    const owners = [
+        { own: myRole, anchor: { lat: 34, lon: -157 }, port: { lat: 19.6, lon: -155.6 } },              // Hawaii
+        { own: (bots[0] && bots[0].str) || 'enemy', anchor: { lat: 35.5, lon: -154 }, port: { lat: 35.5, lon: 139.8 } },   // Tokyo Bay
+        { own: (bots[1] && bots[1].str) || 'enemy', anchor: { lat: 33, lon: -154.5 }, port: { lat: 52.5, lon: 156.5 } },    // Kamchatka
+    ];
+    for (const o of owners) {
+        if (!structs.some(s => !s.dead && s.owner === o.own && s.type === 'port')) {
+            structs.push(new Structure(o.port.lat, o.port.lon, 'port', o.own));
+        }
+    }
+    // player fleet at full class caps; bots at the runAI 5-hull weighted mix
+    const P_FLEET = ['destroyer', 'destroyer', 'destroyer', 'destroyer',
+                     'escort', 'escort', 'escort', 'escort',
+                     'submarine', 'submarine',
+                     'missile', 'missile', 'drone', 'drone',
+                     'carrier', 'transport', 'transport', 'transport'];
+    const BOT_MIX = ['destroyer', 'escort', 'submarine', 'missile', 'carrier'];
+    const fleet = [];
+    owners.forEach((o, oi) => {
+        const mix = oi === 0 ? P_FLEET : BOT_MIX;
+        mix.forEach((cls, i) => {
+            const ll = { lat: o.anchor.lat + (i % 5) * 0.5 - 1, lon: o.anchor.lon + Math.floor(i / 5) * 0.5 };
+            const w = new Warship(o.own, fakePort(ll), ll, cls);
+            warships.push(w); fleet.push(w);
+        });
+    });
+    log(`fleets up: player ${P_FLEET.length} hulls + 2 bot fleets ×${BOT_MIX.length}`);
+
+    // ── snapshot helper: alive per owner/class ──
+    const snap = () => {
+        const s = {};
+        for (const w of fleet) {
+            if (w.dead) continue;
+            const k = w.owner + ':' + w.hullClass;
+            s[k] = (s[k] || 0) + 1;
+        }
+        return s;
+    };
+    const scanSlog = (() => {
+        return () => {
+            const el = document.getElementById('slog');
+            if (!el) return;
+            let torp = 0, mine = 0, aa = 0;
+            for (const k of el.children) {
+                const t = k.textContent || '';
+                if (t.includes('طوربيد أصاب')) torp++;
+                else if (t.includes('حقل ألغام بحري أصاب')) mine++;
+                else if (t.includes('أسقطنا')) aa++;
+            }
+            // cumulative-in-buffer vs last scan (≤40-line buffer; sampled
+            // every 15s so overlap is minor; overflow undercounts)
+            R.events.torpHit += Math.max(0, torp - R._lastTorp);
+            R.events.mineHit += Math.max(0, mine - R._lastMine);
+            R.events.aaKill += Math.max(0, aa - R._lastAa);
+            R._lastTorp = torp; R._lastMine = mine; R._lastAa = aa;
+        };
+    })();
+    R._lastTorp = 0; R._lastMine = 0; R._lastAa = 0;
+
+    _soak = { R, fleet, pump, snap, scanSlog, prev: snap(), logMark: -1 };
+
+    // EXTERNAL DRIVE: set window.__navalSoakExternal=true BEFORE calling to
+    // skip the internal paced loop (hidden pages throttle setTimeout after
+    // ~5min) — the devtools side then drives __navalSoakStep(t) per second
+    // and calls __navalSoakFinish() at the end.
+    if (window.__navalSoakExternal) { log('setup done — EXTERNAL drive mode (call __navalSoakStep(t) per game-second)'); return R; }
+
+    // ── the paced soak loop (visible-host driver): 60 logic frames + ~930ms
+    //    wall = 1× game speed. On hidden embedded pages setTimeout gets
+    //    intensively throttled after ~5min — drive __navalSoakStep from the
+    //    DEVTOOLS/console side instead (window.__navalSoakStep(t)). ──
+    const iters = Math.floor(minutes * 60);
+    for (let t = 0; t < iters; t++) {
+        const cont = await window.__navalSoakStep(t);
+        if (!cont) { log('aborted'); break; }
+        await new Promise(r => setTimeout(r, 930));
+    }
+    return window.__navalSoakFinish();
+};
+
+// ONE paced soak second (t = seconds elapsed). Returns false when aborted.
+// Node-side driver pattern (immune to page timer throttling):
+//   for (t=0..599) { evaluate(__navalSoakStep(t)); await sleep(930); }
+window.__navalSoakStep = async function (t) {
+    const S = _soak;
+    if (!S || window.__navalSoakAbort) return false;
+    const C = GAME_CONSTANTS, R = S.R;
+    await S.pump(60);
+    // player-like cadence: stance cycle + formation order + mines every 2min
+    if (t > 0 && t % 120 === 0) {
+        // log-rate: lines above the PREVIOUS marker = last 2min of combat log
+        const el = document.getElementById('slog');
+        if (el) {
+            let n = 0;
+            for (const k of el.children) {
+                if ((k.textContent || '').includes('دورة النقع')) break;
+                n++;
+            }
+            R._lines2min = n;
+        }
+        fleetStanceIdx = (fleetStanceIdx + 1) % C.FLEET_STANCES.length;
+        const mine = S.fleet.filter(w => !w.dead && w.owner === myRole);
+        if (mine.length >= 2) assignFormation(NAVAL_CTX, myRole, 34.5, -155.5, mine);   // advance INTO the contact zone
+        const active = mineFields.filter(f => !f.dead && f.owner === myRole).length;
+        if (active < C.MINE_CAP) layMineField(NAVAL_CTX, myRole, { lat: 34.5 + (Math.random() - 0.5) * 2, lon: -155.5 + (Math.random() - 0.5) * 2 });   // between the fleets — bot patrols cross it
+        logEvent(`⚓ دورة النقع t+${Math.round(t / 60)}min — تشكيل ${C.FLEET_STANCES[fleetStanceIdx]} + ألغام (${active}/${C.MINE_CAP})`, 'info');
+    }
+    // sample every 15s: alive diff → sink attribution, slog scan
+    if (t % 15 === 0) {
+        S.scanSlog();
+        const now = S.snap();
+        const keys = new Set([...Object.keys(S.prev), ...Object.keys(now)]);
+        for (const k of keys) {
+            const lost = (S.prev[k] || 0) - (now[k] || 0);
+            if (lost > 0) R.events.sink[k] = (R.events.sink[k] || 0) + lost;
+        }
+        S.prev = now;   // REPLACE (merge semantics re-counted dead classes every sample)
+        R.samples.push({ t: Math.round(t / 60), alive: { ...now } });
+        if (t - S.logMark >= 120) {
+            S.logMark = t;
+            const alive = Object.entries(now).map(([k, v]) => `${k}=${v}`).join(' ');
+            console.log('%c[NAVAL-SOAK] t+' + Math.round(t / 60) + 'min — torp=' + R.events.torpHit + ' mine=' + R.events.mineHit + ' aa=' + R.events.aaKill + ' | ' + alive, 'color:#7fffd4');
+        }
+    }
+    return true;
+};
+
+window.__navalSoakFinish = function () {
+    const S = _soak;
+    if (!S) return null;
+    const R = S.R;
+    R.alive = S.snap();
+    R.logRatePerMin = R._lines2min != null ? +(R._lines2min / 2).toFixed(1) : null;
+    const sinkTotal = Object.values(R.events.sink).reduce((s, v) => s + v, 0);
+    console.log('%c[NAVAL-SOAK] DONE — sinks=' + sinkTotal + ' torp=' + R.events.torpHit + ' mine=' + R.events.mineHit + ' aa=' + R.events.aaKill + ' logRate=' + R.logRatePerMin + '/min', 'color:#7fffd4;font-weight:bold');
+    console.log('%c[NAVAL-SOAK] sinks → ' + JSON.stringify(R.events.sink) + ' | survivors → ' + JSON.stringify(R.alive), 'color:#7fffd4');
+    logEvent(`🧪 النقع البحري انتهى: ${sinkTotal} غرقة — انظر __navalSoakResult`, 'info');
+    _soak = null;
+    return R;
+};
+window.__navalSoakAbort = false;
 
 
 // ═══════════════════════════════════════════════════════════════════════
