@@ -80,39 +80,40 @@ export const MTAGS={
  * Was: 10 near-identical 15-field one-liners (every stat repeated per type;
  * adding a field meant editing 10 lines and missing one). Now each ROLE
  * carries the doctrine defaults and each TYPE declares identity + deltas.
- * Merged at module load — every existing key/value is IDENTICAL to v1
- * (probe __ffaProbe.airConfigCheck() asserts this against the frozen v1
- * table). New doctrine fields:
+ * Merged at module load. TASK-501 hygiene: v1 flavor fields the game never
+ * read (col / trainTime / canards / the `tanker:true` flag) were removed —
+ * the __ffaProbe.qaTest() probe asserts PCFG integrity (every type carries
+ * the live doctrine fields, no NaN). Doctrine fields:
  *   sead       — can fire anti-radiation missiles at EMITTING radars/SAMs
  *   napOfEarth — heli doctrine: flies below radar (ground AA range/accuracy −50%)
  *   alt        — cruise altitude in globe units (heli 26 … AWACS/tanker 64)
- *   tanker     — air-to-air refueling source (KC-135) */
+ *   role 'tanker' — air-to-air refueling source (KC-135) */
 const PCFG_ROLE_DEFAULTS = {
- air:      { aaAmmo:8,  agAmmo:0,  gunAmmo:500,  aamCount:2, flares:8,  turnRate:.15, gunCaliber:1,  allAspect:false, canards:false, sead:true,  napOfEarth:false, alt:50 },
- intercept:{ aaAmmo:12, agAmmo:0,  gunAmmo:450,  aamCount:3, flares:4,  turnRate:.18, gunCaliber:1,  allAspect:true,  canards:false, sead:false, napOfEarth:false, alt:50 },
- ground:   { aaAmmo:2,  agAmmo:10, gunAmmo:200,  aamCount:0, flares:8,  turnRate:.07, gunCaliber:.5, allAspect:false, canards:false, sead:false, napOfEarth:false, alt:50 },
- cas:      { aaAmmo:2,  agAmmo:24, gunAmmo:1200, aamCount:1, flares:14, turnRate:.07, gunCaliber:3,  allAspect:false, canards:false, sead:false, napOfEarth:false, alt:34 },
- heli:     { aaAmmo:4,  agAmmo:16, gunAmmo:1200, aamCount:2, flares:10, turnRate:.25, gunCaliber:1,  allAspect:false, canards:false, sead:false, napOfEarth:true,  alt:26 },
- awacs:    { aaAmmo:0,  agAmmo:0,  gunAmmo:0,    aamCount:0, flares:6,  turnRate:.05, gunCaliber:0,  allAspect:false, canards:false, sead:false, napOfEarth:false, alt:64 },
- stealth:  { aaAmmo:4,  agAmmo:8,  gunAmmo:0,    aamCount:4, flares:10, turnRate:.09, gunCaliber:0,  allAspect:true,  canards:false, sead:false, napOfEarth:false, alt:56 },
- tanker:   { aaAmmo:0,  agAmmo:0,  gunAmmo:0,    aamCount:0, flares:6,  turnRate:.05, gunCaliber:0,  allAspect:false, canards:false, sead:false, napOfEarth:false, alt:64 },
+ air:      { aaAmmo:8,  agAmmo:0,  gunAmmo:500,  aamCount:2, flares:8,  turnRate:.15, gunCaliber:1,  allAspect:false, sead:true,  napOfEarth:false, alt:50 },
+ intercept:{ aaAmmo:12, agAmmo:0,  gunAmmo:450,  aamCount:3, flares:4,  turnRate:.18, gunCaliber:1,  allAspect:true,  sead:false, napOfEarth:false, alt:50 },
+ ground:   { aaAmmo:2,  agAmmo:10, gunAmmo:200,  aamCount:0, flares:8,  turnRate:.07, gunCaliber:.5, allAspect:false, sead:false, napOfEarth:false, alt:50 },
+ cas:      { aaAmmo:2,  agAmmo:24, gunAmmo:1200, aamCount:1, flares:14, turnRate:.07, gunCaliber:3,  allAspect:false, sead:false, napOfEarth:false, alt:34 },
+ heli:     { aaAmmo:4,  agAmmo:16, gunAmmo:1200, aamCount:2, flares:10, turnRate:.25, gunCaliber:1,  allAspect:false, sead:false, napOfEarth:true,  alt:26 },
+ awacs:    { aaAmmo:0,  agAmmo:0,  gunAmmo:0,    aamCount:0, flares:6,  turnRate:.05, gunCaliber:0,  allAspect:false, sead:false, napOfEarth:false, alt:64 },
+ stealth:  { aaAmmo:4,  agAmmo:8,  gunAmmo:0,    aamCount:4, flares:10, turnRate:.09, gunCaliber:0,  allAspect:true,  sead:false, napOfEarth:false, alt:56 },
+ tanker:   { aaAmmo:0,  agAmmo:0,  gunAmmo:0,    aamCount:0, flares:6,  turnRate:.05, gunCaliber:0,  allAspect:false, sead:false, napOfEarth:false, alt:64 },
 };
 const PCFG_SPECS = {
- heli:        { name:'AH-64 Apache',   hp:140, spd:2.8, fuel:900,  cost:380,  col:'#44aa66', role:'heli',      trainTime:180 },
- fighter:     { name:'F-16 Falcon',    hp:90,  spd:5.5, fuel:900,  cost:450,  col:'#00ff88', role:'air',       trainTime:240, flares:6 },
- bomber:      { name:'Su-24 Fencer',   hp:120, spd:3.2, fuel:1100, cost:500,  col:'#ffaa44', role:'ground',    trainTime:300 },
- interceptor: { name:'MiG-29 Fulcrum', hp:75,  spd:7.5, fuel:700,  cost:570,  col:'#88ccff', role:'intercept', trainTime:240 },
- a10:         { name:'A-10 Warthog',   hp:200, spd:2.5, fuel:1400, cost:620,  col:'#88bbcc', role:'cas',       trainTime:360, agAmmo:30, gunAmmo:1350, flares:16, turnRate:.08, gunCaliber:4 },
- gunship:     { name:'AC-130 Spectre', hp:150, spd:2.5, fuel:1200, cost:720,  col:'#cc8844', role:'cas',       trainTime:420, aaAmmo:0, agAmmo:20, gunAmmo:999, aamCount:0, flares:12, turnRate:.05 },
- awacs:       { name:'E-3 Sentry',     hp:80,  spd:3,   fuel:2000, cost:780,  col:'#00ffcc', role:'awacs',     trainTime:480 },
- su57:        { name:'Su-57 Felon',    hp:130, spd:8,   fuel:1200, cost:920,  col:'#aa88ff', role:'air',       trainTime:500, agAmmo:4, aamCount:4, turnRate:.19, gunCaliber:1.2, allAspect:true, canards:true },
- stealth:     { name:'B-2 Spirit',     hp:80,  spd:4,   fuel:1500, cost:1000, col:'#667788', role:'stealth',   trainTime:600 },
- f22:         { name:'F-22 Raptor',    hp:120, spd:9,   fuel:1100, cost:1100, col:'#aaddff', role:'air',       trainTime:500, aaAmmo:10, agAmmo:2, gunAmmo:480, aamCount:4, turnRate:.20, gunCaliber:1.2, allAspect:true },
+ heli:        { name:'AH-64 Apache',   hp:140, spd:2.8, fuel:900,  cost:380,  role:'heli'      },
+ fighter:     { name:'F-16 Falcon',    hp:90,  spd:5.5, fuel:900,  cost:450,  role:'air',       flares:6 },
+ bomber:      { name:'Su-24 Fencer',   hp:120, spd:3.2, fuel:1100, cost:500,  role:'ground'    },
+ interceptor: { name:'MiG-29 Fulcrum', hp:75,  spd:7.5, fuel:700,  cost:570,  role:'intercept' },
+ a10:         { name:'A-10 Warthog',   hp:200, spd:2.5, fuel:1400, cost:620,  role:'cas',       agAmmo:30, gunAmmo:1350, flares:16, turnRate:.08, gunCaliber:4 },
+ gunship:     { name:'AC-130 Spectre', hp:150, spd:2.5, fuel:1200, cost:720,  role:'cas',       aaAmmo:0, agAmmo:20, gunAmmo:999, aamCount:0, flares:12, turnRate:.05 },
+ awacs:       { name:'E-3 Sentry',     hp:80,  spd:3,   fuel:2000, cost:780,  role:'awacs'     },
+ su57:        { name:'Su-57 Felon',    hp:130, spd:8,   fuel:1200, cost:920,  role:'air',       agAmmo:4, aamCount:4, turnRate:.19, gunCaliber:1.2, allAspect:true },
+ stealth:     { name:'B-2 Spirit',     hp:80,  spd:4,   fuel:1500, cost:1000, role:'stealth'   },
+ f22:         { name:'F-22 Raptor',    hp:120, spd:9,   fuel:1100, cost:1100, role:'air',       aaAmmo:10, agAmmo:2, gunAmmo:480, aamCount:4, turnRate:.20, gunCaliber:1.2, allAspect:true },
  /* ── NEW (TASK-401): KC-135 — flying gas station. Buddy-refuels every friendly
   * aircraft inside AIR_TANKER_RANGE (CAPs extend indefinitely; a bingo RTB
   * cancels once topped past AIR_TANKER_RESUME_PCT). AWACS orbit-refuel at a
   * slower buddy rate (see AirCombat.tickRefuel). */
- tanker:      { name:'KC-135 Tanker',  hp:110, spd:3.2, fuel:2400, cost:850,  col:'#88aaff', role:'tanker',    trainTime:420, tanker:true },
+ tanker:      { name:'KC-135 Tanker',  hp:110, spd:3.2, fuel:2400, cost:850,  role:'tanker'    },
 };
 export const PCFG = {};
 for (const _k in PCFG_SPECS) {

@@ -3590,6 +3590,76 @@ window.__ffaProbe = {
     // tests even when the tab is hidden (RAF throttles to zero in background).
     step: (n = 1) => { for (let i = 0; i < n; i++) gameFrame(); return window.__perfState.frames; },
     airStats: () => ({ ...window.__airStats, planes: planes.length, aams: aamMissiles.length }),
+    // ═══ TASK-501: air mastery QA summary — one call, every air invariant ═══
+    qaTest: () => {
+        const R = { pass: true, checks: [] };
+        const ck = (n, ok, d) => { R.checks.push({ n, ok: !!ok, d: d === undefined ? '' : d }); if (!ok) R.pass = false; };
+        // 1. PCFG integrity: every type carries the live doctrine fields, no NaN
+        const NEED = ['name', 'hp', 'spd', 'fuel', 'cost', 'role', 'flares', 'turnRate',
+            'gunCaliber', 'aaAmmo', 'agAmmo', 'gunAmmo', 'aamCount', 'alt', 'sead', 'napOfEarth'];
+        let cfgOk = true, cfgBad = '';
+        outer: for (const k in PCFG) for (const f of NEED) {
+            const v = PCFG[k][f];
+            if (v === undefined || (typeof v === 'number' && !isFinite(v))) { cfgOk = false; cfgBad = `${k}.${f}`; break outer; }
+        }
+        ck('PCFG integrity', cfgOk, cfgOk ? `${Object.keys(PCFG).length} types × ${NEED.length} fields` : `missing/NaN: ${cfgBad}`);
+        ck('no dead PCFG fields', !('trainTime' in PCFG['fighter']) && !('col' in PCFG['fighter']) && !('canards' in PCFG['su57']) && !('tanker' in PCFG['tanker']), 'TASK-501 hygiene');
+        // 2. fresh-plane invariants + rwrT cooldown wiring
+        const p = new Plane(0, 0, PCFG['fighter'], myRole);
+        ck('rwrT starts 0', p.rwrT === 0);
+        ck('veterancy starts clean', p.vetLevel === 0 && p.kills === 0 && p.xp === 0);
+        p.rwrT = 2; p.fuel = 500; p.parked = false; p.mode = 'patrol';
+        p.update();
+        ck('rwrT decrements per tick', p.rwrT === 1, `rwrT=${p.rwrT}`);
+        p.dead = true; if (p.mesh) { scene.remove(p.mesh); disposeMeshDeep(p.mesh); }
+        // 3. AIR_RWR_FRAMES constant sane + RWR respects the TASK-408 mixer
+        ck('AIR_RWR_FRAMES sane', GAME_CONSTANTS.AIR_RWR_FRAMES > 0, `${GAME_CONSTANTS.AIR_RWR_FRAMES}f`);
+        ck('RWR on the alerts bus (408 mixer)', typeof SFX.rwr === 'function' && typeof SFX._bus === 'function');
+        // 4. module bridge intact (every AirCombat entry point callable)
+        ck('AirCombat module surface', ['dogfightScan', 'dogfightWeapons', 'strikeTick', 'parkedTick',
+            'tickRefuel', 'squadronSteer', 'vfxTick', 'tickWrecks', 'clearWrecks', 'spawnWreck',
+            'formSquadron', 'leaderDown', 'awardKill', 'seadAcquire', 'seadStrike', 'carpetBomb',
+            'precisionStrike', 'lightStrike', 'gunStrafe', 'gunshipOrbit'].every(m => typeof AirCombat[m] === 'function'));
+        // 5. squadron formation: top-XP leads, wingmen bound with offsets
+        const a = new Plane(0, 0, PCFG['fighter'], myRole); a.xp = 100;
+        const b = new Plane(0, 0, PCFG['fighter'], myRole); b.xp = 10;
+        const sq = AirCombat.formSquadron([a, b], AIRW);
+        ck('squadron forms (2+)', !!sq && sq.members.length === 2);
+        ck('leader = top XP', sq && sq.leader === a);
+        ck('wingman bound', b.squadLead === a && !!b.squadOff && b.squad === a.squad);
+        // 6. fuel-toast fleet rate-limit static is per-game (reset with frame)
+        ck('fuel-toast limiter per-game', Plane._lastFuelToastF === 0 || Plane._lastFuelToastF <= frame, `set@${Plane._lastFuelToastF} frame=${frame}`);
+        // 7. airStats counter surface
+        ck('airStats counters', ['aamFired', 'aamHits', 'gunBursts', 'flaresUsed', 'planesDowned',
+            'strikeRuns', 'samAtPlanes', 'flakHits', 'droneKills', 'seadKills'].every(k => k in window.__airStats));
+        for (const q of [a, b]) { q.dead = true; if (q.mesh) { scene.remove(q.mesh); disposeMeshDeep(q.mesh); } }
+        R.summary = `${R.checks.filter(c => c.ok).length}/${R.checks.length} air QA checks pass`;
+        return R;
+    },
+    // ═══ TASK-501 OPTIMIZE: at-scale measurement — N vs N fighters converge;\n    // dogfight scans + vfx + movement at full load. airPerf() reports the\n    // numbers (logic ms from __perf + renderer draw calls). ═══
+    airPerfTest: (n = 24) => {
+        for (let i = 0; i < n; i++) {
+            const a = new Plane(20 + (i % 6) * 0.3, -40 - Math.floor(i / 6) * 0.35, PCFG['fighter'], myRole);
+            a.parked = false; a.mode = 'patrol'; a.tlat = 20.5; a.tlon = -39.5; a.fuel = a.maxFuel;
+            const b = new Plane(20.6 + (i % 6) * 0.3, -39.4 - Math.floor(i / 6) * 0.35, PCFG['interceptor'], 'enemy');
+            b.parked = false; b.mode = 'patrol'; b.tlat = 20.2; b.tlon = -39.7; b.fuel = b.maxFuel;
+            planes.push(a, b);
+        }
+        window.__apT = { t0: performance.now(), n: n * 2, f0: frame };
+        return `staged ${n * 2} fighters converging — call airPerf() after a few seconds of combat`;
+    },
+    airPerf: () => {
+        const t = window.__apT; if (!t) return null;
+        const perf = window.__perf();
+        return {
+            planes: planes.filter(p => !p.dead).length,
+            framesRun: frame - t.f0,
+            avgGameFrameMs: perf.avgGameFrameMs, p95Ms: perf.p95Ms,
+            drawCalls: renderer.info ? renderer.info.render.calls : null,
+            aamsAlive: aamMissiles.length,
+            ms: Math.round(performance.now() - t.t0),
+        };
+    },
     // model-chain sanity: build every PCFG type once, report GLB/OBJ/proxy source
     airModelsCheck: () => {
         if (!scene) return 'start a game first (scene not ready)';
@@ -3754,15 +3824,19 @@ window.__ffaProbe = {
     // TASK-401×402 QA: air-vs-ship strike — verifies the lead-ported hull
     // acquisition in AirCombat.strikeTick + the _shipTarget wrapper end-to-end
     // (A-10 acquires the hull, precision strike damages it ×AIR_STRIKE_SHIP_MUL).
+    // TASK-501 determinism: stage at ~150km (CAS release range is 45 — the old
+    // 650km chase needed 1500+ frames and raced the ship's reversing patrol;
+    // park the hull so the run is clock-stable in visible tabs).
     airVsShipTest: () => {
-        const w = new Warship('enemy', { lat: 24, lon: -36 }, { lat: 25, lon: -37 });
+        const w = new Warship('enemy', { lat: 24, lon: -36 }, { lat: 24.05, lon: -35.95 });
         warships.push(w);
         w.aaCd = 99999;   // neuter fleet AA — this probe verifies the STRIKE path (AA lethality is navalBattleTest's job)
-        const p = new Plane(24.6, -40.8, PCFG['a10'], myRole);
+        w.mode = 'hold'; w.wp = null;   // TASK-501: freeze the hull at its spawn (deterministic geometry)
+        const p = new Plane(24.6, -35.1, PCFG['a10'], myRole);
         planes.push(p);
         p.parked = false; p.mode = 'attack'; p.tlat = w.curLat; p.tlon = w.curLon;
         window.__avsT = { p, w, hp0: w.hp, s0: { ...window.__airStats } };
-        return 'staged: A-10 attack vs enemy warship (AA neutered, hull acquisition path)';
+        return 'staged: A-10 ~130km from a HOLDING enemy warship (AA neutered, hull acquisition path)';
     },
     airVsShipResult: () => {
         const t = window.__avsT; if (!t) return null;
@@ -5647,6 +5721,7 @@ const AIRCRAFT_GLB_MANIFEST = {
     su57:        { file: 'su57.glb',        span: 14.0 },  // Su-57
     stealth:     { file: 'stealth.glb',     span: 52.4 },  // B-2
     f22:         { file: 'f22.glb',         span: 13.6 },  // F-22
+    tanker:      { file: 'tanker.glb',      span: 39.9 },  // KC-135 (TASK-501: entry was missing — an authored tanker.glb never loaded)
 };
 // Real wingspans span 10-52m — mapped onto a 9-24 globe-unit range so every
 // aircraft stays visible at globe scale while relative size still reads.
@@ -6984,9 +7059,14 @@ class Structure {
                         spawnExp(p.lat + rnd(-0.05, 0.05), p.lon + rnd(-0.06, 0.06), 1.5, '#888888');   // broken-lock puff
                         window.__airStats.samLockMisses++;
                     } else {
-                        // TASK-401 RWR: lock tone warns player crews as the battery fires
-                        if (p.owner === myRole && SFX && SFX.rwr) SFX.rwr();
-                        p.rwrT = GAME_CONSTANTS.AIR_RWR_FRAMES;
+                        // TASK-401 RWR: lock tone warns player crews as the battery
+                        // fires. TASK-501: rwrT is a real cooldown now — several
+                        // batteries engaging inside one window ring ONE tone, not
+                        // a beep storm (the interceptor itself always fires).
+                        if (p.rwrT <= 0) {
+                            if (p.owner === myRole && SFX && SFX.rwr) SFX.rwr();
+                            p.rwrT = GAME_CONSTANTS.AIR_RWR_FRAMES;
+                        }
                         fireSAMPlane(this, p);
                         window.__airStats.samAtPlanes++;
                     }
@@ -7626,6 +7706,7 @@ class Plane {
         this.xp = 0; this.kills = 0; this.vetLevel = 0;
         this._airC = GAME_CONSTANTS;   // constants handle for AirCombat.W_C
         this.gunT = 0;             // gun burst cooldown
+        this.rwrT = 0;             // TASK-501: RWR lock-tone cooldown (AIR_RWR_FRAMES)
         this.strikeCd = 0;         // weapon-release cooldown (per pass)
         this.overshootT = 0;       // post-pass fly-through (breaks orbit lock)
         this.awacsBoost = false;   // set when a friendly AWACS is nearby
@@ -7726,6 +7807,7 @@ class Plane {
 
         if (this.fireT > 0) this.fireT--;
         if (this.gunT > 0) this.gunT--;
+        if (this.rwrT > 0) this.rwrT--;   // TASK-501: RWR lock-tone cooldown
         if (this.strikeCd > 0) this.strikeCd--;
         if (this.overshootT > 0) this.overshootT--;
 
@@ -12052,6 +12134,8 @@ function updateSelectionPanel() {
             statsHtml += `<div class="sstat"><span>🔫 رشاش</span><span>${Math.floor(unit.gunAmmo)}/${unit.maxGun}</span></div>`;
             statsHtml += `<div class="sstat"><span>✨ شعلات</span><span>${Math.floor(unit.flares)}/${unit.maxFlares}</span></div>`;
             statsHtml += `<div class="sstat"><span>⭐ رتبة</span><span>${AIR_VET_NAMES[unit.vetLevel || 0]}${unit.kills ? ' · ' + unit.kills + '⚔' : ''}</span></div>`;
+            // TASK-501: squadron membership — leader badge or wingman station
+            if (unit.squad) statsHtml += `<div class="sstat"><span>🎖 السرب</span><span>#${unit.squad} · ${unit.squadLead ? 'جناح ' + (unit.squadIdx || 1) : 'القائد'}</span></div>`;
         } else if (unit instanceof Warship) {
             statsHtml += `<div class="sstat"><span>الوضع</span><span>${unit.invading ? 'إنزال ⚔' : unit.mode}</span></div>`;
             if (unit.hullClass === 'transport') statsHtml += `<div class="sstat"><span>القوات</span><span>${Math.floor(unit.troops).toLocaleString('en')}</span></div>`;
@@ -12082,8 +12166,22 @@ function updateSelectionPanel() {
         if(sel.warships.length) info.push(`🚢 ${sel.warships.length} سفينة`);
         if(sel.tanks.length) info.push(`🚜 ${sel.tanks.length} فرقة`);
         if(sel.structs.length) info.push(`🏗 ${sel.structs.length} مبنى`);
+        // TASK-501 squadron polish: a 2-4 plane multi-select previews the
+        // squadron that forms on the next order — leader (top XP) with rank,
+        // total kills, mean fuel — so the player reads the wing before
+        // committing it (matches AirCombat.formSquadron's leader pick).
+        let sqRows = '';
+        if (sel.planes.length >= 2 && sel.planes.length <= GAME_CONSTANTS.AIR_SQ_MAX) {
+            const alive = sel.planes.filter(p => !p.dead);
+            if (alive.length >= 2) {
+                const lead = alive.reduce((a, b) => ((b.xp || 0) > (a.xp || 0) ? b : a));
+                const kills = alive.reduce((n, p) => n + (p.kills || 0), 0);
+                const fuel = Math.round(alive.reduce((n, p) => n + p.fuel / p.maxFuel, 0) / alive.length * 100);
+                sqRows = `<div class="sstat"><span>🎖 تشكيل سرب (${alive.length})</span><span>${lead.cfg.name} · ${AIR_VET_NAMES[lead.vetLevel || 0]} · ${kills}⚔ · ⛽${fuel}%</span></div>`;
+            }
+        }
         document.getElementById('selStats').innerHTML = 
-            `<div class="sstat"><span>${info.join(' | ')}</span></div>`;
+            `<div class="sstat"><span>${info.join(' | ')}</span></div>` + sqRows;
     }
     
     // Action buttons
@@ -12974,17 +13072,6 @@ window.addEventListener('click', async e => {
         }
         launchTransportInvasion(target, 'player');
         updateHUD();
-    } else if (typeof targetingMode === 'string' && targetingMode.startsWith('plane_')) {
-        let mode = targetingMode.split('_')[1];
-        let selPlanes = planes.filter(p => p.owner===myRole && !p.dead);
-        selPlanes.forEach(p => {
-            p.mode = mode;
-            p.tlat = loc.lat;
-            p.tlon = loc.lon;
-            p.parked = false;
-            if(isOnline) sendAction({ type: 'plane_move', ptype: 'fighter', tlat: loc.lat, tlon: loc.lon }); 
-        });
-        targetingMode = false;
     } else {
         if (window.gameMode === 'mode1' && loc && isLand(loc.lat, loc.lon) && getPixelOwner(loc.lat, loc.lon) !== 'player') {
             let bestDist = Infinity;
@@ -13179,6 +13266,11 @@ function initWorld(difficulty, pCountryKey='usa', eCountryKey='random', gameMode
     planes.forEach(p => { if(p.mesh) { scene.remove(p.mesh); disposeMeshDeep(p.mesh); } if(p.selRing) { scene.remove(p.selRing); disposeMeshDeep(p.selRing); } });
     aamMissiles.forEach(m => { if(m.mesh) { scene.remove(m.mesh); if(m.mesh.material) _recycleMat(m.mesh.material); } });   // TASK-201 AAM tracers
     AirCombat.clearWrecks();                          // TASK-401 falling wrecks
+    // TASK-501: per-game air state — stat counters + the fleet fuel-toast
+    // rate-limit static must not leak across games (frame resets to 0, so a
+    // stale large _lastFuelToastF silently suppressed toasts in game #2+).
+    for (const _ak in window.__airStats) window.__airStats[_ak] = 0;
+    Plane._lastFuelToastF = 0;
     exps.forEach(e => { scene.remove(e); disposeMeshDeep(e); });
     particles.forEach(p => { scene.remove(p); disposeMeshDeep(p); });
     tradeShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
@@ -15872,11 +15964,7 @@ const G = {
             controls.update();
         }
     },
-    orderPlanes: function(mode) {
-        targetingMode = 'plane_' + mode;
-        document.getElementById('tgtMsg').textContent = 'اختر هدف الطائرات (' + mode + ')';
-        document.getElementById('tgtMsg').style.display='block';
-    },
+    orderPlanes: null,   // TASK-501: removed — legacy targetingMode ordering replaced by the radial menu (window.orderPlanesAt); the dead path still sent hardcoded ptype:'fighter' with no pid
     toggleAutoSAM: function() {
         autoSAM = !autoSAM;
         const _asam = document.getElementById('btnASAM');
@@ -15896,6 +15984,9 @@ const G = {
         sel.planes.forEach(p => {
             p.mode = mode;
             if(mode !== 'return') p.parked = false;
+            // TASK-501: online sync — mode flips from the panel buttons mirror
+            // like radial-menu orders do (was local-only).
+            if (isOnline) sendAction({ type: 'plane_move', ptype: p.pkey, pid: p.id, tlat: p.tlat, tlon: p.tlon, mode });
         });
         updateSelectionPanel();
     },
@@ -15934,7 +16025,7 @@ function backToMenu() {
     particles.forEach(p => { scene.remove(p); disposeMeshDeep(p); });
     if (window.paintExpansions) window.paintExpansions.forEach(pe => { if(pe.mesh) { scene.remove(pe.mesh); disposeMeshDeep(pe.mesh); } });
     cleanupTerritory();
-    structs = []; missiles = []; planes = []; drones = []; exps = []; particles = [];
+    structs = []; missiles = []; planes = []; drones = []; aamMissiles = []; exps = []; particles = [];   // TASK-501: aamMissiles array too (audit #12 remnant — meshes were disposed but entries leaked)
     tradeShips = []; trains = []; troopCohorts = []; transportShips = []; warships = [];
     tanks = [];   // TASK-302
     transients = []; craterDecals = [];
@@ -16032,13 +16123,17 @@ function purchasePlane(k, fromRowId) {
     // Prefer the selected airport, else nearest player airport
     let apt = structs.find(s => s.selected && s.owner === myRole && !s.dead && s.type === 'airport');
     if (!apt) {
+        // Fallback: airport nearest the camera's ground focus (the player is
+        // usually reinforcing the front they're looking at). TASK-501: was a
+        // first-found loop with dead `haversineDist(...)*0+1` math that
+        // contradicted the "nearest airport" contract in the comment above.
+        const focus = vec3ToLatLon(_airV1.copy(camera.position).normalize());
         let best = Infinity;
-        structs.forEach(s => {
-            if (s.owner === myRole && !s.dead && s.type === 'airport') {
-                const d = haversineDist(s.lat, s.lon, 0, 0) * 0 + 1; // any airport qualifies
-                if (best === Infinity) { best = 0; apt = s; } // first found
-            }
-        });
+        for (const s of structs) {
+            if (s.owner !== myRole || s.dead || s.type !== 'airport') continue;
+            const d = haversineDist(focus.lat, focus.lon, s.lat, s.lon);
+            if (d < best) { best = d; apt = s; }
+        }
     }
     const feedback = (txt, isErr) => {
         let el = document.getElementById('planeMsg');
@@ -16053,6 +16148,10 @@ function purchasePlane(k, fromRowId) {
     if (!econFuelSpend(myRole, GAME_CONSTANTS.ECON_FUEL_COST_PLANE)) { feedback(`⛽ وقود غير كافٍ للنشر! تحتاج ${GAME_CONSTANTS.ECON_FUEL_COST_PLANE}`, true); SFX.ui('err'); return; }
     pRes -= PCFG[k].cost;
     planes.push(new Plane(apt.lat, apt.lon, PCFG[k], myRole));
+    // TASK-501: online sync — the receiver (applyOpponentAction spawn_plane;
+    // navy's deck-CAP path + TASK-404 fuel mirror already use it) now hears
+    // about player purchases too.
+    if (isOnline) sendAction({ type: 'spawn_plane', lat: apt.lat, lon: apt.lon, ptype: k });
     feedback(`${PCFG[k].name} أقلعت من المطار ✈️`, false);
     SFX.ui('build');
     logEvent(`${PCFG[k].name} أقلعت من المطار ✈️`, 'info');
