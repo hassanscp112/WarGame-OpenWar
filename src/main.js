@@ -11845,7 +11845,11 @@ window.economyTest = function(followSec) {
         const r3 = econRatesFromSnapshot({ troops: C.WAR_UPKEEP_FREE_TROOPS });
         chk('army at free threshold costs 0', r3.parts.army === 0);
         const r5 = econRatesFromSnapshot({ base: 1, factoryLinks: [0, 0], milestoneMul: 1.1 });
-        chk('milestone × factory multipliers stack', Math.abs(r5.income - C.INCOME_BASE * 60 * (1 + 2 * C.FACTORY_MULTIPLIER) * 1.1) < 1e-9);
+        // NOTE (supervisor fix): factoryLinks:[0,0] = TWO factories — each also
+        // contributes its OWN income to the subtotal before the multipliers.
+        // The old expectation forgot that (expected 12.87 vs actual 26.60).
+        chk('milestone × factory multipliers stack',
+            Math.abs(r5.income - (C.INCOME_BASE * 60 + 2 * C.INCOME_FACTORY * 60) * (1 + 2 * C.FACTORY_MULTIPLIER) * 1.1) < 1e-9);
         const r6 = econRatesFromSnapshot({ portCityLinks: 2 });
         chk('port↔city throughput income', Math.abs(r6.parts.synergy - 2 * C.SYNERGY_PORT_CITY_INCOME) < 1e-9, r6.parts.synergy.toFixed(2) + '/s');
     }
