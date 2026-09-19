@@ -6860,6 +6860,7 @@ class Missile {
         }
     }
     explode() {
+        if (this.dead) return;   // AUDIT FIX #2b: idempotent explode
         this.dead = true;
         scene.remove(this.mesh);
         // Per-instance accent materials die with the missile; shared hull
@@ -6904,14 +6905,16 @@ class Missile {
                     spawnExp(s.lat, s.lon, 3, '#00ffcc');
                 }
             });
+            this._hitTroops(dmg * 0.5, blastR);   // AUDIT FIX #5: crews suffer too
         } else if (this.mkey === 'thermobaric') {
             // Fuel-air: primary blast + 2 delayed secondary fireballs (40% each)
             structs.forEach(s => {
                 if (s.owner !== this.owner && !s.dead && dst(this, s) < blastR) s.hit(dmg);
             });
             this._hitTroops(dmg * (cfg.troopMul || 1) * 0.6, blastR * 1.2);
+            const _sess = gameSessionId;   // AUDIT FIX #11: restart-defeating guard (gOver alone is reset by the next boot)
             [400, 850].forEach(d => setTimeout(() => {
-                if (gOver) return;
+                if (gOver || _sess !== gameSessionId) return;
                 const l2 = this.lat + rnd(-rad / 110, rad / 110), o2 = this.lon + rnd(-rad / 110, rad / 110);
                 spawnExp(l2, o2, rad / 12, '#ff5500');
                 structs.forEach(s => {
@@ -6924,6 +6927,7 @@ class Missile {
             structs.forEach(s => {
                 if (s.owner !== this.owner && !s.dead && dst(this, s) < blastR) s.hit(dmg * (HARD[s.type] ? 2.2 : 0.7));
             });
+            this._hitTroops(dmg * 0.6, blastR);   // AUDIT FIX #5: garrison casualties
         } else if (this.mkey === 'nuke_tac') {
             // W80: falloff damage + white flash + blast-EMP on survivors
             _nukeFlash();
@@ -6936,6 +6940,7 @@ class Missile {
                     }
                 }
             });
+            this._hitTroops(dmg, blastR * 1.4);   // AUDIT FIX #5: nukes annihilate field armies + fleets
         } else {
             structs.forEach(s => {
                 if (s.owner !== this.owner && !s.dead && dst(this, s) < blastR) {
@@ -6953,19 +6958,26 @@ class Missile {
     // TASK-204 anti-troop: damage committed troop cohorts inside radiusUnits
     // (world units). Cluster is the shredder (troopMul 3.2), thermobaric burns
     // formations, others cause incidental casualties.
+    // Also handles TASK-202 anti-ship splash (hulls at ×2) — AUDIT FIX #1/#4:
+    // previously referenced out-of-scope blastR/dmg (ReferenceError crash loop
+    // whenever cohorts AND warships coexisted) and was gated on troopCohorts
+    // being non-empty (pure naval battles never damaged hulls).
     _hitTroops(dmgPer, radiusUnits) {
-        if (!troopCohorts.length || dmgPer <= 0) return;
-        for (const tc of troopCohorts) {
-            if (tc.dead || tc.owner === this.owner) continue;
-            const ll = vec3ToLatLon(tc.mesh.position);
-            if (haversineDist(this.lat, this.lon, ll.lat, ll.lon) < radiusUnits) {
-                const kill = Math.floor(dmgPer * 12);   // dmg scale → troops
-                tc.troops -= kill;
-                spawnExp(ll.lat, ll.lon, 3, '#ff8866');
-                if (tc.troops <= 0) {
-                    tc.dead = true;
-                    scene.remove(tc.mesh);
-                    if (tc.mesh.material) tc.mesh.material.dispose();
+        const blastR = radiusUnits;
+        const dmg = dmgPer;
+        if (dmgPer > 0) {
+            for (const tc of troopCohorts) {
+                if (tc.dead || tc.owner === this.owner) continue;
+                const ll = vec3ToLatLon(tc.mesh.position);
+                if (haversineDist(this.lat, this.lon, ll.lat, ll.lon) < radiusUnits) {
+                    const kill = Math.floor(dmgPer * 12);   // dmg scale → troops
+                    tc.troops -= kill;
+                    spawnExp(ll.lat, ll.lon, 3, '#ff8866');
+                    if (tc.troops <= 0) {
+                        tc.dead = true;
+                        scene.remove(tc.mesh);
+                        if (tc.mesh.material) tc.mesh.material.dispose();
+                    }
                 }
             }
         }
@@ -6979,7 +6991,6 @@ class Missile {
                 if (w.hp <= 0 && !w.dead) w._sink();
             }
         }
-        if (this.isSAM && this.tgt) this.tgt.dead = true;
     }
 }
 
@@ -9833,8 +9844,16 @@ function startOnlineGame(pc, ec) {
 }
 
 let frame = 0, gOver = false;
+let gameSessionId = 0;   // AUDIT FIX #10/#11: invalidates pending setTimeouts (volleys, delayed warheads) on restart — gOver alone resets too early
 let _lastRAF = 0, _frameAcc = 0;   // fixed-timestep accumulator (60 logic ticks/sec)
 let pRes = 2700, eRes = 2700;
+// DEV/TEST: player-only starting-gold override (constants.js: STARTING_RES_PLAYER_DEV).
+// Applied on top of every match-start resource grant so the enemy/AI economy
+// stays on normal balance while you test freely. Set the constant to 0 to disable.
+function applyDevStartingRes() {
+    const dev = GAME_CONSTANTS.STARTING_RES_PLAYER_DEV;
+    if (dev && dev > 0) pRes = dev;
+}
 let buildMode = null;
 let autoSAM = true;
 let targetingMode = false, selMissile = 'ballistic', volleyCount = 1, volcnt = 1;
@@ -10051,7 +10070,9 @@ function fireMissileVolley(loc) {
     if (pRes < cost) { logEvent(`موارد غير كافية! تحتاج $${cost}`, 'err'); return false; }
     for (let i = 0; i < volleyCount; i++) {
         const delay = i * 1200;
+        const _sess = gameSessionId;   // AUDIT FIX #10: no ghost volleys into the next game
         setTimeout(() => {
+            if (gOver || _sess !== gameSessionId) return;
             const P2 = _pickLaunchPoint(loc, myRole);
             if (P2 && pRes >= cost) {
                 P2.launcher.reload = P2.launcher.maxReload;
@@ -10626,6 +10647,7 @@ window.addEventListener('click', async e => {
             
             pRes = GAME_CONSTANTS.STARTING_RES_OFFLINE || 1500;
             eRes = GAME_CONSTANTS.STARTING_RES_OFFLINE || 1500;
+            applyDevStartingRes();   // DEV: player-only test gold
             pTroops = GAME_CONSTANTS.STARTING_TROOPS || 1000;
             eTroops = GAME_CONSTANTS.STARTING_TROOPS || 1000;
         } else {
@@ -10672,6 +10694,7 @@ window.addEventListener('click', async e => {
                 pRes = GAME_CONSTANTS.STARTING_RES_OFFLINE;
                 eRes = GAME_CONSTANTS.STARTING_RES_OFFLINE;
             }
+            applyDevStartingRes();   // DEV: player-only test gold
         }
         } finally {
             window._spawnBusy = false;   // release the double-click guard (early returns included)
@@ -11022,7 +11045,9 @@ window.addEventListener('click', async e => {
 
         for(let i=0; i<volleyCount; i++) {
             let delay = i * 1200;
+            const _sess = gameSessionId;   // AUDIT FIX #10b: legacy path — same guard
             setTimeout(() => {
+                if (gOver || _sess !== gameSessionId) return;
                 const P2 = _pickLaunchPoint(loc, myRole);   // TASK-204: silo/rail/sub launch
                 if(P2 && pRes >= cost) {
                     P2.launcher.reload = P2.launcher.maxReload;
@@ -11241,6 +11266,7 @@ const COUNTRIES = {
 
 function initWorld(difficulty, pCountryKey='usa', eCountryKey='random', gameMode='mode1', botCount=0) {
     window.gameMode = gameMode;
+    gameSessionId++;   // AUDIT FIX: new session — pending timers from the last game die silently
     window.gameDifficulty = difficulty || 'normal';   // was accepted but never used
     window.playerCoordinates = [];
     window.enemyCoordinates = [];
@@ -11392,6 +11418,7 @@ function initWorld(difficulty, pCountryKey='usa', eCountryKey='random', gameMode
         
         pRes = GAME_CONSTANTS.STARTING_RES_OFFLINE;
         eRes = GAME_CONSTANTS.STARTING_RES_OFFLINE;
+        applyDevStartingRes();   // DEV: player-only test gold
         
         structs.push(new Structure(pLoc.lat, pLoc.lon, 'base', 'player'));
         structs.push(new Structure(pLoc.lat - 1.2, pLoc.lon + 1.8, 'launcher', 'player'));
@@ -12680,7 +12707,8 @@ function gameFrame() {
     _compactAlive(tradeShips, ts => ts.update());
     _compactAlive(transportShips, ts => ts.update());
     _compactAlive(warships, w => w.update());
-    _compactAlive(drones, d => d.update());   // TASK-202 swarm drones
+    // (AUDIT FIX #3: drones were updated TWICE per tick — the TASK-202 merge
+    //  duplicated the TASK-204 line. 2× speed/fuel/scan cadence + 2× CPU.)
     _compactAlive(trains, t => t.update());
     _compactAlive(troopCohorts, tc => tc.update());
     if (window.paintExpansions) {
