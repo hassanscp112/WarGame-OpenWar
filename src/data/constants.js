@@ -135,6 +135,15 @@ export const TCFG={
           speed:1.0, gunDmg:105, gunRange:180, fireRate:240, engageR:430, sightR:420,
           armor:0.50, structMul:2.0, troopMul:1.0, tanks:3, scale:1.1, lenM:6.3,
           tip:'Tiger — بطيئة ومدرعة بشدة: تحطم التحصينات وتشق جبهة العدو وحدها'},
+ /* TASK-405: self-propelled artillery — INDIRECT FIRE: can only engage
+  * targets spotted by a recon drone, a light scout division, a friendly
+  * radar, or its own short sightR. Standoff siege: holds position and
+  * bombards (structMul 2.6 shreds buildings) but armor 0.15 melts if
+  * anything closes inside its dead zone. */
+ spg:    {name:'فرقة مدفعية',  key:'spg',    icon:'🎇', cost:550, cap:4, hp:420,
+          speed:1.1, gunDmg:85,  gunRange:420, fireRate:300, engageR:520, sightR:300,
+          armor:0.15, structMul:2.6, troopMul:2.0, tanks:3, scale:1.0, lenM:5.5,
+          tip:'Wespe — مدفعية ذاتية الحركة: تقصف من خارج مدى رؤيتها لكن تحتاج كشفاً (درون استطلاع أو فرقة استطلاع أو رادار)'},
 };
 
 export const GAME_CONSTANTS = {
@@ -338,6 +347,62 @@ export const GAME_CONSTANTS = {
   //    (GAME_CONSTANTS.WAR_UPKEEP_* / ECON_FUEL_* / ECON_MILESTONES …)
   //    stays identical for all callers.
   ...ECON_CONSTANTS,
+  // ── TASK-405: deep pass — artillery / entrenchment / supply / aces ──
+  TANK_ENTRENCH_FRAMES: 1200,       // 20s holding to fully dig in
+  TANK_ENTRENCH_ARMOR: 0.5,         // entrenched: incoming damage ×(1−0.5) on top of armor
+  TANK_SUPPLY_R_KM: 650,            // great-circle reach of a supply hub (city/factory/port/base)
+  TANK_SUPPLY_OWN_MUL: 2.0,         // standing on OWN territory extends hub reach ×2 (road net)
+  TANK_SUPPLY_GRACE_F: 600,         // 10s cut before attrition bites
+  TANK_SUPPLY_HP_PER_F: 0.0004,     // ×maxHp drained per frame while cut (≈2.4%/s)
+  TANK_SUPPLY_SPEED_MUL: 0.6,       // out of supply: crawl
+  TANK_SUPPLY_RELOAD_MUL: 1.5,      // out of supply: slow reload
+  TANK_BRIDGEHEAD_KM: 400,          // an ENTRENCHED division projects supply this far (beachhead)
+  TANK_ACE_KILLS: [3, 8, 15],       // kills → Veteran / Ace / Ace-of-Aces
+  TANK_ACE_DMG: 0.10,               // +gun damage per ace level
+  TANK_ACE_ARMOR: 0.06,             // +armor per ace level (armor still caps at 0.85)
+  TANK_ENGINE_HP: 0.35,             // below this hp fraction the engine is damaged
+  TANK_ENGINE_SPEED_MUL: 0.5,       // engine-damaged speed
+  TANK_TRAVERSE_TOL: 0.35,          // rad off-axis the gun may still fire within
+  TANK_TERRAIN_SPEED: { 1: 1.0, 2: 0.75, 3: 0.5 },   // plains/highland/mountain multipliers
+  TANK_DUST_EVERY: 9,               // frames between dust puffs while advancing
+  TANK_FLAK_AT_RANGE: 90,           // enemy flak (dual-purpose 88s) chips armor inside this
+  TANK_FLAK_AT_DMG: 14,             // chip damage per burst (armor applies)
+  TANK_SPOT_R_KM: 380,              // recon-drone / scout spotting radius for indirect fire
+  TANK_SPG_ARC_H: 120,              // indirect shell apex height (world units)
+  TANK_SPG_DEADZONE_KM: 120,        // SPG minimum range — inside it the howitzer can't depress
+  TANK_SPG_SPLASH_KM: 30,           // indirect shell splash radius at impact
+  TANK_RIVER_SPEED_MUL: 0.35,       // crossing a river/strait: assault-speed crawl
+  TANK_RIVER_PROBE_KM: 48,          // far-bank probe — water wider than this = ocean (no crossing)
+  TANK_RIVER_VULN_MUL: 1.25,        // divisions IN the water take +25% damage (exposed)
+  TANK_WRECK_FRAMES: 480,           // burning wreck lifetime (8s) before fade+remove
+  TANK_SUPPLY_HUBS: ['city', 'factory', 'port', 'base'],   // what counts as a supply hub
+  // ── TASK-301: Economy Depth ──
+  // 1) WAR UPKEEP: standing armies above the free threshold drain gold/sec.
+  //    Counts home troops + cohorts in the field. Makes booming vs fighting
+  //    a real economic trade-off (armies that sit still cost money).
+  WAR_UPKEEP_FREE_TROOPS: 25000,   // troops below this cost nothing
+  WAR_UPKEEP_PER_K: 0.02,         // gold/sec per 1000 troops above the threshold
+  // 2) BLOCKADE: enemy warship parked within this radius of YOUR port seals
+  //    it — no trade ships spawn from it while blocked (READ-ONLY scan of
+  //    warships[]; the navy agent owns the class).
+  BLOCKADE_RADIUS_KM: 350,
+  // 3) SYNERGY: adjacency bonuses between structures (shown in selection
+  //    panel + income tooltip).
+  SYNERGY_RANGE_KM: 420,          // max distance for a synergy link
+  SYNERGY_FACTORY_CITY: 0.30,     // factory output +30% per linked city (cap 3)
+  SYNERGY_PORT_CITY_INCOME: 0.05, // gold/sec per port↔city link (throughput)
+  // 4) MILESTONES: one-time bonuses at territory/army thresholds. All sides
+  //    (player + bots) earn them. `cells` uses the conquest grid in mode 1
+  //    (mode 2 falls back to owned cities × 800). Thresholds calibrated vs
+  //    real growth curves (army hits ~220k by 2 min, ~450k by 10 min; cells
+  //    ~22/s): regional ≈2 min, industry ≈5-6 min, superpower ≈10 min.
+  ECON_MILESTONES: [
+    { id:'regional',   icon:'🏙️', name:'قوة إقليمية',  cells:2500,   rewardGold:300,  incomeMul:1.00 },
+    { id:'grand_army', icon:'🎖️', name:'جيش عظيم',     troops:300000,  rewardGold:250,  incomeMul:1.00 },
+    { id:'industry',   icon:'🏭', name:'ثورة صناعية',  cells:5000,   rewardGold:0,    incomeMul:1.10 },
+    { id:'war_econ',   icon:'⚔️', name:'اقتصاد حربي',  troops:450000, rewardGold:0,    incomeMul:1.10 },
+    { id:'superpower', icon:'🌍', name:'قوة عظمى',      cells:7000,   rewardGold:1500, incomeMul:1.00 },
+  ],
   // ── Win conditions (mode 1) ──
   WIN_LAND_PERCENT: 0.8,            // OpenFront FFA: own 80% of the land → victory
   WIN_TIME_LIMIT_S: 10200,          // 170-minute hard limit → draw (OpenFront)
