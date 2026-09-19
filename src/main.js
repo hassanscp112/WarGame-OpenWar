@@ -6954,6 +6954,7 @@ class Plane {
             spawnExp(aim.lat + rnd(-0.2, 0.2), aim.lon + rnd(-0.25, 0.25), rnd(3, 6), '#ffaa44');
         }
         if (SFX && SFX.exp) SFX.exp(50);
+        if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(aim.lat, aim.lon, R, 1.3);
     }
 
     // A-10 / heli (CAS): anti-armor precision — missiles + the gun, hard-target bonus.
@@ -6962,6 +6963,7 @@ class Plane {
         t.hit(HARD[t.type] ? 190 : 120);
         spawnExp(t.lat, t.lon, 4, '#ffcc66');
         if (SFX && SFX.exp) SFX.exp(30);
+        if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(t.lat, t.lon, 12, 0.7);
     }
 
     // Fighters / multirole: light standoff AGM pop at a single target.
@@ -6969,6 +6971,7 @@ class Plane {
         t.hit(55);
         spawnExp(t.lat, t.lon, 3, '#ffdd88');
         if (SFX && SFX.exp) SFX.exp(20);
+        if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(t.lat, t.lon, 10, 0.5);
     }
 
     // Dry bomberless gun harassment for aircraft still packing rounds.
@@ -6978,6 +6981,7 @@ class Plane {
         t.hit(burst * GAME_CONSTANTS.AIR_GUN_BURST_DMG * this.cfg.gunCaliber / 12);
         _spawnGunTracer(this.pos, t.pos);
         if (SFX && SFX.gun) SFX.gun();
+        if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(t.lat, t.lon, 8, 0.3);
         this.strikeCd = 90;
         window.__airStats.strikeRuns++;
     }
@@ -6999,6 +7003,7 @@ class Plane {
             }
             spawnExp(t.lat + rnd(-0.08, 0.08), t.lon + rnd(-0.1, 0.1), 2.5, '#ffaa55');
             if (SFX && SFX.gun) SFX.gun();
+            if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(t.lat, t.lon, 15, 0.4);
             window.__airStats.strikeRuns++;
             this.strikeCd = 40;   // ~0.7s between pulses = sustained rain
             if (this.agAmmo < 0.25) {
