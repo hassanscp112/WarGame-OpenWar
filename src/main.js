@@ -13080,6 +13080,32 @@ function econSecondTick() {
     refreshMarketPanel();         // no-op when closed
 }
 
+// ── TASK-404 debug accessor (console probes + post-merge verification) ──
+// Follows the __ffaProbe pattern: live state by reference where safe, plus
+// manual drivers for the 1s pass so edge paths (bond cycle under a war,
+// sanctions, lane risk) are probeable without waiting on organic wars.
+window.__econProbe = {
+    state: () => econState,                        // by REFERENCE — probes may inject
+    breakdown: () => window.__econBreakdown,       // (e.g. state()._warDirs.add('X>player'))
+    fuelBreakdown: () => window.__fuelBreakdown,
+    myRole: () => myRole,
+    warDirs: () => [...econState._warDirs],
+    defWar: (s) => econDefensiveWar(s || myRole),
+    partners: (s) => econWarPartnerCount(s || myRole),
+    sanctioned: (s) => econSanctioned(s || myRole),
+    takeLoan: (s) => econTakeLoan(s || myRole, true),
+    takeBond: (s) => econTakeBond(s || myRole, true),
+    loan: (s) => { const L = econLoanOf(s || myRole); return { ...L }; },
+    bond: (s) => { const B = econBondOf(s || myRole); return { ...B }; },
+    intel: () => ({ active: econIntelActive(), left_s: econIntelActive() ? Math.ceil((econState.intel.until - frame) / 60) : 0 }),
+    setFuel: (v, s) => { econState.fuel[s || myRole] = v; },
+    fuelTick: (dt) => econFuelTick(dt == null ? 1 : dt),
+    secondTick: () => econSecondTick(),            // drive the 1s pass manually
+    warTick: () => econWarTick(),                  // rebuild the war/blockade cache NOW
+    lanes: () => ({ on: tradeLanesOn, arcs: tradeLaneGroup ? tradeLaneGroup.children.length : 0 }),
+    marketOpen: (v) => toggleMarketPanel(v),
+};
+
 // Remove all TASK-404 visuals (menu return / new game reset).
 function econTeardownForMenu() {
     try {
