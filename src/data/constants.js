@@ -344,14 +344,12 @@ export const GAME_CONSTANTS = {
   TRANSPORT_SHIP_SPEED_KM_S: 100,   // same cruise speed as trade ships
   BEACHHEAD_RADIUS_KM: 8,           // landing zone conquered on arrival (~1-2 cells)
   // ── Warships (OpenFront Warship — patrol/gun-ship unit) ──
-  WARSHIP_COST: 800,                // flat (OpenFront: 250k escalating — scaled to our economy)
-  WARSHIP_MAX_ACTIVE: 4,            // per side (player + each bot)
-  WARSHIP_HP: 1000,                 // OpenFront maxHealth
-  WARSHIP_SPEED_KM_S: 140,          // faster than transports (100)
-  WARSHIP_SHELL_DAMAGE: 250,        // OpenFront shell base damage (4 shells kill a warship)
-  WARSHIP_SHELL_RANGE_KM: 300,      // open fire distance
-  WARSHIP_FIRE_RATE_TICKS: 120,     // 2s between shells (OpenFront: 20 ticks @10tps)
-  WARSHIP_TARGET_RANGE_KM: 700,     // target search radius (OpenFront: 130 tiles ≈ 650km)
+  // TASK-502 hygiene: the flat WARSHIP_COST/MAX_ACTIVE/HP/SPEED/TARGET_RANGE
+  // constants were DEAD (superseded by HULL_CLASSES per-class stats — the
+  // destroyer entry carries their legacy values). Live fallbacks kept below.
+  WARSHIP_SHELL_DAMAGE: 250,        // fallback when a hull lacks shellDmg
+  WARSHIP_SHELL_RANGE_KM: 300,      // fallback shell range
+  WARSHIP_FIRE_RATE_TICKS: 120,     // fallback fire cooldown (2s)
   WARSHIP_PATROL_RADIUS_KM: 350,    // wander radius around the clicked patrol point
   WARSHIP_HEAL_RATE: 4,             // HP/sec repaired near own port
   WARSHIP_HEAL_RANGE_KM: 400,       // 'near own port' distance

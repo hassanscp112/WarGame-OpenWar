@@ -14,7 +14,8 @@
 //              ownerName, navalSpend, sendAction, renderMode1Territory,
 //              _tracer, latLonToVec3, targetLivePos, killTradeShip,
 //              missileScatter, newId, buildTorpedoMesh, buildMineModel,
-//              puffAt, disposeMesh, pushAttack, fleetStanceIdx
+//              puffAt, disposeMesh, pushAttack, fleetStanceIdx,
+//              sonarPingFX (TASK-502 — contact/reveal rings)
 // ══════════════════════════════════════════════════════════════════════
 import { PCFG, MCFG, DCFG, GAME_CONSTANTS } from '../data/constants.js';
 
@@ -120,6 +121,15 @@ function sonarPing(s, ctx) {
     for (const w of ctx.warships) {
         if (w.dead || w.owner === s.owner || !w.submerged) continue;
         if (ctx.haversineDist(s.curLat, s.curLon, w.curLat, w.curLon) < s.hull.sonarRange) {
+            // TASK-502 (sub sonar ring visibility): fire the ring only on a
+            // FRESH contact (undetected → detected — covers both a cold boat
+            // and one already flaming-datum revealed by its own torpedoes) —
+            // a continuous glow would be noise. Ping ring at the escort,
+            // reveal ring over the boat.
+            if (!w.detected && ctx.sonarPingFX) {
+                ctx.sonarPingFX(s.curLat, s.curLon, 0x66ccff, 0.8);
+                ctx.sonarPingFX(w.curLat, w.curLon, 0x4da6ff, 1.6);
+            }
             w._detectedT = GAME_CONSTANTS.SUB_DETECT_FRAMES;
         }
     }
@@ -157,8 +167,11 @@ function airWing(s, ctx) {
     // AUDIT #8 gate: online → the owner's client drives the cycle, the
     // receiver mirrors spawns via the network (no double-spawned wings).
     if (ctx.isOnline && s.owner !== ctx.myRole) return;
-    const wing = ctx.planes.filter(p => !p.dead && p.baseStruct === s);
-    if (wing.length < s.hull.airWing && s.planeCd <= 0) {
+    // TASK-502 OPTIMIZE: was ctx.planes.filter(...) — a fresh array EVERY
+    // frame per carrier. Allocation-free counting pass instead.
+    let wingN = 0;
+    for (const p of ctx.planes) if (!p.dead && p.baseStruct === s) wingN++;
+    if (wingN < s.hull.airWing && s.planeCd <= 0) {
         const p = new ctx.Plane(s.curLat, s.curLon, PCFG['fighter'], s.owner, s);
         p.shipDuty = -720;                     // sit on deck ~12s before first launch
         ctx.planes.push(p);
@@ -166,9 +179,10 @@ function airWing(s, ctx) {
         if (s.owner === ctx.myRole && ctx.isOnline) {
             ctx.sendAction({ type: 'spawn_plane', lat: s.curLat, lon: s.curLon, ptype: 'fighter', shipId: s.id });
         }
-        if (s.owner === ctx.myRole) ctx.logEvent(`🛫 ${s.name}: انضمام مقاتلة لسرب السفينة (${wing.length + 1}/${s.hull.airWing})`, 'info');
+        if (s.owner === ctx.myRole) ctx.logEvent(`🛫 ${s.name}: انضمام مقاتلة لسرب السفينة (${wingN + 1}/${s.hull.airWing})`, 'info');
     }
-    for (const p of wing) {
+    for (const p of ctx.planes) {
+        if (p.dead || p.baseStruct !== s) continue;
         if (p.parked) {
             if (p.shipDuty < 0) { p.shipDuty++; continue; }   // deck rest countdown
             if (p.shipDuty === 0) {
@@ -204,17 +218,22 @@ function airWing(s, ctx) {
 //  online (mirrored via drone_launch, TASK-204's existing action).
 // ══════════════════════════════════════════════════════════════════════
 function droneBay(s, ctx) {
-    const mine = ctx.drones.filter(d => !d.dead && d.home === s);
+    // TASK-502 OPTIMIZE: was ctx.drones.filter(...) ×2 (roster + kamikaze
+    // count) — fresh arrays EVERY frame per bay. One counting pass now;
+    // the tether refresh writes are still paced at 1-in-30 frames.
+    let bayN = 0, kamCnt = 0;
+    for (const d of ctx.drones) {
+        if (d.dead || d.home !== s) continue;
+        bayN++;
+        if (d.cfg.type === 'kamikaze') kamCnt++;
+        if (ctx.frame % 30 === (s.id % 30)) { d.homeLat = s.curLat; d.homeLon = s.curLon; }
+    }
     // Tether upkeep: the generic Drone patrols a FIXED homeLat/homeLon —
     // refresh so the screen keeps station over a sailing carrier.
-    if (ctx.frame % 30 === (s.id % 30)) {
-        for (const d of mine) { d.homeLat = s.curLat; d.homeLon = s.curLon; }
-    }
     if (ctx.isOnline && s.owner !== ctx.myRole) return;   // AUDIT #8: owner-driven online
-    if (mine.length >= s.hull.swarmCap || s.droneCd > 0) return;
-    const kamCnt = mine.filter(d => d.cfg.type === 'kamikaze').length;
-    const key = (mine.length === 0 && kamCnt === 0) ? 'nano'
-        : (kamCnt < 2 ? 'kamikaze' : (mine.length % 2 ? 'swarm' : 'nano'));
+    if (bayN >= s.hull.swarmCap || s.droneCd > 0) return;
+    const key = (bayN === 0 && kamCnt === 0) ? 'nano'
+        : (kamCnt < 2 ? 'kamikaze' : (bayN % 2 ? 'swarm' : 'nano'));
     const squad = ctx.launchDrone(s.owner, key,
         { lat: s.curLat, lon: s.curLon },
         { homeLat: s.curLat, homeLon: s.curLon, engageR: GAME_CONSTANTS.DRONE_ENGAGE_RANGE_KM });
@@ -304,6 +323,9 @@ function subSystems(s, ctx) {
     if (s.detected && s.owner === ctx.myRole && (!s._warnT || ctx.frame - s._warnT > 600)) {
         s._warnT = ctx.frame;
         ctx.logEvent(`⚠️ ${s.name}: كُشف موقعنا بالسونار — الغوص العميق!`, 'warn');
+        // TASK-502: visual companion to the warning — red ring so the player
+        // SEES which boat is painted (log lines scroll away fast in combat).
+        if (ctx.sonarPingFX) ctx.sonarPingFX(s.curLat, s.curLon, 0xff5a4d, 1.4);
     }
 }
 function fireTorpedo(s, ctx) {

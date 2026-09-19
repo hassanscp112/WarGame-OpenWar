@@ -2614,19 +2614,21 @@ class Warship {
         const C = GAME_CONSTANTS;
         if (s.kind === 'transport') {
             tgt._remove();          // sunk — embarked troops are lost
-            if (this.owner === 'player') logEvent('⚓ مدمرة نسفت سفينة إنزال معادية!', 'info');
-            else if (tgt.owner === 'player') logEvent('⚠️ غرقت سفينة إنزال لدينا تحت نيران العدو!', 'err');
+            // TASK-502 QC: name the actual hull class (was hardcoded 'مدمرة')
+            // and gate on myRole so ONLINE guests see their own kills too.
+            if (this.owner === myRole) logEvent(`⚓ ${this.name} نسفت سفينة إنزال معادية!`, 'info');
+            else if (tgt.owner === myRole) logEvent('⚠️ غرقت سفينة إنزال لدينا تحت نيران العدو!', 'err');
         } else if (s.kind === 'warship') {
             tgt.hp -= dmg;
             if (tgt.hp <= 0 && !tgt.dead) tgt._sink();
         } else if (s.kind === 'trade') {
             // Piracy: captured cargo → gold (OpenFront warship capture)
             const gold = GAME_CONSTANTS.TRADE_SHIP_BASE_GOLD;
-            if (this.owner === 'player') { pRes += gold; logEvent(`⚓ مدمرة صادرت سفينة تجارية! +$${gold}`, 'info'); updateHUD(); }
+            if (this.owner === myRole) { pRes += gold; logEvent(`⚓ ${this.name} صادرت سفينة تجارية! +$${gold}`, 'info'); updateHUD(); }
             else {
                 const b = botByStr(this.owner);
                 if (b) b.res += gold;
-                if (tgt.owner === 'player') logEvent('⚠️ قرصنة العدو استولت على سفينتك التجارية!', 'err');
+                if (tgt.owner === myRole) logEvent('⚠️ قرصنة العدو استولت على سفينتك التجارية!', 'err');
             }
             _killTradeShip(tgt);
         } else if (s.kind === 'struct') {
@@ -2654,7 +2656,7 @@ class Warship {
         // the animator (gameFrame) owns the mesh until it reaches the seabed.
         navalSinking.push({ mesh: this.mesh, t: 0, dur: GAME_CONSTANTS.SINK_ANIM_FRAMES,
                             scale: this.hull.scale, owner: this.owner });
-        if (this.owner === 'player') logEvent(`💥 غرقت ${this.name} لدينا!`, 'err');
+        if (this.owner === myRole) logEvent(`💥 غرقت ${this.name} لدينا!`, 'err');
         else logEvent(`💥 ${this.name} ${_ownerName(this.owner)} غرقت!`, 'info');
     }
 
@@ -2959,7 +2961,32 @@ const NAVAL_CTX = {
     puffAt: _puffAt, disposeMesh: disposeMeshDeep,
     pushAttack: (atk) => activeAttacks.push(atk),
     fleetStanceIdx: () => fleetStanceIdx,
+    sonarPingFX: _sonarPingFX,   // TASK-502: sonar-contact ring visuals
 };
+
+// TASK-502 (FINISH item — sub sonar ring visibility): before this, a sonar
+// reveal changed NOTHING on screen — the escort silently marked the boat
+// targetable. _sonarPingFX drops an expanding ring flat on the water so the
+// CONTACT reads at a glance, both directions:
+//   · our escort pings an enemy sub  → cyan ring over the revealed boat
+//   · OUR sub gets painted by sonar  → red ring over our boat (matches the
+//     existing "كُشف موقعنا بالسونار" log warning)
+// Pooled material + shared cached geometry — zero per-call allocation beyond
+// the transient record itself (rides the TASK-204 transient system).
+function _sonarPingFX(lat, lon, colHex, scale = 1) {
+    if (!GEO_CACHE['sonarRing']) {
+        GEO_CACHE['sonarRing'] = new THREE.RingGeometry(2.2, 3.0, 24);
+        GEO_CACHE['sonarRing'].userData.shared = true;   // dispose-safe (transients check)
+    }
+    const m = new THREE.Mesh(GEO_CACHE['sonarRing'], _getFxMat(colHex, 0.95));
+    m.position.copy(latLonToVec3(lat, lon, EARTH_RADIUS + 0.9));
+    m.up.copy(m.position).normalize();
+    m.lookAt(0, 0, 0);                 // ring plane tangent to the sea surface
+    m.scale.setScalar(scale);
+    scene.add(m);
+    _addTransient(m, 46, { grow: 0.030 });   // ~0.9s expanding ping
+    return m;
+}
 
 // TASK-402 POLISH: sinking animation — a dead hull lists over and settles
 // toward the seabed over ~3s (bubble wake) instead of vanishing instantly.
@@ -6481,7 +6508,12 @@ function buildMineModel(acc) {
         _M(g, _sph(0.16, 6, 4), _am(acc), x, 3.5, z);                                 // buoy tip (owner tint)
     }
     // owner-tinted danger disc flat on the water
-    if (!GEO_CACHE['mineRing']) GEO_CACHE['mineRing'] = new THREE.RingGeometry(4.6, 5.4, 24);
+    // (TASK-502: flag shared — _expire's disposeMeshDeep used to dispose this
+    // CACHED geometry on every field expiry, forcing a GPU re-upload per mine)
+    if (!GEO_CACHE['mineRing']) {
+        GEO_CACHE['mineRing'] = new THREE.RingGeometry(4.6, 5.4, 24);
+        GEO_CACHE['mineRing'].userData.shared = true;
+    }
     const disc = new THREE.Mesh(GEO_CACHE['mineRing'], _am(acc));
     disc.rotation.x = -Math.PI / 2;
     disc.position.y = 0.15;
@@ -12206,8 +12238,9 @@ window.addEventListener('keydown', e => {
         return;
     }
 
-    // V: warship slot (hotbar)
-    if (e.code === 'KeyV' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+    // V: warship slot (hotbar) — TASK-502: !e.repeat (audit #12 — holding V
+    // used to cycle hull classes on every key-repeat event + spam the log)
+    if (e.code === 'KeyV' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.repeat) {
         if (window.__hotbarKey) window.__hotbarKey('V');
         return;
     }
@@ -16458,6 +16491,9 @@ window.__refreshHotbar = function () {
                 ? GAME_CONSTANTS.MINE_COST                       // TASK-402: minefield deploy cost
                 : window.__UI_API.costOf(slot.type);
         let count;
+        // TASK-502: .capped flags the count red at cap (mine counter UI at
+        // cap — the FINISH-list item; applies to the fleet slot too)
+        const _capCls = (el, n, cap) => el.querySelector('.hcnt').classList.toggle('capped', n >= cap);
         if (slot.type === 'warship') {
             count = warships.reduce((n, w) => n + (!w.dead && w.owner === 'player' && w.hullClass === warshipBuildClass ? 1 : 0), 0);
             // Live slot = the armed hull class (V cycling)
@@ -16465,10 +16501,12 @@ window.__refreshHotbar = function () {
             el.querySelector('.hicon').textContent = hull.icon;
             el.querySelector('.hname').textContent = hull.name;
             el.querySelector('.hcnt').textContent = `${count}/${hull.cap}`;
+            _capCls(el, count, hull.cap);
         } else if (slot.type === 'mine') {
             // TASK-402: live minefield count vs cap
             const fields = mineFields.filter(f => !f.dead && f.owner === 'player').length;
             el.querySelector('.hcnt').textContent = `${fields}/${GAME_CONSTANTS.MINE_CAP}`;
+            _capCls(el, fields, GAME_CONSTANTS.MINE_CAP);
         } else if (slot.type === 'tank') {
             // TASK-302: live slot = the armed division class (H cycling)
             const cfg = TCFG[tankBuildClass];

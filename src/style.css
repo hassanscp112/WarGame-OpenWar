@@ -727,3 +727,11 @@ button:focus-visible, select:focus-visible, input:focus-visible, [tabindex]:focu
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+/* ═══ TASK-502 naval mastery — hotbar cap visibility ═══
+   Count turns red at cap so the player SEES why placement refuses
+   (mine fields 6/6, per-class hull caps) instead of reading toasts. */
+.hslot .hcnt.capped {
+    color: #ff6b5e;
+    font-weight: 700;
+}
