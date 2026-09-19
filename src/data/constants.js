@@ -54,8 +54,8 @@ export const MCFG={
  * FIRST interceptor of each flight (consumed on roll, win or lose). */
 
 /* ── MTAGS (TASK-403): short tooltip tags per warhead, synced to the
- * TASK-204/403 balance numbers. WIRED into the missile-mode HUD chips +
- * build-menu buttons (title attr). 4 tags each, Arabic. ── */
+ * TASK-204/403 balance numbers. WIRED into the missile-mode HUD chips
+ * (title attr — hover a chip in [R] mode). 4 tags each, Arabic. ── */
 export const MTAGS={
  scud:       ['رخيص $80 — أرخص ضربة','رعب: يصدم إعادة التعبئة','دقة ضعيفة ±16كم','يكشفه الرادار بسهولة'],
  ballistic:  ['حصان العمل $130/110','أفضل ضرر لكل دولار','دقة متوسطة','مسار باليستي عالٍ'],
