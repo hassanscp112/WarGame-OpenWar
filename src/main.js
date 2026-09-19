@@ -2007,18 +2007,24 @@ class TradeShip {
             + C.TRADE_SHIP_DIST_GOLD * dist
         );
 
+        // TASK-404 SANCTIONS: a nation at war with many others trades at a
+        // penalty — each earner's share is scaled by their OWN status.
+        const _mul = (o) => (econSanctioned(o) ? C.ECON_SANCTIONS_TRADE_MUL : 1);
+        const goldA = Math.floor(gold * _mul(this.owner));
+        const goldB = Math.floor(gold * _mul(this.dstPort.owner));
+
         // OpenFront TradeShipExecution.complete(): srcPort.owner() AND dstPort.owner() both get gold.
         const creditGold = (ownerStr, amt) => {
             if (ownerStr === 'player') pRes += amt;
             else if (ownerStr === 'enemy') eRes += amt;
             else { const b = botByStr(ownerStr); if (b) b.res += amt; }
         };
-        creditGold(this.owner, gold);
-        creditGold(this.dstPort.owner, gold);
+        creditGold(this.owner, goldA);
+        creditGold(this.dstPort.owner, goldB);
         if (this.owner === 'player') {
-            logEvent(`سفينة تجارية وصلت! +💰${gold} (مسافة ${Math.round(dist)} كم)`, 'info');
+            logEvent(`سفينة تجارية وصلت! +💰${goldA} (مسافة ${Math.round(dist)} كم)`, 'info');
         } else if (this.dstPort.owner === 'player') {
-            logEvent(`ميناءك استقبل سفينة تجارية! +💰${gold}`, 'info');
+            logEvent(`ميناءك استقبل سفينة تجارية! +💰${goldB}`, 'info');
         }
         updateHUD();
     }
@@ -10582,7 +10588,10 @@ function applyOpponentAction(action) {
     }
     if (action.type === 'drone_launch') {
         // TASK-204: remote drone deployment — spawn the same squad locally
-        if (DCFG[action.key]) launchDrone(oS, action.key, { lat: action.lat, lon: action.lon }, { homeLat: action.hlat, homeLon: action.hlon });
+        if (DCFG[action.key]) {
+            econFuelSpend(oS, GAME_CONSTANTS.ECON_FUEL_COST_DRONE, true);   // TASK-404: mirror their fuel spend
+            launchDrone(oS, action.key, { lat: action.lat, lon: action.lon }, { homeLat: action.hlat, homeLon: action.hlon });
+        }
     }
     if (action.type === 'build') {
         if (!SDEFS[action.btype]) return;   // guard: unknown/missing build type
@@ -10601,11 +10610,15 @@ function applyOpponentAction(action) {
         }
     }
     if(action.type === 'spawn_plane') {
+        econFuelSpend(oS, GAME_CONSTANTS.ECON_FUEL_COST_PLANE, true);   // TASK-404: mirror their fuel spend
         planes.push(new Plane(action.lat, action.lon, PCFG[action.ptype], oS));
     }
     if (action.type === 'tank_spawn') {
         // TASK-302: remote armor deployment — mirror the division locally
-        if (TCFG[action.tkey]) spawnTankDivision(action.lat, action.lon, action.tkey, oS, { tgtLat: action.tlat, tgtLon: action.tlon });
+        if (TCFG[action.tkey]) {
+            econFuelSpend(oS, GAME_CONSTANTS.ECON_FUEL_COST_TANK, true);   // TASK-404
+            spawnTankDivision(action.lat, action.lon, action.tkey, oS, { tgtLat: action.tlat, tgtLon: action.tlon });
+        }
     }
     if (action.type === 'tank_move') {
         const t = tanks.find(q => q.owner === oS && q.id === action.tid);
@@ -10939,10 +10952,18 @@ function launchDroneSquad(loc) {
     const pads = structs.filter(s => !s.dead && s.owner === myRole && (s.type === 'launcher' || s.type === 'base'));
     if (!pads.length) { logEvent('لا توجد منصة إطلاق للدرونات (منصة أو قاعدة)! 🛸', 'err'); return false; }
     if (pRes < cfg.cost) { logEvent(`موارد غير كافية! تحتاج $${cfg.cost}`, 'err'); return false; }
+    // TASK-404: drone squads burn strategic fuel on deployment (econ logic
+    // lives here — the Drone class is 403's, untouched).
+    if (!econFuelSpend(myRole, GAME_CONSTANTS.ECON_FUEL_COST_DRONE)) return false;
     const P = pads.sort((a, b) => haversineDist(a.lat, a.lon, loc.lat, loc.lon) - haversineDist(b.lat, b.lon, loc.lat, loc.lon))[0];
     pRes -= cfg.cost;
     spawnExp(P.lat, P.lon, 3, cfg.col);
     const squad = launchDrone(myRole, selDrone, { lat: P.lat, lon: P.lon }, { homeLat: loc.lat, homeLon: loc.lon });
+    // AUDIT #17 (TASK-404): refund the unlaunched share — the per-owner cap
+    // can eat part of the squad AFTER payment (was: full price lost).
+    if (!squad || squad.length < (cfg.squad || 1)) {
+        pRes += _droneRefund(cfg.cost, squad ? squad.length : 0, cfg.squad || 1);
+    }
     if (isOnline && squad) sendAction({ type: 'drone_launch', key: selDrone, lat: P.lat, lon: P.lon, hlat: loc.lat, hlon: loc.lon });
     _refreshDroneHud();
     logEvent(squad ? `🛸 نُشر ${squad.length}× ${cfg.name} باتجاه المحطة` : 'تعذّر نشر الدرون (الحد الأقصى)', squad ? 'info' : 'err');
@@ -11341,6 +11362,8 @@ window.addEventListener('keydown', e => {
         attackMoveMode = false;
         if (missileMode) _setMissileMode(false);
         if (droneMode) _setDroneMode(false);   // TASK-204
+        const _mk = document.getElementById('econMkt');   // TASK-404: close the black market
+        if (_mk) _mk.classList.remove('open');
         document.getElementById('tgtMsg').style.display = 'none';
         if(rangeMarkerMesh) rangeMarkerMesh.visible = false;
         clearSelection();
@@ -11404,6 +11427,20 @@ window.addEventListener('keydown', e => {
     // J: radar-ECM station slot (hotbar) — TASK-403
     if (e.code === 'KeyJ' && !e.ctrlKey && !e.altKey && !e.metaKey) {
         if (window.__hotbarKey) window.__hotbarKey('J');
+        return;
+    }
+
+    // K: BLACK MARKET panel — TASK-404 economy (loans / war bonds / intel)
+    if (e.code === 'KeyK' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.repeat) {
+        if (window.gameMode !== 'mode1' || window.startSpawnPhase) return;
+        toggleMarketPanel();
+        return;
+    }
+
+    // L: trade-lane visualization toggle — TASK-404 economy
+    if (e.code === 'KeyL' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.repeat) {
+        if (window.gameMode !== 'mode1' || window.startSpawnPhase) return;
+        toggleTradeLanes();
         return;
     }
 
@@ -11803,6 +11840,9 @@ window.addEventListener('click', async e => {
             const fac = structs.filter(s => !s.dead && s.owner === 'player' && s.type === 'factory')
                 .sort((a, b) => haversineDist(a.lat, a.lon, loc.lat, loc.lon) - haversineDist(b.lat, b.lon, loc.lat, loc.lon))[0];
             if (!fac) { document.getElementById('bldMsg').textContent = 'تحتاج مصنع حرب لنشر المدرعات! 🏭'; return; }
+            // TASK-404: strategic-fuel gate for armor deployment (econ logic —
+            // the Tank class is untouched; log note for @lead/@405).
+            if (!econFuelSpend(myRole, C.ECON_FUEL_COST_TANK)) { document.getElementById('bldMsg').textContent = `⛽ وقود غير كافٍ للنشر! تحتاج ${C.ECON_FUEL_COST_TANK}`; return; }
             pRes -= cfg.cost;
             spawnTankDivision(fac.lat, fac.lon, tankBuildClass, 'player', { tgtLat: loc.lat, tgtLon: loc.lon });
             if (isOnline) sendAction({ type: 'tank_spawn', lat: fac.lat, lon: fac.lon, tkey: tankBuildClass, tlat: loc.lat, tlon: loc.lon });
@@ -12506,28 +12546,31 @@ function updateLeaderboard() {
 
 function updateHUD() {
     if(!document.getElementById('pGold')) return;
-    document.getElementById('pGold').textContent = Math.floor(pRes);
+    // TASK-404: dirty-flagged DOM writes (redundant writes skipped via a
+    // per-element cache) + the ⛽ fuel chip next to the income stat.
+    ensureFuelChip();
+    _setTxt(document.getElementById('pGold'), Math.floor(pRes));
     if (!window.__econTipInit) initEconTooltip();   // TASK-301: lazy wire the income tooltip
     
     if(document.getElementById('pTroops')) {
         // Show current / max so the player always knows troop headroom
         let pMax = calcMaxTroops('player');
-        document.getElementById('pTroops').textContent = formatTroopCount(pTroops) + '/' + formatTroopCount(pMax);
+        _setTxt(document.getElementById('pTroops'), formatTroopCount(pTroops) + '/' + formatTroopCount(pMax));
         document.getElementById('pTroops').title = `القوات: ${Math.floor(pTroops)} / ${pMax}`;
         const pf = document.getElementById('pTroopFill');
-        if (pf) pf.style.width = Math.min(100, (pTroops / Math.max(1, pMax)) * 100).toFixed(1) + '%';
+        if (pf) _setStyle(pf, 'width', Math.min(100, (pTroops / Math.max(1, pMax)) * 100).toFixed(1) + '%');
     }
     if(document.getElementById('eTroops')) {
         // FFA: the right panel shows the STRONGEST rival nation (flag + name label)
         const top = strongestBot();
         const tTroops = top ? top.troops : eTroops;
         let eMax = calcMaxTroops(top ? top.str : 'enemy');
-        document.getElementById('eTroops').textContent = formatTroopCount(tTroops) + '/' + formatTroopCount(eMax);
+        _setTxt(document.getElementById('eTroops'), formatTroopCount(tTroops) + '/' + formatTroopCount(eMax));
         document.getElementById('eTroops').title = `قوات ${top ? top.flag + ' ' + top.name : 'العدو'}: ${Math.floor(tTroops)} / ${eMax}`;
         const ef = document.getElementById('eTroopFill');
-        if (ef) ef.style.width = Math.min(100, (tTroops / Math.max(1, eMax)) * 100).toFixed(1) + '%';
+        if (ef) _setStyle(ef, 'width', Math.min(100, (tTroops / Math.max(1, eMax)) * 100).toFixed(1) + '%');
         const lbl = document.getElementById('p2Label');
-        if (lbl) lbl.textContent = top ? `${top.flag} ${top.name}` : 'العدو';
+        if (lbl) _setTxt(lbl, top ? `${top.flag} ${top.name}` : 'العدو');
     }
     
     let pVP = 0; let eVP = 0;
@@ -12537,8 +12580,8 @@ function updateHUD() {
             if (c.owner === 'enemy') eVP += c.victoryPoints;
         });
     }
-    if (document.getElementById('pVP')) document.getElementById('pVP').textContent = pVP;
-    if (document.getElementById('eVP')) document.getElementById('eVP').textContent = eVP;
+    _setTxt(document.getElementById('pVP'), pVP);
+    _setTxt(document.getElementById('eVP'), eVP);
 
     // Base/city/plane counters — mode 1 counts STRUCTURES (cityNodes is mode-2 only)
     const mode1 = window.gameMode === 'mode1';
@@ -12546,28 +12589,40 @@ function updateHUD() {
     const rivalStr = topBot ? topBot.str : 'enemy';
     const pBases = structs.filter(s=>s.owner==='player'&&!s.dead&&(mode1 ? (s.type==='airport'||s.type==='launcher') : s.type==='base')).length;
     const eBases = structs.filter(s=>s.owner===rivalStr&&!s.dead&&(mode1 ? (s.type==='airport'||s.type==='launcher') : s.type==='base')).length;
-    document.getElementById('pBase').textContent = pBases;
-    document.getElementById('eBase').textContent = eBases;
+    _setTxt(document.getElementById('pBase'), pBases);
+    _setTxt(document.getElementById('eBase'), eBases);
     let pCities = mode1 ? structs.filter(s=>s.owner==='player'&&!s.dead&&s.type==='city').length
                         : (cityNodes ? cityNodes.filter(c=>c.owner==='player').length : 0);
     let eCities = mode1 ? structs.filter(s=>s.owner===rivalStr&&!s.dead&&s.type==='city').length
                         : (cityNodes ? cityNodes.filter(c=>c.owner==='enemy').length : 0);
-    document.getElementById('pCit').textContent = pCities;
-    document.getElementById('pPln').textContent = planes.filter(p=>p.owner==='player'&&!p.dead).length;
-    document.getElementById('eCit').textContent = eCities;
+    _setTxt(document.getElementById('pCit'), pCities);
+    _setTxt(document.getElementById('pPln'), planes.filter(p=>p.owner==='player'&&!p.dead).length);
+    _setTxt(document.getElementById('eCit'), eCities);
     
     // Show neutral city count
     let neutralCount = mode1 ? 0 : (cityNodes ? cityNodes.filter(c=>c.owner==='neutral').length : 0);
     let cInfoEl = document.getElementById('cInfo');
-    if(cInfoEl) cInfoEl.textContent = `⚪${neutralCount} | 🟢${pCities} | 🔴${eCities}`;
+    if(cInfoEl) _setTxt(cInfoEl, `⚪${neutralCount} | 🟢${pCities} | 🔴${eCities}`);
     
     // Income rate display
     let econ = calcIncome('player');
     let incEl = document.getElementById('pIncome');
     if(incEl) {
         let perSec = (econ.net * 60).toFixed(1);
-        incEl.textContent = (econ.net >= 0 ? '+' : '') + perSec;
-        incEl.style.color = econ.net >= 0 ? '#00ff88' : '#ff4444';
+        _setTxt(incEl, (econ.net >= 0 ? '+' : '') + perSec);
+        _setStyle(incEl, 'color', econ.net >= 0 ? '#00ff88' : '#ff4444');
+    }
+
+    // TASK-404: fuel chip (dirty-flagged; pool + fill + low-state tint)
+    const fb = window.__fuelBreakdown;
+    const fEl = document.getElementById('pFuel');
+    if (fEl) {
+        if (fb) {
+            _setTxt(fEl, Math.floor(fb.fuel));
+            fEl.classList.toggle('lowFuel', fb.fuel < GAME_CONSTANTS.ECON_FUEL_MAX * 0.15 || fb.net < 0);
+            const ff = document.getElementById('pFuelFill');
+            if (ff) _setStyle(ff, 'width', Math.min(100, (fb.fuel / GAME_CONSTANTS.ECON_FUEL_MAX) * 100).toFixed(1) + '%');
+        } else _setTxt(fEl, '—');
     }
     
     // Hotbar affordability/counts/selection stay live
@@ -12589,14 +12644,41 @@ function updateHUD() {
 //   Pure math lives in econRatesFromSnapshot() so economyTest() can replay
 //   the exact same formulas on synthetic balance scenarios.
 // ══════════════════════════════════════════════════════════════════════
-const econState = { milestones: {}, incomeMul: {} };
+const econState = {
+    milestones: {}, incomeMul: {},
+    // ── TASK-404 state (re-created by econResetState) ──
+    fuel: {},            // side → pooled fuel units
+    loans: {},           // side → { principal, owed }
+    bonds: {},           // side → { owed, epoch, count }
+    defWar: {},          // side → { active, epoch }
+    netHist: [],         // last 60s of net income (sparkline)
+    _warDirs: new Set(), // 'atk>def' war directions (30f cache)
+    _warPairs: [],       // undirected pairs for sanctions
+    _blockedPorts: new Set(),
+    _warFrame: -1e9,
+    intel: { until: 0, markers: [] },
+    _lowT: -1e9,         // last treasury-low toast frame
+};
 let _econScan = { frame: -1, sideData: {} };
 
 function econResetState() {
     econState.milestones = {};
     econState.incomeMul = {};
+    econState.fuel = {};
+    econState.loans = {};
+    econState.bonds = {};
+    econState.defWar = {};
+    econState.netHist = [];
+    econState._warDirs = new Set();
+    econState._warPairs = [];
+    econState._blockedPorts = new Set();
+    econState._warFrame = -1e9;
+    econState.intel = { until: 0, markers: [] };
+    econState._lowT = -1e9;
     window.__econBreakdown = null;
+    window.__fuelBreakdown = null;
     _econScan = { frame: -1, sideData: {} };
+    econTeardownForMenu();   // TASK-404: drop lanes/intel/medal visuals
 }
 
 function troopsOf(side) {
@@ -12617,14 +12699,13 @@ function econResAdd(side, amt) {
     else { const b = bots.find(x => x.str === side); if (b) b.res += amt; }
 }
 
-// BLOCKADE — read-only scan of the warships[] array (navy agent's class).
+// BLOCKADE — O(1) per call: reads the 30-frame cached port set built by
+// econWarTick() (warships move slowly — the warship×port scan runs at most
+// every 30 frames instead of per port per frame; TASK-404 OPTIMIZE item).
+// Still a READ-ONLY scan of warships[] — the navy agent owns the class.
 function isPortBlockaded(port) {
-    const R = GAME_CONSTANTS.BLOCKADE_RADIUS_KM;
-    for (const w of warships) {
-        if (w.dead || w.owner === port.owner) continue;
-        if (haversineDist(w.lat, w.lon, port.lat, port.lon) <= R) return true;
-    }
-    return false;
+    if (frame - econState._warFrame > 30) econWarTick();
+    return econState._blockedPorts.has(port.id);
 }
 
 // Per-frame cached scan: synergy links + blockade state, per side. Called from
@@ -12658,6 +12739,8 @@ function econScanFrame() {
             const nowBlk = isPortBlockaded(p);
             if (nowBlk !== !!p._blockaded) {           // state change → notify
                 p._blockaded = nowBlk;
+                // TASK-404: striped overlay marker on the port itself
+                if (nowBlk) _blkMarkAdd(p); else _blkMarkRemove(p);
                 if (side === 'player' && !window.startSpawnPhase) {
                     if (nowBlk) {
                         uiToast('⛔ ميناؤك تحت الحصار البحري — التجارة متوقفة!', 'err', 3200);
@@ -12670,7 +12753,8 @@ function econScanFrame() {
             }
             if (nowBlk) blockaded++;
         }
-        _econScan.sideData[side] = { factoryLinks, pcLinks, blockaded };
+        // TASK-404: ports count feeds the fuel income (open = ports − blockaded)
+        _econScan.sideData[side] = { factoryLinks, pcLinks, blockaded, ports: ports.length };
     }
     return _econScan;
 }
@@ -12776,7 +12860,7 @@ function econMilestoneTick() {
             if (m.incomeMul) econState.incomeMul[side] = (econState.incomeMul[side] || 1) * m.incomeMul;
             if (side === 'player') {
                 const bonus = m.rewardGold ? ` +$${m.rewardGold}` : (m.incomeMul ? ` دخل +${Math.round((m.incomeMul - 1) * 100)}%` : '');
-                uiToast(`${m.icon} إنجاز: ${m.name}!${bonus}`, 'warn', 3400);
+                econMilestoneToast(m, bonus);   // TASK-404: medal fly-in toast
                 logEvent(`${m.icon} إنجاز اقتصادي: ${m.name}${bonus}`, 'info');
             }
         }
@@ -12809,6 +12893,7 @@ function structSynergyInfo(s) {
 }
 let _econTipTimer = null;
 function renderEconTooltip(tip) {
+    const C = GAME_CONSTANTS;   // TASK-404: fuel/debt/sanction rows read the econ block
     const b = window.__econBreakdown;
     if (!b) { tip.innerHTML = '<div class="etRow">لا توجد بيانات اقتصادية بعد</div>'; return; }
     const P = b.parts;
@@ -12832,13 +12917,28 @@ function renderEconTooltip(tip) {
     if (P.factoryMul > 1) row('⚙️ مضاعف المصانع', '×' + P.factoryMul.toFixed(2));
     if (P.milestoneMul > 1) row('🏆 إنجازات', '×' + P.milestoneMul.toFixed(2), 'etMile');
     rows.push('<div class="etSep"></div>');
+    // TASK-404 rows: fuel pool / debt / bonds / sanctions
+    const F = window.__fuelBreakdown;
+    if (F) {
+        row('⛽ وقود', `${Math.floor(F.fuel)}/${C.ECON_FUEL_MAX} (${F.net >= 0 ? '+' : ''}${F.net.toFixed(2)}/ث)`, F.net < 0 ? 'etDrain' : '');
+        if (F.crisis > 0) rows.push('<div class="etBlk">⛽ أزمة وقود — شراء اضطراري من الذهب!</div>');
+    }
+    const LN = econState.loans[myRole];
+    if (LN && LN.owed > 0) row('🏦 قرض', `-$${C.ECON_LOAN_REPAY_PS}/ث (متبقٍ $${Math.ceil(LN.owed)})`, 'etDrain');
+    const BD = econState.bonds[myRole];
+    if (BD && BD.owed > 0) row('🎖️ سندات', `-$${C.ECON_BOND_REPAY_PS}/ث بعد الحرب (متبقٍ $${Math.ceil(BD.owed)})`, 'etDrain');
+    if (econSanctioned(myRole)) rows.push(`<div class="etBlk">⚠️ عقوبات دولية — التجارة ×${C.ECON_SANCTIONS_TRADE_MUL} (حروب: ${econWarPartnerCount(myRole)})</div>`);
     row('🎖️ الجيش' + (P.armyExcess > 0 ? ` (${Math.round(P.armyExcess / 1000)}k فائض)` : ' (مجاني)'), (P.army > 0 ? '-' : '+') + Math.abs(P.army).toFixed(1), P.army > 0 ? 'etDrain' : '');
     row('✈️ الطائرات', '-' + P.planes.toFixed(1), 'etDrain');
     row('🏗️ المباني', '-' + P.buildings.toFixed(1), 'etDrain');
     rows.push(`<div class="etNet${b.net >= 0 ? '' : ' etNeg'}">الصافي ${fmt(b.net)}/ث</div>`);
     if (b.blockadedPorts > 0) rows.push(`<div class="etBlk">⛔ موانئ تحت الحصار: ${b.blockadedPorts}</div>`);
     rows.push(`<div class="etMiles">🏆 ${chips}</div>`);
+    // TASK-404: animated sparkline of the last 60s net income
+    rows.push('<div class="etSpark"><canvas id="econSpark"></canvas></div>');
     tip.innerHTML = rows.join('');
+    const cv = tip.querySelector('#econSpark');
+    if (cv) econSparkDraw(cv);
 }
 function initEconTooltip() {
     window.__econTipInit = true;
@@ -12860,6 +12960,687 @@ function initEconTooltip() {
     };
     const gold = document.getElementById('pGold');   if (gold) attach(gold.closest('.stat') || gold);
     const inc  = document.getElementById('pIncome'); if (inc)  attach(inc.closest('.stat') || inc);
+    const fuel = document.getElementById('pFuel');   if (fuel) attach(fuel.closest('.stat') || fuel);   // TASK-404
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// TASK-404 — ECONOMY DEEP PASS
+//   · FUEL v1          — one pooled strategic reserve per nation (trickle +
+//                        open ports + factories in; planes/tanks/drones out).
+//                        Empty pool → world-market auto-buy drains GOLD and
+//                        new deployments are gated until the reserve recovers.
+//   · BLACK MARKET     — emergency loans at 30% interest, credit-capped.
+//                        Bots borrow when broke (a bad early war never
+//                        eliminates a nation). Key K opens the panel.
+//   · WAR BONDS        — interest-free, ONLY during a defensive war (max 2
+//                        per war), auto-repaid once the war ends.
+//   · SANCTIONS        — ≥3 simultaneous war partners → trade payouts ×0.6.
+//   · INTEL            — pay $300 to ring every enemy structure + census 60s.
+//   · TRADE LANES (L)  — port→port demand arcs; red when an enemy warship
+//                        sits on the lane (raid risk). Raidable shipping.
+//   · POLISH           — 60s net-income sparkline in the tooltip, milestone
+//                        medal fly-in toasts, striped overlay on blockaded
+//                        ports, "treasury low" warning (<10s of upkeep).
+//   · REFACTOR/OPT     — econ UI via observer (econBus, emits on change),
+//                        dirty-flag HUD writes, 30-frame war/blockade cache
+//                        (was warship×port per port per frame).
+//   Pure math lives in snapshot functions so economyTest() replays the
+//   exact live formulas (TASK-301 pattern). Other agents' classes are only
+//   ever READ (warships/troopCohorts/tanks/missiles/structs arrays).
+// ══════════════════════════════════════════════════════════════════════
+
+// ── Observer: econ-derived UI subscribes instead of being polled. Values
+//    are published ONLY on change (dirty at the source).
+const econBus = {
+    _subs: {}, _last: {},
+    on(ev, fn) { (this._subs[ev] = this._subs[ev] || []).push(fn); return fn; },
+    emit(ev, val) {
+        const l = this._subs[ev];
+        if (l) for (const fn of l) { try { fn(val); } catch (err) { console.warn('[ECON] subscriber "' + ev + '" failed:', err); } }
+    },
+};
+function econBusPublish() {
+    const b = window.__econBreakdown, f = window.__fuelBreakdown;
+    const emit = (ev, v) => { if (econBus._last[ev] !== v) { econBus._last[ev] = v; econBus.emit(ev, v); } };
+    emit('gold', Math.floor(pRes));
+    if (b) emit('net', Math.round(b.net * 10) / 10);
+    if (f) emit('fuel', Math.floor(f.fuel));
+    const L = econState.loans[myRole];
+    emit('debt', L && L.owed > 0 ? Math.ceil(L.owed) : 0);
+}
+
+// Debt badge inside the gold stat — the flagship econBus subscriber
+// (TASK-404 observer pattern: this UI is NEVER written from updateHUD;
+// it only ever changes when the published 'debt' value changes).
+function _econDebtBadge(v) {
+    let b = document.getElementById('econDebt');
+    if (!v) { if (b) b.style.display = 'none'; return; }
+    if (!b) {
+        const g = document.getElementById('pGold');
+        const host = (g && g.closest && g.closest('.stat')) || document.body;
+        b = document.createElement('span');
+        b.id = 'econDebt';
+        host.appendChild(b);
+    }
+    b.style.display = '';
+    b.textContent = `🏦$${v}`;
+    b.title = `دين قائم $${v} — يُسدد تلقائياً من الدخل`;
+}
+econBus.on('debt', _econDebtBadge);
+
+// ── Dirty-flag DOM writes: updateHUD fires from ~20 call sites + the HUD
+//    cadence — most textContent/style writes are redundant. Per-element
+//    keyed cache skips identical writes entirely (OPTIMIZE item).
+const _domCache = new WeakMap();
+function _domKey(el, k, v) {
+    let m = _domCache.get(el);
+    if (!m) { m = {}; _domCache.set(el, m); }
+    if (m[k] === v) return false;
+    m[k] = v;
+    return true;
+}
+function _setTxt(el, v) { if (el && _domKey(el, 'txt', v)) el.textContent = v; }
+function _setStyle(el, prop, v) { if (el && _domKey(el, 'st:' + prop, v)) el.style[prop] = v; }
+
+// ── ⛽ FUEL chip (top HUD, next to the income stat; built lazily so
+//    index.html stays untouched for the merge).
+function ensureFuelChip() {
+    if (document.getElementById('pFuel')) return;
+    const inc = document.getElementById('pIncome');
+    const st = inc && inc.closest && inc.closest('.stat');
+    if (!st || !st.parentElement) return;
+    const d = document.createElement('div');
+    d.className = 'stat fuelStat';
+    d.id = 'fuelStat';
+    d.innerHTML = `<span class="sIcon">⛽</span><span class="rval" id="pFuel">—</span><div class="fBarWrap"><div class="fFill" id="pFuelFill"></div></div>`;
+    st.after(d);
+}
+
+// ── Gold get/set siblings of econResAdd ──────────────────────────────
+function econResGet(side) {
+    if (side === 'player') return pRes;
+    if (side === 'enemy') return eRes;
+    const b = bots.find(x => x.str === side);
+    return b ? b.res : 0;
+}
+function econResSet(side, v) {
+    if (side === 'player') pRes = v;
+    else if (side === 'enemy') eRes = v;
+    else { const b = bots.find(x => x.str === side); if (b) b.res = v; }
+}
+
+// ── FUEL v1 (pooled per side) ─────────────────────────────────────────
+function econFuelGet(side) {
+    if (!(side in econState.fuel)) econState.fuel[side] = GAME_CONSTANTS.ECON_FUEL_START;
+    return econState.fuel[side];
+}
+// PURE fuel math — replayed by economyTest() (income: trickle + open ports
+// + factories; upkeep: aircraft + tank divisions + drones).
+function econFuelRatesFromSnapshot(snap) {
+    const C = GAME_CONSTANTS;
+    const income = C.ECON_FUEL_INCOME_BASE
+        + (snap.openPorts || 0) * C.ECON_FUEL_PER_PORT
+        + (snap.factories || 0) * C.ECON_FUEL_PER_FACTORY;
+    const planes = (snap.planes || 0) * C.ECON_FUEL_UPKEEP_PLANE;
+    const tanks = (snap.tanks || 0) * C.ECON_FUEL_UPKEEP_TANK;
+    const drones = (snap.drones || 0) * C.ECON_FUEL_UPKEEP_DRONE;
+    const upkeep = planes + tanks + drones;
+    return { income, upkeep, net: income - upkeep, parts: { planes, tanks, drones } };
+}
+function econFuelSides() {
+    const s = [myRole, 'player'];
+    if (bots.length === 0) s.push('enemy');
+    for (const b of bots) if (b.alive) s.push(b.str);
+    return [...new Set(s)];
+}
+function econFuelTick(dt) {
+    const C = GAME_CONSTANTS;
+    for (const side of econFuelSides()) {
+        const scan = econScanFrame().sideData[side] || {};
+        const snap = {
+            openPorts: Math.max(0, (scan.ports || 0) - (scan.blockaded || 0)),
+            factories: (scan.factoryLinks || []).length,
+            planes: planes.reduce((n, p) => n + (p.owner === side && !p.dead ? 1 : 0), 0),
+            tanks: tanks.reduce((n, t) => n + (t.owner === side && !t.dead ? 1 : 0), 0),
+            drones: drones.reduce((n, d) => n + (!d.dead && d.owner === side ? 1 : 0), 0),
+        };
+        const r = econFuelRatesFromSnapshot(snap);
+        let f = econFuelGet(side) + r.net * dt;
+        let crisis = 0;
+        if (f <= 0) {
+            if (r.net < 0) crisis = -r.net * dt * C.ECON_FUEL_CRISIS_GOLD;  // auto-buy at premium
+            f = 0;
+        } else if (f > C.ECON_FUEL_MAX) f = C.ECON_FUEL_MAX;
+        econState.fuel[side] = f;
+        if (crisis > 0) econResSet(side, Math.max(0, econResGet(side) - crisis));
+        if (side === myRole) window.__fuelBreakdown = Object.assign({}, r, snap, { fuel: f, crisis, at: frame });
+    }
+}
+// Deployment gate: true (fuel deducted) or false + player-facing message.
+function econFuelSpend(side, amount, silent) {
+    const f = econFuelGet(side);
+    if (f < amount) {
+        if (!silent && (side === myRole || side === 'player')) {
+            logEvent(`⛽ وقود غير كافٍ للنشر (${Math.floor(f)}/${amount}) — الموانئ والمصانع ترفع المخزون`, 'err');
+        }
+        return false;
+    }
+    econState.fuel[side] = f - amount;
+    return true;
+}
+
+// ── WAR SCAN (30-frame cache): war directions + blockaded ports in ONE
+//    bounded pass. War signal = someone's forces are actively on/at the
+//    other's land: cohorts marching at it, tank divisions standing on it,
+//    strategic missiles inbound at it (interceptors excluded via .tgt),
+//    warships blockading its ports. READ-ONLY scans of other agents' arrays.
+function econWarTick() {
+    const C = GAME_CONSTANTS;
+    const valid = new Set(econFuelSides());
+    const dirs = new Set();
+    const blocked = new Set();
+    const pairs = new Set();
+    const link = (atk, def) => {
+        if (atk === def || !valid.has(atk) || !valid.has(def)) return;
+        dirs.add(atk + '>' + def);
+        pairs.add(atk < def ? atk + '|' + def : def + '|' + atk);
+    };
+    const ownerAt = (lat, lon) => (typeof getPixelOwner === 'function' && typeof conquestGrid !== 'undefined' && conquestGrid && conquestGrid._maskReady)
+        ? getPixelOwner(lat, lon) : null;
+    const R = C.BLOCKADE_RADIUS_KM;
+    for (const w of warships) {
+        if (w.dead) continue;
+        for (const p of structs) {
+            if (p.type !== 'port' || p.dead || p.owner === w.owner) continue;
+            if (haversineDist(w.lat, w.lon, p.lat, p.lon) <= R) { link(w.owner, p.owner); blocked.add(p.id); }
+        }
+    }
+    for (const c of troopCohorts) if (!c.dead) link(c.owner, ownerAt(c.tlat, c.tlon));
+    for (const t of tanks) if (!t.dead) link(t.owner, ownerAt(t.lat, t.lon));
+    for (const m of missiles) if (!m.dead && !m.tgt) link(m.owner, ownerAt(m.tlat, m.tlon));
+    econState._warDirs = dirs;
+    econState._warPairs = [...pairs];
+    econState._blockedPorts = blocked;
+    econState._warFrame = frame;
+}
+function econDefensiveWar(side) {
+    for (const d of econState._warDirs) if (d.endsWith('>' + side)) return true;
+    return false;
+}
+function econWarPartnerCount(side) {
+    let n = 0;
+    for (const p of econState._warPairs) {
+        const i = p.indexOf('|');
+        if (p.slice(0, i) === side || p.slice(i + 1) === side) n++;
+    }
+    return n;
+}
+function econSanctioned(side) {
+    return econWarPartnerCount(side) >= GAME_CONSTANTS.ECON_SANCTIONS_MIN_WARS;
+}
+
+// ── BLACK MARKET: emergency loans (interest) + war bonds (defensive) ──
+function econLoanOf(side) { return econState.loans[side] || (econState.loans[side] = { principal: 0, owed: 0 }); }
+function econTakeLoan(side, silent) {
+    const C = GAME_CONSTANTS;
+    const L = econLoanOf(side);
+    if (L.principal + C.ECON_LOAN_AMOUNT > C.ECON_LOAN_MAX_DEBT) {
+        if (!silent && side === myRole) logEvent(`🏦 بلغتَ سقف الائتمان ($${C.ECON_LOAN_MAX_DEBT})`, 'err');
+        return false;
+    }
+    L.principal += C.ECON_LOAN_AMOUNT;
+    L.owed += C.ECON_LOAN_AMOUNT * C.ECON_LOAN_INTEREST;
+    econResAdd(side, C.ECON_LOAN_AMOUNT);
+    if (side === myRole) {
+        logEvent(`🏦 قرض طارئ: +$${C.ECON_LOAN_AMOUNT} (تسديد $${Math.round(C.ECON_LOAN_AMOUNT * C.ECON_LOAN_INTEREST)} تدريجياً)`, 'warn');
+        updateHUD();
+    }
+    return true;
+}
+function econLoanTick(dt) {
+    const C = GAME_CONSTANTS;
+    for (const side of econFuelSides()) {
+        const L = econState.loans[side];
+        if (!L || L.owed <= 0) continue;
+        const res = econResGet(side);
+        const avail = res - C.ECON_LOAN_RESERVE;         // repayment pauses at the floor
+        if (avail <= 0) continue;
+        const pay = Math.min(L.owed, avail, C.ECON_LOAN_REPAY_PS * dt);
+        L.owed -= pay;
+        L.principal = Math.max(0, L.principal - pay / C.ECON_LOAN_INTEREST);
+        econResSet(side, res - pay);
+    }
+}
+function econBondOf(side) { return econState.bonds[side] || (econState.bonds[side] = { owed: 0, epoch: -1, count: 0 }); }
+// Rising-edge tracking of defensive wars → the bond allowance resets per war.
+function econDefWarEdge() {
+    for (const side of econFuelSides()) {
+        const st = econState.defWar[side] || (econState.defWar[side] = { active: false, epoch: 0 });
+        const active = econDefensiveWar(side);
+        if (active && !st.active) st.epoch++;
+        st.active = active;
+    }
+}
+function econTakeBond(side, silent) {
+    const C = GAME_CONSTANTS;
+    const st = econState.defWar[side] || (econState.defWar[side] = { active: false, epoch: 0 });
+    if (!econDefensiveWar(side)) {
+        if (!silent && side === myRole) logEvent('🎖️ سندات الحرب متاحة فقط أثناء حرب دفاعية على أرضك!', 'err');
+        return false;
+    }
+    const B = econBondOf(side);
+    if (B.epoch !== st.epoch) { B.epoch = st.epoch; B.count = 0; }
+    if (B.count >= C.ECON_BOND_MAX_PER_WAR) {
+        if (!silent && side === myRole) logEvent(`🎖️ صدرت كل سندات هذه الحرب (${C.ECON_BOND_MAX_PER_WAR})`, 'err');
+        return false;
+    }
+    B.count++;
+    B.owed += C.ECON_BOND_AMOUNT;
+    econResAdd(side, C.ECON_BOND_AMOUNT);
+    if (side === myRole) {
+        logEvent(`🎖️ سندات حرب: +$${C.ECON_BOND_AMOUNT} (بلا فائدة — تُسدد بعد انتهاء الحرب)`, 'warn');
+        updateHUD();
+    }
+    return true;
+}
+function econBondTick(dt) {
+    const C = GAME_CONSTANTS;
+    for (const side of econFuelSides()) {
+        const B = econState.bonds[side];
+        if (!B || B.owed <= 0) continue;
+        if (econDefensiveWar(side)) continue;            // grace while the war lasts
+        const res = econResGet(side);
+        const pay = Math.min(B.owed, Math.max(0, res), C.ECON_BOND_REPAY_PS * dt);
+        if (pay <= 0) continue;
+        B.owed -= pay;
+        econResSet(side, res - pay);
+    }
+}
+// Bots borrow when broke — a bad early war shouldn't eliminate a nation.
+function econBotCreditTick() {
+    for (const b of bots) {
+        if (!b.alive) continue;
+        if (b.res < 120) econTakeLoan(b.str, true);
+    }
+}
+
+// ── INTEL: reveal enemy structures for a window ──────────────────────
+function econIntelActive() { return frame < ((econState.intel && econState.intel.until) || 0); }
+function econBuyIntel() {
+    const C = GAME_CONSTANTS;
+    if (pRes < C.ECON_INTEL_COST) { logEvent(`موارد غير كافية! تحتاج $${C.ECON_INTEL_COST}`, 'err'); return false; }
+    pRes -= C.ECON_INTEL_COST;
+    econState.intel.until = frame + C.ECON_INTEL_SECONDS * 60;
+    _intelBuildMarkers();
+    logEvent(`🕵️ نشاط استخبارات: كل منشآت العدو مكشوفة لمدة ${C.ECON_INTEL_SECONDS} ثانية`, 'warn');
+    updateHUD();
+    return true;
+}
+function _intelBuildMarkers() {
+    _intelClearMarkers();
+    if (typeof scene === 'undefined' || !scene) return;
+    for (const s of structs) {
+        if (s.dead || s.owner === myRole) continue;
+        const ring = new THREE.Mesh(
+            new THREE.RingGeometry(8, 11, 20),
+            new THREE.MeshBasicMaterial({ color: 0xff4455, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthWrite: false })
+        );
+        ring.position.copy(latLonToVec3(s.lat, s.lon, EARTH_RADIUS + 2.5));
+        ring.lookAt(0, 0, 0);
+        ring.renderOrder = 4;
+        scene.add(ring);
+        econState.intel.markers.push(ring);
+    }
+}
+function _intelClearMarkers() {
+    if (!econState.intel.markers) econState.intel.markers = [];
+    for (const r of econState.intel.markers) {
+        if (r.parent) r.parent.remove(r);
+        r.geometry.dispose();
+        r.material.dispose();
+    }
+    econState.intel.markers = [];
+}
+function _intelTick() {
+    if (!econState.intel.markers || !econState.intel.markers.length) return;
+    if (!econIntelActive()) {
+        _intelClearMarkers();
+        logEvent('🕵️ انتهت صلاحية الاستخبارات', 'info');
+        return;
+    }
+    const t = frame / 60;
+    for (const r of econState.intel.markers) r.material.opacity = 0.45 + 0.35 * Math.sin(t * 4);
+}
+
+// ── TRADE-LANE visualization (port→port demand arcs; raidable) ────────
+let tradeLaneGroup = null;
+let tradeLanesOn = true;
+let _laneFrame = -1e9;
+function toggleTradeLanes() {
+    tradeLanesOn = !tradeLanesOn;
+    rebuildTradeLanes();
+    logEvent(tradeLanesOn ? '🛣️ مسارات التجارة ظاهرة (أخضر = آمن، أحمر = خطر قرصنة)' : '🛣️ مسارات التجارة مخفية', 'info');
+}
+function _disposeGroupChildren(g) {
+    for (let i = g.children.length - 1; i >= 0; i--) {
+        const c = g.children[i];
+        g.remove(c);
+        if (c.geometry) c.geometry.dispose();
+        if (c.material) c.material.dispose();
+    }
+}
+function laneAtRisk(a, b) {
+    const R = GAME_CONSTANTS.ECON_LANE_RAID_RISK_KM;
+    const va = latLonToVec3(a.lat, a.lon, 1).normalize();
+    const vb = latLonToVec3(b.lat, b.lon, 1).normalize();
+    const mid = vec3ToLatLon(va.clone().add(vb).normalize());
+    for (const w of warships) {
+        if (w.dead || w.owner === myRole) continue;
+        if (haversineDist(w.lat, w.lon, a.lat, a.lon) < R) return true;
+        if (haversineDist(w.lat, w.lon, mid.lat, mid.lon) < R) return true;
+        if (haversineDist(w.lat, w.lon, b.lat, b.lon) < R) return true;
+    }
+    return false;
+}
+function rebuildTradeLanes() {
+    if (typeof scene === 'undefined' || !scene) return;
+    if (!tradeLaneGroup) { tradeLaneGroup = new THREE.Group(); scene.add(tradeLaneGroup); }
+    _disposeGroupChildren(tradeLaneGroup);
+    if (!tradeLanesOn || window.startSpawnPhase) return;
+    const C = GAME_CONSTANTS;
+    const myPorts = structs.filter(s => s.type === 'port' && !s.dead && s.owner === myRole);
+    if (!myPorts.length) return;
+    const foreign = structs.filter(s => s.type === 'port' && !s.dead && s.owner !== myRole);
+    const N = 28;
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), p = new THREE.Vector3();
+    for (const p1 of myPorts) {
+        const targets = foreign
+            .slice().sort((x, y) => haversineDist(p1.lat, p1.lon, x.lat, x.lon) - haversineDist(p1.lat, p1.lon, y.lat, y.lon))
+            .slice(0, C.ECON_LANE_TOP_TARGETS);
+        for (const p2 of targets) {
+            const risk = laneAtRisk(p1, p2);
+            a.copy(latLonToVec3(p1.lat, p1.lon, 1)).normalize();
+            b.copy(latLonToVec3(p2.lat, p2.lon, 1)).normalize();
+            const pts = [];
+            for (let i = 0; i <= N; i++) {
+                const t = i / N;
+                p.copy(a).lerp(b, t).normalize()
+                    .multiplyScalar(EARTH_RADIUS + 7 + 7 * Math.sin(Math.PI * t));   // lift mid-arc
+                pts.push(p.clone());
+            }
+            const line = new THREE.Line(
+                new THREE.BufferGeometry().setFromPoints(pts),
+                new THREE.LineDashedMaterial({ color: risk ? 0xff4444 : 0x39d98a, transparent: true, opacity: risk ? 0.95 : 0.5, dashSize: 7, gapSize: 5 })
+            );
+            line.computeLineDistances();
+            tradeLaneGroup.add(line);
+        }
+    }
+}
+
+// ── SPARKLINE: last 60s of net income, drawn into the econ tooltip ──
+function econSparkDraw(cv) {
+    const hist = econState.netHist;
+    const dpr = window.devicePixelRatio || 1;
+    const W = 216, H = 48;
+    if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    if (!hist || hist.length < 2) {
+        ctx.fillStyle = 'rgba(255,255,255,.45)';
+        ctx.font = '10px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('جارٍ تجميع بيانات الدخل…', W / 2, H / 2 + 3);
+        return;
+    }
+    const lo = Math.min(0, ...hist), hi = Math.max(1, ...hist);
+    const range = hi - lo || 1;
+    const X = i => 3 + (W - 6) * (i / (hist.length - 1));
+    const Y = v => H - 5 - (H - 10) * ((v - lo) / range);
+    // zero axis
+    ctx.strokeStyle = 'rgba(255,255,255,.22)';
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(3, Y(0)); ctx.lineTo(W - 3, Y(0)); ctx.stroke();
+    ctx.setLineDash([]);
+    // area fill
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, 'rgba(60,230,140,.32)');
+    grad.addColorStop(1, 'rgba(60,230,140,0)');
+    ctx.beginPath();
+    ctx.moveTo(X(0), Y(hist[0]));
+    for (let i = 1; i < hist.length; i++) ctx.lineTo(X(i), Y(hist[i]));
+    ctx.lineTo(X(hist.length - 1), H - 2); ctx.lineTo(X(0), H - 2); ctx.closePath();
+    ctx.fillStyle = grad; ctx.fill();
+    // line (red while the latest sample is negative)
+    ctx.beginPath();
+    ctx.moveTo(X(0), Y(hist[0]));
+    for (let i = 1; i < hist.length; i++) ctx.lineTo(X(i), Y(hist[i]));
+    const neg = hist[hist.length - 1] < 0;
+    ctx.strokeStyle = neg ? '#ff5555' : '#3ce68c';
+    ctx.lineWidth = 1.6;
+    ctx.stroke();
+    // end dot + scale labels
+    ctx.fillStyle = neg ? '#ff5555' : '#3ce68c';
+    ctx.beginPath(); ctx.arc(X(hist.length - 1), Y(hist[hist.length - 1]), 2.4, 0, 7); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,.5)';
+    ctx.font = '9px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('+' + hi.toFixed(1), 4, 10);
+    ctx.textAlign = 'right';
+    ctx.fillText(lo < 0 ? lo.toFixed(1) : '0', W - 4, 10);
+}
+
+// ── MILESTONE MEDALS: fly-in toast (TASK-404 polish) ─────────────────
+function econMilestoneToast(m, bonus) {
+    let host = document.getElementById('econMedals');
+    if (!host) { host = document.createElement('div'); host.id = 'econMedals'; document.body.appendChild(host); }
+    const el = document.createElement('div');
+    el.className = 'econMedal';
+    el.innerHTML = `<span class="mIcon">${m.icon}</span><span class="mTxt"><b>${m.name}</b>${bonus ? `<small>${bonus}</small>` : ''}</span>`;
+    host.appendChild(el);
+    while (host.children.length > 3) host.firstChild.remove();   // stack cap
+    setTimeout(() => { el.classList.add('out'); }, 2900);
+    setTimeout(() => el.remove(), 3500);
+}
+
+// ── BLOCKADE STRIPED overlay on blockaded ports ──────────────────────
+let _blkTex = null;
+function _blockadeStripeTex() {
+    if (_blkTex) return _blkTex;
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    const x = c.getContext('2d');
+    x.strokeStyle = '#ff5533';
+    x.lineWidth = 9;
+    for (let i = -64; i < 128; i += 22) {
+        x.beginPath(); x.moveTo(i, 64); x.lineTo(i + 64, 0); x.stroke();
+    }
+    // clip to a circle so it reads as a hazard ring over the port
+    x.globalCompositeOperation = 'destination-in';
+    x.beginPath(); x.arc(32, 32, 31, 0, 7);
+    x.fillStyle = '#fff'; x.fill();
+    _blkTex = new THREE.CanvasTexture(c);
+    return _blkTex;
+}
+function _blkMarkAdd(port) {
+    if (port._blkMark) return;
+    if (typeof scene === 'undefined' || !scene) return;
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: _blockadeStripeTex(), transparent: true, opacity: 0.9, depthTest: false }));
+    s.scale.set(22, 22, 1);
+    s.renderOrder = 6;
+    s.position.copy(latLonToVec3(port.lat, port.lon, EARTH_RADIUS + 13));
+    scene.add(s);
+    port._blkMark = s;
+}
+function _blkMarkRemove(port) {
+    const s = port._blkMark;
+    if (!s) return;
+    if (s.parent) s.parent.remove(s);
+    s.material.dispose();
+    port._blkMark = null;
+}
+function _blkPulse() {
+    const t = frame / 60;
+    for (const s of structs) {
+        if (s.type !== 'port' || s.dead || !s._blkMark) continue;
+        s._blkMark.material.opacity = 0.55 + 0.4 * Math.abs(Math.sin(t * 2.2));
+    }
+}
+
+// ── BLACK-MARKET PANEL (key K) ────────────────────────────────────────
+let _mktBuilt = false;
+function ensureMarketPanel() {
+    if (_mktBuilt && document.getElementById('econMkt')) return;
+    const old = document.getElementById('econMkt'); if (old) old.remove();
+    const p = document.createElement('div');
+    p.id = 'econMkt';
+    p.innerHTML = `
+        <div class="mkHead"><span>🏦 السوق السوداء</span><button class="mkClose">✕</button></div>
+        <div class="mkBody">
+            <div class="mkRow" id="mkLoanRow">
+                <div class="mkInfo"><b>قرض طارئ</b><small id="mkLoanInfo">—</small></div>
+                <button class="mkBtn" id="mkLoanBtn">+$800</button>
+            </div>
+            <div class="mkRow" id="mkBondRow">
+                <div class="mkInfo"><b>🎖️ سندات حرب</b><small id="mkBondInfo">—</small></div>
+                <button class="mkBtn" id="mkBondBtn">+$1200</button>
+            </div>
+            <div class="mkRow" id="mkIntelRow">
+                <div class="mkInfo"><b>🕵️ استخبارات</b><small id="mkIntelInfo">—</small></div>
+                <button class="mkBtn" id="mkIntelBtn">-$300</button>
+            </div>
+            <div class="mkStatus" id="mkStatus"></div>
+        </div>`;
+    document.body.appendChild(p);
+    p.querySelector('.mkClose').onclick = () => toggleMarketPanel(false);
+    p.querySelector('#mkLoanBtn').onclick = () => { econTakeLoan(myRole); refreshMarketPanel(); };
+    p.querySelector('#mkBondBtn').onclick = () => { econTakeBond(myRole); refreshMarketPanel(); };
+    p.querySelector('#mkIntelBtn').onclick = () => { econBuyIntel(); refreshMarketPanel(); };
+    _mktBuilt = true;
+}
+function toggleMarketPanel(force) {
+    ensureMarketPanel();
+    const p = document.getElementById('econMkt');
+    const open = force != null ? force : !p.classList.contains('open');
+    p.classList.toggle('open', open);
+    if (open) refreshMarketPanel();
+}
+function refreshMarketPanel() {
+    const p = document.getElementById('econMkt');
+    if (!p || !p.classList.contains('open')) return;
+    const C = GAME_CONSTANTS;
+    const L = econLoanOf(myRole);
+    const canLoan = L.principal + C.ECON_LOAN_AMOUNT <= C.ECON_LOAN_MAX_DEBT;
+    const li = document.getElementById('mkLoanInfo');
+    if (li) li.textContent = L.owed > 0
+        ? `دين قائم $${Math.ceil(L.owed)} — تسديد $${C.ECON_LOAN_REPAY_PS}/ث`
+        : `بلا ديون — فائدة ${Math.round((C.ECON_LOAN_INTEREST - 1) * 100)}%`;
+    const lb = document.getElementById('mkLoanBtn');
+    if (lb) { lb.disabled = !canLoan; lb.textContent = canLoan ? `+$${C.ECON_LOAN_AMOUNT}` : 'سقف الائتمان'; }
+    const def = econDefensiveWar(myRole);
+    const B = econBondOf(myRole);
+    const st = econState.defWar[myRole] || { active: false, epoch: 0 };
+    const bondsLeft = (B.epoch === st.epoch) ? Math.max(0, C.ECON_BOND_MAX_PER_WAR - B.count) : C.ECON_BOND_MAX_PER_WAR;
+    const bi = document.getElementById('mkBondInfo');
+    if (bi) bi.textContent = def
+        ? `حرب دفاعية! متاح ${bondsLeft}/${C.ECON_BOND_MAX_PER_WAR} — بلا فائدة`
+        : (B.owed > 0 ? `تسديد $${Math.ceil(B.owed)} بعد الحرب` : 'تتاح فقط أثناء حرب دفاعية');
+    const bb = document.getElementById('mkBondBtn');
+    if (bb) { bb.disabled = !(def && bondsLeft > 0); bb.textContent = def ? `+$${C.ECON_BOND_AMOUNT}` : 'مقفل'; }
+    const intelOn = econIntelActive();
+    const ii = document.getElementById('mkIntelInfo');
+    if (ii) ii.textContent = intelOn
+        ? `نشط — ${Math.ceil((econState.intel.until - frame) / 60)} ثانية متبقية`
+        : `يكشف كل منشآت العدو ${C.ECON_INTEL_SECONDS} ثانية`;
+    const ib = document.getElementById('mkIntelBtn');
+    if (ib) { ib.disabled = pRes < C.ECON_INTEL_COST && !intelOn; ib.textContent = intelOn ? 'نشط' : `-$${C.ECON_INTEL_COST}`; }
+    const sanc = econSanctioned(myRole);
+    const wars = econWarPartnerCount(myRole);
+    const f = window.__fuelBreakdown;
+    const ss = document.getElementById('mkStatus');
+    if (ss) ss.innerHTML =
+        (sanc ? `<div class="mkWarn">⚠️ عقوبات دولية — تجارتك ×${C.ECON_SANCTIONS_TRADE_MUL} (حروب: ${wars})</div>` : '') +
+        (f ? `<div>⛽ وقود: ${Math.floor(f.fuel)}/${C.ECON_FUEL_MAX} (${f.net >= 0 ? '+' : ''}${f.net.toFixed(2)}/ث)</div>` : '') +
+        (L.owed > 0 ? `<div class="mkWarn">🏦 دين مستحق: $${Math.ceil(L.owed)}</div>` : '') +
+        (B.owed > 0 ? `<div>🎖️ سندات قيد التسديد: $${Math.ceil(B.owed)}</div>` : '');
+}
+
+// ── SECOND TICK: everything once per second ──────────────────────────
+function econSecondTick() {
+    if (window.startSpawnPhase) return;
+    econMilestoneTick();          // TASK-301 (milestones, all sides)
+    econWarTick();                // refresh war pairs + blockade set (30f cache)
+    econDefWarEdge();             // defensive-war rising edges (bond epochs)
+    econLoanTick(1);
+    econBondTick(1);
+    econBotCreditTick();
+    // sparkline history (net income, 60 samples @ 1/s)
+    if (window.__econBreakdown) {
+        econState.netHist.push(window.__econBreakdown.net);
+        if (econState.netHist.length > 60) econState.netHist.shift();
+    }
+    // treasury-low warning (rate-limited): gold can't cover the next 10s
+    const b = window.__econBreakdown;
+    if (b && b.net < 0 && pRes < GAME_CONSTANTS.ECON_TREASURY_LOW_S * -b.net &&
+        frame - econState._lowT > GAME_CONSTANTS.ECON_TREASURY_LOW_TOAST_F) {
+        econState._lowT = frame;
+        uiToast(`⚠️ الخزينة تكفي أقل من ${GAME_CONSTANTS.ECON_TREASURY_LOW_S} ثانية من النفقات!`, 'err', 3200);
+        logEvent('⚠️ تحذير: الخزينة منخفضة — قلّص الجيش أو اقترض من السوق السوداء', 'err');
+    }
+    // trade lanes (rebuild cadence; L toggles)
+    if (tradeLanesOn && frame - _laneFrame >= GAME_CONSTANTS.ECON_LANE_REFRESH_F) {
+        _laneFrame = frame;
+        rebuildTradeLanes();
+    }
+    _intelTick();
+    _blkPulse();
+    econBusPublish();             // observer: econ UI values on change
+    refreshMarketPanel();         // no-op when closed
+}
+
+// ── TASK-404 debug accessor (console probes + post-merge verification) ──
+// Follows the __ffaProbe pattern: live state by reference where safe, plus
+// manual drivers for the 1s pass so edge paths (bond cycle under a war,
+// sanctions, lane risk) are probeable without waiting on organic wars.
+window.__econProbe = {
+    state: () => econState,                        // by REFERENCE — probes may inject
+    breakdown: () => window.__econBreakdown,       // (e.g. state()._warDirs.add('X>player'))
+    fuelBreakdown: () => window.__fuelBreakdown,
+    myRole: () => myRole,
+    warDirs: () => [...econState._warDirs],
+    defWar: (s) => econDefensiveWar(s || myRole),
+    partners: (s) => econWarPartnerCount(s || myRole),
+    sanctioned: (s) => econSanctioned(s || myRole),
+    takeLoan: (s) => econTakeLoan(s || myRole, true),
+    takeBond: (s) => econTakeBond(s || myRole, true),
+    loan: (s) => { const L = econLoanOf(s || myRole); return { ...L }; },
+    bond: (s) => { const B = econBondOf(s || myRole); return { ...B }; },
+    intel: () => ({ active: econIntelActive(), left_s: econIntelActive() ? Math.ceil((econState.intel.until - frame) / 60) : 0 }),
+    setFuel: (v, s) => { econState.fuel[s || myRole] = v; },
+    fuelTick: (dt) => econFuelTick(dt == null ? 1 : dt),
+    secondTick: () => econSecondTick(),            // drive the 1s pass manually
+    warTick: () => econWarTick(),                  // rebuild the war/blockade cache NOW
+    lanes: () => ({ on: tradeLanesOn, arcs: tradeLaneGroup ? tradeLaneGroup.children.length : 0 }),
+    marketOpen: (v) => toggleMarketPanel(v),
+};
+
+// Remove all TASK-404 visuals (menu return / new game reset).
+function econTeardownForMenu() {
+    try {
+        if (typeof scene !== 'undefined' && scene && tradeLaneGroup) _disposeGroupChildren(tradeLaneGroup);
+        _intelClearMarkers();
+        if (typeof structs !== 'undefined' && structs) for (const s of structs) if (s && s._blkMark) _blkMarkRemove(s);
+        const host = document.getElementById('econMedals'); if (host) host.innerHTML = '';
+        const p = document.getElementById('econMkt'); if (p) p.classList.remove('open');
+    } catch (e) { console.warn('[ECON] teardown:', e); }
+}
+
+// Pure refund math for AUDIT #17 (probed by economyTest): proportional
+// refund for squad members that never launched (cap ate them post-payment).
+function _droneRefund(cost, launched, squad) {
+    if (launched >= squad) return 0;
+    return Math.floor(cost * (squad - launched) / squad);
 }
 
 // ── TASK-301 PROBE: economyTest() ─────────────────────────────────────
@@ -12911,18 +13692,83 @@ window.economyTest = function(followSec) {
         chk('milestone defs sane (unique ids, thresholds, mul ≥ 1)', sane, [...ids].join(','));
     }
     // blockade distance logic — synthetic warship pushed & popped synchronously
-    // (no frame can interleave; the real warships[] is untouched afterwards)
+    // (no frame can interleave; the real warships[] is untouched afterwards).
+    // TASK-404: isPortBlockaded reads the 30f war cache — force a rebuild
+    // between mutations by rewinding _warFrame (saved + restored around it).
     {
-        const fakePort = { lat: 30, lon: 30, owner: 'player' };
-        const fakeShip = { dead: false, owner: 'enemy', lat: 30, lon: 30 };
-        warships.push(fakeShip);
-        const near = isPortBlockaded(fakePort);
+        // The cache is built from structs+warships — push BOTH fakes, and use
+        // a REAL hostile side ('enemy' only exists in 1v1; FFA uses bot strs).
+        const hostile = bots.length ? bots[0].str : 'enemy';
+        const fakePort = { id: 'probe_blk_port', type: 'port', dead: false, lat: 30, lon: 30, owner: 'player' };
+        const fakeShip = { dead: false, owner: hostile, lat: 30, lon: 30 };
+        const savedWf = econState._warFrame;
+        structs.push(fakePort); warships.push(fakeShip);
+        econState._warFrame = -1e9; const near = isPortBlockaded(fakePort);
         fakeShip.lon = 40;                    // ≈1040km away — outside radius
-        const far = isPortBlockaded(fakePort);
+        econState._warFrame = -1e9; const far = isPortBlockaded(fakePort);
         fakeShip.lon = 30; fakeShip.owner = 'player';   // own ship never blocks
-        const own = isPortBlockaded(fakePort);
-        warships.pop();
-        chk('blockade: near✓ far✗ own✗', near === true && far === false && own === false, `R=${C.BLOCKADE_RADIUS_KM}km`);
+        econState._warFrame = -1e9; const own = isPortBlockaded(fakePort);
+        structs.pop(); warships.pop();
+        econState._warFrame = savedWf;        // live cache resumes untouched
+        chk('blockade: near✓ far✗ own✗ (30f cache)', near === true && far === false && own === false, `R=${C.BLOCKADE_RADIUS_KM}km vs ${hostile}`);
+    }
+
+    // ── A2. TASK-404 unit checks (fuel / loans / bonds / sanctions / refund) ──
+    // Probe sides ('probe404') are never in econFuelSides() → no live tick
+    // touches them; every mutation is saved + restored synchronously.
+    {
+        // fuel math (pure snapshot, per-second)
+        const f0 = econFuelRatesFromSnapshot({});
+        chk('fuel: base trickle', Math.abs(f0.income - C.ECON_FUEL_INCOME_BASE) < 1e-9 && f0.upkeep === 0, f0.income.toFixed(2) + '/s');
+        const f1 = econFuelRatesFromSnapshot({ openPorts: 3, factories: 2, planes: 4, tanks: 2, drones: 5 });
+        const expInc = C.ECON_FUEL_INCOME_BASE + 3 * C.ECON_FUEL_PER_PORT + 2 * C.ECON_FUEL_PER_FACTORY;
+        const expUp = 4 * C.ECON_FUEL_UPKEEP_PLANE + 2 * C.ECON_FUEL_UPKEEP_TANK + 5 * C.ECON_FUEL_UPKEEP_DRONE;
+        chk('fuel: income/upkeep parts', Math.abs(f1.income - expInc) < 1e-9 && Math.abs(f1.upkeep - expUp) < 1e-9,
+            `net ${f1.net.toFixed(2)}/s`);
+        // fuel spend gate (deducts on success, refuses when short)
+        const hadFuel = 'probe404' in econState.fuel;
+        const oldFuel = econState.fuel.probe404;
+        econState.fuel.probe404 = 30;
+        const s1 = econFuelSpend('probe404', 25, true);
+        const s2 = econFuelSpend('probe404', 10, true);
+        const s3 = econState.fuel.probe404 === 5;
+        if (hadFuel) econState.fuel.probe404 = oldFuel; else delete econState.fuel.probe404;
+        chk('fuel: spend gate deducts + refuses', s1 === true && s2 === false && s3 === true);
+        // drone-squad refund math (AUDIT #17)
+        chk('drone refund: unlaunched share returned',
+            _droneRefund(90, 2, 3) === 30 && _droneRefund(90, 3, 3) === 0 && _droneRefund(90, 0, 3) === 90);
+        // loan: amount + interest + credit cap (probe side — econResAdd no-ops)
+        delete econState.loans.probe404;
+        const t1 = econTakeLoan('probe404', true);
+        const L2 = econLoanOf('probe404');
+        const t2 = econTakeLoan('probe404', true), t3 = econTakeLoan('probe404', true);   // 3rd crosses the cap
+        const loanOk = t1 === true && t2 === true && t3 === false
+            && L2.principal === 2 * C.ECON_LOAN_AMOUNT
+            && Math.abs(L2.owed - 2 * C.ECON_LOAN_AMOUNT * C.ECON_LOAN_INTEREST) < 1e-9;
+        delete econState.loans.probe404;
+        chk('loan: +$800 @30% interest, credit-capped', loanOk);
+        // bond: refused outside a defensive war (probe side has no incoming war)
+        delete econState.bonds.probe404; delete econState.defWar.probe404;
+        const bondRefused = econTakeBond('probe404', true) === false;
+        delete econState.bonds.probe404; delete econState.defWar.probe404;
+        chk('bond: refused outside a defensive war', bondRefused);
+        // sanctions: synthetic war partners (saved + restored synchronously)
+        const svPairs = econState._warPairs, svWf2 = econState._warFrame;
+        econState._warPairs = ['probe404|a', 'probe404|b', 'probe404|c', 'x|y'];
+        const nPart = econWarPartnerCount('probe404');
+        const sanc = econSanctioned('probe404');
+        const notSanc = econSanctioned('x');
+        econState._warPairs = svPairs; econState._warFrame = svWf2;
+        chk('sanctions: ≥3 war partners → trade penalty', nPart === 3 && sanc === true && notSanc === false,
+            `threshold ${C.ECON_SANCTIONS_MIN_WARS}`);
+        // sparkline: rolling window — once full it stays at exactly 60
+        const svHist = econState.netHist;
+        econState.netHist = Array.from({ length: 60 }, (_, i) => i);   // full window [0..59]
+        econState.netHist.push(60);
+        if (econState.netHist.length > 60) econState.netHist.shift();  // same maintenance as econSecondTick
+        const cap60 = econState.netHist.length === 60 && econState.netHist[0] === 1 && econState.netHist[59] === 60;
+        econState.netHist = svHist;
+        chk('sparkline: rolling window holds 60 samples', cap60);
     }
 
     // ── B. live snapshot (if a game is running) ──
@@ -13285,6 +14131,7 @@ function runAI() {
         if (_resOf(riv) < DCFG[key].cost) continue;
         const T = tgts[Math.floor(Math.random() * tgts.length)];
         const P = pads[Math.floor(Math.random() * pads.length)];
+        if (!econFuelSpend(riv.str, GAME_CONSTANTS.ECON_FUEL_COST_DRONE, true)) continue;   // TASK-404: bots pay fuel too
         _spendRes(riv, DCFG[key].cost);
         launchDrone(riv.str, key, { lat: P.lat, lon: P.lon }, { homeLat: T.lat, homeLon: T.lon });
       }
@@ -13417,7 +14264,9 @@ function runAI() {
                         let ap = new Structure(bl, bo, 'airport', riv.str);
                         structs.push(ap);
                         _spendRes(riv, SDEFS['airport'].cost);
-                        planes.push(new Plane(ap.lat, ap.lon, PCFG['fighter'], riv.str));
+                        // TASK-404: the bundled starter fighter burns fuel like any deployment
+                        if (econFuelSpend(riv.str, GAME_CONSTANTS.ECON_FUEL_COST_PLANE, true))
+                            planes.push(new Plane(ap.lat, ap.lon, PCFG['fighter'], riv.str));
                     }
                 } else if (!hasNearbyPort && _resOf(riv) >= _enemyPortCost()) {
                     // OpenFront: ports drive the trade economy — snap to the nearest shore.
@@ -13458,8 +14307,9 @@ function runAI() {
                     let ap = new Structure(targetCity.lat + 0.1, targetCity.lon - 0.15, 'airport', 'enemy');
                     structs.push(ap);
                     eRes -= SDEFS['airport'].cost;
-                    // Give them a starting fighter
-                    planes.push(new Plane(ap.lat, ap.lon, PCFG['fighter'], 'enemy'));
+                    // Give them a starting fighter (TASK-404: burns fuel like any deployment)
+                    if (econFuelSpend('enemy', GAME_CONSTANTS.ECON_FUEL_COST_PLANE, true))
+                        planes.push(new Plane(ap.lat, ap.lon, PCFG['fighter'], 'enemy'));
                 }
             }
         }
@@ -13552,6 +14402,7 @@ function runAI() {
             if (!pool.length) continue;
             let total = pool.reduce((s, m) => s + m.w, 0), roll = Math.random() * total, pick = pool[0];
             for (const m of pool) { roll -= m.w; if (roll <= 0) { pick = m; break; } }
+            if (!econFuelSpend(riv.str, C.ECON_FUEL_COST_PLANE, true)) continue;   // TASK-404: bots pay fuel too
             planes.push(new Plane(apt.lat, apt.lon, PCFG[pick.k], riv.str));
             _spendRes(riv, PCFG[pick.k].cost);
         }
@@ -13573,7 +14424,8 @@ function runAI() {
                     const roll = Math.random();
                     const k = roll < 0.4 ? 'light' : roll < 0.8 ? 'medium' : 'heavy';
                     const cfg = TCFG[k];
-                    if (_resOf(riv) >= cfg.cost + 300) {
+                    if (_resOf(riv) >= cfg.cost + 300
+                        && econFuelSpend(riv.str, GAME_CONSTANTS.ECON_FUEL_COST_TANK, true)) {   // TASK-404: bots pay fuel too
                         // muster at the base, fan out to a spread holding point
                         // (the frontal re-aim below re-tasks them as the line moves)
                         spawnTankDivision(fac.lat, fac.lon, k, riv.str,
@@ -13817,10 +14669,13 @@ function gameFrame() {
         // Floor at 0 — no debt
         if(pRes < 0) pRes = 0;
         if(eRes < 0) eRes = 0;
+        // TASK-404: fuel resource tick (one pooled reserve per side)
+        econFuelTick(GAME_CONSTANTS.ECON_TICK_INTERVAL / 60);
     }
     
-    // TASK-301: economy milestones — once per second, all sides
-    if (frame % 60 === 0) econMilestoneTick();
+    // TASK-301 milestones + TASK-404 second-tick (fuel crisis watch, loans,
+    // bonds, sanctions, intel, trade lanes, sparkline, observer) — 1/s.
+    if (frame % 60 === 0) econSecondTick();
     
     // Spawn Trade Ships and Trains on interval
     if(frame % GAME_CONSTANTS.TRADE_SHIP_SPAWN_INTERVAL === 0) {
@@ -14028,6 +14883,7 @@ function backToMenu() {
     drones.forEach(d => { if(d.mesh && !d.dead) { scene.remove(d.mesh); disposeMeshDeep(d.mesh); } });   // TASK-204
     transients.forEach(_killTransient); transients = [];                                             // TASK-204
     craterDecals.forEach(c => { scene.remove(c.mesh); if (c.mesh.material) _recycleMat(c.mesh.material); }); craterDecals = [];
+    econTeardownForMenu();   // TASK-404: lanes / intel rings / medals / panel state
     exps.forEach(e => { scene.remove(e); disposeMeshDeep(e); });
     particles.forEach(p => { scene.remove(p); disposeMeshDeep(p); });
     if (window.paintExpansions) window.paintExpansions.forEach(pe => { if(pe.mesh) { scene.remove(pe.mesh); disposeMeshDeep(pe.mesh); } });
@@ -14139,6 +14995,9 @@ function purchasePlane(k, fromRowId) {
     };
     if (!apt) { feedback('لا يوجد مطار! ابنِ مطاراً عسكرياً أولاً 🛫', true); SFX.ui('err'); return; }
     if (pRes < PCFG[k].cost) { feedback(`موارد غير كافية! تحتاج $${PCFG[k].cost}`, true); SFX.ui('err'); return; }
+    // TASK-404: strategic-fuel gate — new aircraft burn reserve fuel on
+    // deployment (economy logic; the Plane class itself is untouched).
+    if (!econFuelSpend(myRole, GAME_CONSTANTS.ECON_FUEL_COST_PLANE)) { feedback(`⛽ وقود غير كافٍ للنشر! تحتاج ${GAME_CONSTANTS.ECON_FUEL_COST_PLANE}`, true); SFX.ui('err'); return; }
     pRes -= PCFG[k].cost;
     planes.push(new Plane(apt.lat, apt.lon, PCFG[k], myRole));
     feedback(`${PCFG[k].name} أقلعت من المطار ✈️`, false);
