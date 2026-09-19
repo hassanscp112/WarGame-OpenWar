@@ -67,6 +67,7 @@
 - **TASK-405 (tanks agent) — WIP3 AI polish + final sweep COMPLETE**:
   - Rival AI: SPG joins the purchase roll (~15%); frontline re-aim holds standoff guns ~240km behind the contact point (home bearing) instead of marching them into their own 120km dead zone.
   - Final probe sweep ALL GREEN in one session: `tankBattleTest` PASS · `tankDeepTest` PASS · `tankMarchTest` corridor+arrival ✓.
+  - Cross-mode compat verified: classic (`gameMode='mode2'`) `tankBattleTest` PASS (isLand fallback path) + 12k-frame soak with `_tankDeepTick` live — ~0.45ms/frame avg, no errors, wrecks fade, arrays bounded.
   - ⚠️ **Cross-agent flag (conquest/world)**: with Overpass down and 0 cities seeded, FFA bots paint 0 cells + build 0 structs (res drains to research only) — rivals never reach tank/base-building branches. Environment-dependent, pre-existing.
   - **Status: ready-for-merge** (branch `feature/tanks-system`, HEAD after WIP3 commit).
 

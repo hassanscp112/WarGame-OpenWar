@@ -43,6 +43,18 @@ await window.tankBattleTest() // classic duel regression
 await window.tankMarchTest()  // corridor painting
 ```
 
+### 🔀 MERGE MAP for supervisor (TASK-405 touch-points in shared hot regions)
+| Region (function) | TASK-405 change | Merge note |
+|---|---|---|
+| `gameFrame()` — entity tick block | added `_tankDeepTick();` line right after `_compactAlive(tanks…)` (and after `_compactAlive(aamMissiles…)`) | keep tanks compact + deepTick adjacent; drones must stay listed ONCE |
+| `Tank._supplyCheck()` | grace now `supplyGrace += 90` per scan (frames, not scans) | semantic fix — prefer ours over any branch with `++supplyGrace` |
+| `updateSelectionPanel()` — `unit instanceof Tank` branch | TASK-405 rows (crossing/entrench/supply/ace/engine) | other agents extend OTHER branches (Warship/planes) — independent |
+| rival AI "6. AI LAND FORCES" block | SPG in class roll + artillery hold-back re-aim (`home` lookup + bearing math) | conquest/world agents edit neighboring sections — re-aim block is self-contained |
+| file tail (probes) | `tankDeepTest` + `tankRiverProbe` appended after `tankMarchTest` | append-only; other agents append their probes too — order irrelevant |
+| `src/land/landUnits.js` | unchanged this session (WIP1) | already merged shape |
+| `tankBattleTest` isolation | added `_clearTankDeep()` after `tanks.length = 0` | trivial |
+| Known shared-file hazards | `applyOpponentAction` tank_spawn/tank_move unchanged | planes/navy agents add sibling `if` blocks — no overlap |
+
 ---
 
 ## SESSION 4 (2026-07-05): Ocean-Colour Paint + Tile-Based Brush
