@@ -47,6 +47,12 @@ export const CONQUEST_CFG = {
   DEVASTATION_DECAY_PER_TICK: 0.00012,  // ~1/5000 per tick ≈ fades in ~3.5 min
   DEVASTATION_DEF_MULT: 0.35,    // at full devastation, terrain magnitude ×0.35
   DEVASTATION_SPEED_MULT: 1.8,   // at full devastation, conquest speed ×1.8
+  // ── TASK-406: devastation VISUAL layer (scorch reads on the globe) ──
+  DEV_VIS_LEVELS: 16,            // quantized alpha buckets (bucket change = repaint)
+  DEV_VIS_MAX_ALPHA: 150,        // scorch opacity at full devastation
+  // ── TASK-406: frontline heat ──
+  HEAT_AGE_MS: 12000,            // a flipped cell stays "hot" this long
+  HEAT_MAX_CELLS: 24000,         // safety cap on the heat map
   TERRAIN_SPEED: { 1: 16.5, 2: 20, 3: 25  },
 
   // ── Large-empire defense debuff (big defenders are slower/softer) ──
@@ -312,6 +318,27 @@ export class ConquestGrid {
     this._countsOther = new Map();        // bot owner code → owned cell count (O(1) countCells)
     this._devastation = new Float32Array(cfg.GRID_W * cfg.GRID_H);  // TASK-102 blast-weakening layer
     this._devCursor = 0;                  // rotating decay cursor
+
+    // TASK-406: devastation VISUAL layer — a second canvas painted with a
+    // scorched tint whose alpha follows the logical devastation value and
+    // fades with the same decay (bucketed so decay only repaints on change).
+    this.devCanvas = document.createElement('canvas');
+    this.devCanvas.width = cfg.GRID_W;
+    this.devCanvas.height = cfg.GRID_H;
+    this.devCtx = this.devCanvas.getContext('2d');
+    this.devImage = this.devCtx.createImageData(cfg.GRID_W, cfg.GRID_H);
+    this._devBuckets = new Uint8Array(N); // quantized 0..LEVELS-1 alpha bucket per cell
+    this._devDirty = new Set();           // cells whose bucket changed since last flush
+
+    // TASK-406: shared dirty-region queue — territory overlay uploads can blit
+    // just the changed sub-rect instead of the whole 7200×3600 canvas.
+    //   undefined = nothing pending · null = full repaint pending · {x,y,w,h} = union rect
+    this._ovRect = undefined;
+    this._lastFlush = { full: false, rect: null };
+
+    // TASK-406: frontline heat — cells involved in recent ownership flips
+    // (the active frontline glows; ages out after HEAT_AGE_MS).
+    this._heat = new Map();               // cell → performance.now() stamp
 
     // Biome canvas: the globe's LAND surface, painted tile-by-tile from terrainByte[]
     // (one pixel per cell). This REPLACES the old static photo texture — same resolution
@@ -617,6 +644,31 @@ export class ConquestGrid {
     this._biomePainted = true;
   }
 
+  // ── TASK-406: INCREMENTAL biome painter — repaint just the given cells into
+  // the biome canvas (the biome side of the shared dirty-region queue: water
+  // dilation + editor edits no longer need a full 26M-cell repaint).
+  paintBiomeCells(cells) {
+    if (!cells || cells.length === 0) return;
+    const cfg = this.cfg;
+    const W = cfg.GRID_W;
+    const data = this.biomeImage.data;
+    const tb = this.terrainByte, owner = this.owner;
+    const WATERC = cfg.WATER;
+    let minC = W, minR = cfg.GRID_H, maxC = -1, maxR = -1;
+    for (const cell of cells) {
+      const c = owner[cell] === WATERC ? OF_OCEAN : ofTerrainColor(tb[cell]);
+      const i = cell * 4;
+      data[i] = c[0]; data[i + 1] = c[1]; data[i + 2] = c[2]; data[i + 3] = 255;
+      const col = cell % W, row = (cell / W) | 0;
+      if (col < minC) minC = col;
+      if (col > maxC) maxC = col;
+      if (row < minR) minR = row;
+      if (row > maxR) maxR = row;
+    }
+    this.biomeCtx.putImageData(this.biomeImage, 0, 0, minC, minR, maxC - minC + 1, maxR - minR + 1);
+    this._biomePainted = true;
+  }
+
   // ── Fallback biome painter: used only when the OpenFront binary is unavailable. ──
   // Paints from the latitude/terrain heuristic (this.terrain[] + owner[]) using the
   // flat COLOR palette, so the globe still gets a clean land surface.
@@ -841,8 +893,97 @@ export class ConquestGrid {
     else if (newCode === cfg.NEUTRAL) this._counts.neutral++;
     else if (newCode > 3) this._countsOther.set(newCode, (this._countsOther.get(newCode) || 0) + 1);
     this._dirtyCells.add(cell);
+    // TASK-406: stamp the frontline heat map (cap guards mass flips — e.g.
+    // eliminations repaint a whole empire in one tick).
+    if (this._heat.size < cfg.HEAT_MAX_CELLS) this._heat.set(cell, performance.now());
     return true;
   }
+
+  // ── TASK-406: frontline HEAT edges — vector segments around cells involved
+  // in recent ownership flips. Same edge geometry as getFrontierEdges but only
+  // for the ACTIVE frontline (recently fought-over cells), so the render layer
+  // can pulse a glow over live combat zones. Stale entries are pruned in-pass.
+  getHotEdges(maxAgeMs) {
+    const cfg = this.cfg;
+    const ageMs = maxAgeMs || cfg.HEAT_AGE_MS;
+    const W = cfg.GRID_W, H = cfg.GRID_H, D = cfg.CELL_DEG;
+    const owner = this.owner;
+    const now = performance.now();
+    if (!this._heSegs) { this._heSegs = []; this._heSeen = new Set(); }
+    const segs = this._heSegs, seen = this._heSeen;
+    segs.length = 0; seen.clear();
+    const N = W * H;
+    const dead = [];
+    for (const entry of this._heat) {
+      const cell = entry[0], ts = entry[1];
+      if (now - ts > ageMs) { dead.push(cell); continue; }
+      const o = owner[cell];
+      if (o === cfg.WATER || o === cfg.NEUTRAL) continue;   // only owned frontage glows
+      const col = cell % W;
+      const row = (cell / W) | 0;
+      const wLon = -180 + col * D;
+      const eLon = wLon + D;
+      const nLat = 90 - row * D;
+      const sLat = nLat - D;
+      const push = (b, lat1, lon1, lat2, lon2) => {
+        const key = cell < b ? cell * N + b : b * N + cell;
+        if (seen.has(key)) return;
+        seen.add(key);
+        segs.push(lat1, lon1, lat2, lon2);
+      };
+      const eCell = row * W + (col < W - 1 ? col + 1 : 0);
+      if (owner[eCell] !== o) push(eCell, nLat, eLon, sLat, eLon);
+      const wCell = row * W + (col > 0 ? col - 1 : W - 1);
+      if (owner[wCell] !== o) push(wCell, nLat, wLon, sLat, wLon);
+      if (row > 0 && owner[cell - W] !== o) push(cell - W, nLat, wLon, nLat, eLon);
+      if (row < H - 1 && owner[cell + W] !== o) push(cell + W, sLat, wLon, sLat, eLon);
+    }
+    for (const c of dead) this._heat.delete(c);
+    return segs;
+  }
+
+  // ── TASK-406: devastation VISUAL flush — paint bucket-dirty cells into the
+  // scorch canvas (dark tint, alpha ∝ devastation). Returns true when pixels
+  // changed (caller re-uploads the texture, throttled).
+  flushDevastationRender() {
+    if (!this._devDirty || this._devDirty.size === 0) return false;
+    const cfg = this.cfg;
+    const W = cfg.GRID_W, H = cfg.GRID_H;
+    const data = this.devImage.data;
+    const L = cfg.DEV_VIS_LEVELS - 1;
+    const maxA = cfg.DEV_VIS_MAX_ALPHA;
+    let minC = W, minR = H, maxC = -1, maxR = -1;
+    for (const cell of this._devDirty) {
+      const b = this._devBuckets[cell];
+      const p = cell * 4;
+      if (b > 0) {
+        data[p] = 34; data[p + 1] = 24; data[p + 2] = 16;   // charcoal scorch
+        data[p + 3] = Math.round((b / L) * maxA);
+      } else {
+        data[p + 3] = 0;                                    // fully healed → clear
+      }
+      const c = cell % W, r = (cell / W) | 0;
+      if (c < minC) minC = c;
+      if (c > maxC) maxC = c;
+      if (r < minR) minR = r;
+      if (r > maxR) maxR = r;
+    }
+    this._devDirty.clear();
+    this.devCtx.putImageData(this.devImage, 0, 0, minC, minR, maxC - minC + 1, maxR - minR + 1);
+    return true;
+  }
+  hasDevDirty() { return this._devDirty.size > 0; }
+  getDevastationCanvas() { return this.devCanvas; }
+
+  // ── TASK-406: shared dirty-region queue (consumed by the render layer) ──
+  // Returns: undefined (nothing pending) · null (full repaint pending) ·
+  // {x,y,w,h} (union sub-rect of every change since the last consume).
+  takeOverlayRect() {
+    const v = this._ovRect;
+    this._ovRect = undefined;
+    return v;
+  }
+  getLastFlush() { return this._lastFlush; }
 
   // ── DEVASTATION (TASK-102) ──
   // Blast damage from missiles/bombs weakens territory: each hit paints
@@ -874,7 +1015,14 @@ export class ConquestGrid {
         const fall = 1 - dist / Math.max(1, radiusKm);          // 1 at center → 0 at rim
         const add = hit * fall;
         const cur = this._devastation[cell];
-        this._devastation[cell] = cur + add > maxD ? maxD : cur + add;
+        const nv = cur + add > maxD ? maxD : cur + add;
+        this._devastation[cell] = nv;
+        // TASK-406: track the visual bucket — repaint only when it changes
+        const nb = Math.min(cfg.DEV_VIS_LEVELS - 1, Math.round(nv * (cfg.DEV_VIS_LEVELS - 1)));
+        if (nb !== this._devBuckets[cell]) {
+          this._devBuckets[cell] = nb;
+          this._devDirty.add(cell);
+        }
       }
     }
   }
@@ -891,9 +1039,19 @@ export class ConquestGrid {
     // rotating window: only touches nCells entries per call → O(nCells)
     this._devCursor = (this._devCursor || 0) % d.length;
     let idx = this._devCursor;
+    const L = this.cfg.DEV_VIS_LEVELS - 1;
     for (let i = 0; i < nCells; i++) {
       const v = d[idx];
-      if (v > 0) d[idx] = v <= dec ? 0 : v - dec;
+      if (v > 0) {
+        const nv = v <= dec ? 0 : v - dec;
+        d[idx] = nv;
+        // TASK-406: bucket change → scorch pixel repaint (usually stays same → no-op)
+        const nb = nv <= 0 ? 0 : Math.min(L, Math.round(nv * L));
+        if (nb !== this._devBuckets[idx]) {
+          this._devBuckets[idx] = nb;
+          this._devDirty.add(idx);
+        }
+      }
       idx++;
       if (idx >= d.length) idx = 0;
     }
@@ -1001,30 +1159,36 @@ export class ConquestGrid {
     let dirtyRect = null; // null = full-canvas copy; otherwise {x,y,w,h}
 
     if (this._dirty) {
-      // full repaint — territory fills for every cell (ownership shown later via frontier pass)
-      for (let i = 0; i < this.owner.length; i++) {
-        paintCell(i);
-      }
-      // Border-cell detection pass (no texture darkening — crisp vector lines drawn
-      // separately in main.js via getFrontierEdges). We only record which cells are on
-      // the frontier so the overlay stays pure green/red fills with hard vector edges.
+      // Full repaint — TASK-406: paint + border detection FUSED into one pass
+      // (the old code ran a second 26M-cell scan for border membership).
+      const owner = this.owner;
       this._borderCells.clear();
       for (let row = 0; row < H; row++) {
         const rowStart = row * W;
         for (let col = 0; col < W; col++) {
           const i = rowStart + col;
-          const o = this.owner[i];
-          if (!isOwnedCode(o, cfg)) continue;
-          let border = false;
-          if (this.owner[col === W - 1 ? i - W + 1 : i + 1] !== o) border = true;
-          else if (this.owner[col === 0 ? i + W - 1 : i - 1] !== o) border = true;
-          else if (row > 0 && this.owner[i - W] !== o) border = true;
-          else if (row < H - 1 && this.owner[i + W] !== o) border = true;
-          if (border) this._borderCells.add(i);
+          const o = owner[i];
+          const p = i * 4;
+          if (isOwnedCode(o, cfg)) {
+            const c = ownerColor(o, cfg);
+            data[p] = c[0]; data[p + 1] = c[1]; data[p + 2] = c[2]; data[p + 3] = 150;
+            // fused border detection (east/west wrap, north/south clamp)
+            const e = col === W - 1 ? i - W + 1 : i + 1;
+            const w = col === 0 ? i + W - 1 : i - 1;
+            if (owner[e] !== o || owner[w] !== o ||
+                (row > 0 && owner[i - W] !== o) ||
+                (row < H - 1 && owner[i + W] !== o)) {
+              this._borderCells.add(i);
+            }
+          } else {
+            data[p + 3] = 0;   // transparent — biome base shows through
+          }
         }
       }
       this._dirty = false;
       this._dirtyCells.clear();
+      this._ovRect = null;                 // full repaint pending for the overlay
+      this._lastFlush = { full: true, rect: null };
       // dirtyRect stays null → full putImageData (startup / land-mask rebuild only)
     } else if (this._dirtyCells.size > 0) {
       // ── Incremental: repaint dirty cells, then fix borders for affected cells ──
@@ -1068,6 +1232,19 @@ export class ConquestGrid {
       }
       dirtyRect = { x: minC, y: minR, w: maxC - minC + 1, h: maxR - minR + 1 };
       this._dirtyCells.clear();
+      // TASK-406: union into the shared overlay dirty-region queue (a null
+      // sentinel from an earlier full repaint wins — full blit covers it).
+      if (this._ovRect === undefined) this._ovRect = dirtyRect;
+      else if (this._ovRect !== null) {
+        const r = this._ovRect;
+        const x2 = Math.max(r.x + r.w, dirtyRect.x + dirtyRect.w);
+        const y2 = Math.max(r.y + r.h, dirtyRect.y + dirtyRect.h);
+        r.x = Math.min(r.x, dirtyRect.x);
+        r.y = Math.min(r.y, dirtyRect.y);
+        r.w = x2 - r.x;
+        r.h = y2 - r.y;
+      }
+      this._lastFlush = { full: false, rect: dirtyRect };
     } else {
       return false; // nothing changed
     }
@@ -1100,6 +1277,12 @@ export function attackLogic(grid, attackTroops, attackerStr, defenderStr, cell, 
   mag *= 1 - dev * (1 - cfg.DEVASTATION_DEF_MULT);
   const devSpeed = 1 + dev * (cfg.DEVASTATION_SPEED_MULT - 1);
 
+  // TASK-406 MORALE: recent-loss ratio modulates troop effectiveness ±15%.
+  // Low-morale attackers bleed more per tile and conquer slower; low-morale
+  // defenders lose more per tile. (2 − m) inverts the scale so m∈[0.85,1.15]
+  // maps exactly to ×[1.15,0.85] on losses; m multiplies conquest speed.
+  const mA = ctx.getMorale ? ctx.getMorale(attackerStr) : 1;
+
   // Any OWNED territory (player, legacy enemy, or a registered bot nation)
   const isBot = (s) => typeof s === 'string' && s.startsWith('bot');
   const defenderIsPlayer = (defenderStr === 'player' || defenderStr === 'enemy' || isBot(defenderStr));
@@ -1112,6 +1295,7 @@ export function attackLogic(grid, attackTroops, attackerStr, defenderStr, cell, 
   if (defenderIsPlayer) {
     const defTroops = ctx.getTroops(defenderStr);
     const defCells = Math.max(1, grid.countCells(defenderStr));
+    const mD = ctx.getMorale ? ctx.getMorale(defenderStr) : 1;
 
     // large-empire defense debuff
     const defenseSig = 1 - sigmoid(defCells, cfg.DEFENSE_DEBUFF_DECAY_RATE, cfg.DEFENSE_DEBUFF_MIDPOINT);
@@ -1128,12 +1312,12 @@ export function attackLogic(grid, attackTroops, attackerStr, defenderStr, cell, 
       largeAttackerSpeedBonus = Math.pow(cfg.LARGE_EMPIRE_THRESHOLD / attackerCells, 0.6);
     }
 
-    const defenderTroopLoss = defTroops / defCells;
+    const defenderTroopLoss = (defTroops / defCells) * (2 - mD);
     const currentAttackerLoss =
       within(defTroops / Math.max(1, attackTroops), 0.6, 2) *
       mag * 0.8 * largeDefenderAttackDebuff * largeAttackBonus;
     const altAttackerLoss = 1.3 * defenderTroopLoss * (mag / 100);
-    const attackerTroopLoss = 0.6 * currentAttackerLoss + 0.4 * altAttackerLoss;
+    const attackerTroopLoss = (0.6 * currentAttackerLoss + 0.4 * altAttackerLoss) * (2 - mA);
 
     // TASK-102 TROOP-SCALE: absolute commitment now matters — losses scale
     // DOWN with a large force (economy of force): a 10× bigger force takes
@@ -1145,7 +1329,7 @@ export function attackLogic(grid, attackTroops, attackerStr, defenderStr, cell, 
       defenderTroopLoss,
       tilesPerTickUsed:
         within(defTroops / (5 * Math.max(1, attackTroops)), 0.2, 1.5) *
-        speed * devSpeed * largeDefenderSpeedDebuff * largeAttackerSpeedBonus,
+        speed * devSpeed * largeDefenderSpeedDebuff * largeAttackerSpeedBonus * mA,
     };
   } else {
     // vs neutral wilderness — OpenFront: bots expand at HALF the human cost
@@ -1156,9 +1340,9 @@ export function attackLogic(grid, attackTroops, attackerStr, defenderStr, cell, 
     // cost UP with troops — one tile ate the whole budget: 1 cell/tick.)
     const forceEff = Math.max(0.45, 1 / (1 + Math.log10(Math.max(1, attackTroops / 500)) * 0.5));
     return {
-      attackerTroopLoss: ((attackerStr === 'enemy' || isBot(attackerStr)) ? mag / 10 : mag / 5) * forceEff,
+      attackerTroopLoss: ((attackerStr === 'enemy' || isBot(attackerStr)) ? mag / 10 : mag / 5) * forceEff * (2 - mA),
       defenderTroopLoss: 0,
-      tilesPerTickUsed: within((2000 * Math.max(10, speed)) / Math.max(1, attackTroops), 5, 100) * devSpeed,
+      tilesPerTickUsed: within((2000 * Math.max(10, speed)) / Math.max(1, attackTroops), 5, 100) * devSpeed * mA,
     };
   }
 }
@@ -1437,6 +1621,11 @@ _enqueueTargetCell(attackerCell, targetCell) {
       if (this.target !== 'neutral') {
         this.ctx.addTroops(this.target, -res.defenderTroopLoss);
       }
+      // TASK-406 morale: feed the recent-loss trackers (both sides of the fight)
+      if (this.ctx.onLosses) {
+        this.ctx.onLosses(this.owner, res.attackerTroopLoss);
+        if (this.target !== 'neutral') this.ctx.onLosses(this.target, res.defenderTroopLoss);
+      }
 
       // conquer the cell
       grid.conquerCell(cell, this.owner);
@@ -1475,7 +1664,9 @@ _enqueueTargetCell(attackerCell, targetCell) {
     // OpenFront conquerPlayer: the conquered side loses their ENTIRE remaining
     // troop pool (previously the loser kept breeding troops with zero territory).
     if (this.ctx && this.ctx.getTroops && this.ctx.addTroops) {
-      this.ctx.addTroops(this.target, -this.ctx.getTroops(this.target));
+      const wiped = this.ctx.getTroops(this.target);
+      this.ctx.addTroops(this.target, -wiped);
+      if (this.ctx.onLosses && wiped > 0) this.ctx.onLosses(this.target, wiped);   // TASK-406 morale
     }
     if (this.ctx.onEliminated) this.ctx.onEliminated(this.owner, this.target);
     if (this.ctx.log) {
