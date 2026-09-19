@@ -17364,6 +17364,173 @@ window.navalDeepTest = async function () {
     return R;
 };
 
+// ═══════════════════════════════════════════════════════════════════════
+//  NAVAL QA TEST (TASK-502 mastery probe) — window.navalQATest()
+//  Summarizes the Phase-5 naval checks in one deterministic run (pumps
+//  gameFrame directly — hidden-page safe):
+//    1. KEYS   — P cycles stance (toast), Z arms mine mode, V REFUSES to
+//                cycle on key-repeat (audit #12), J/K/L untouched
+//    2. SINK   — _sink() hands the mesh to the sinking animator and the
+//                entry expires within SINK_ANIM_FRAMES + margin
+//    3. MINES  — hotbar mine slot reaches N/N with the .capped flag at cap
+//    4. SONAR  — a fresh sonar contact fires the TASK-502 ping rings
+//    5. PERF   — 26 mixed hulls (13v13, all 7 classes) pumped 900 frames:
+//                avg/p95 gameFrame ms + fpsAvg/draw calls when the tab is
+//                visible (before/after numbers go to the board Log)
+//  Verdict lands in window.__navalQAResult. Run from the console in mode 1.
+// ═══════════════════════════════════════════════════════════════════════
+window.navalQATest = async function () {
+    const log = (m) => console.log('%c[NAVAL-QA] ' + m, 'color:#5ad2ff;font-weight:bold');
+    if (!scene || gOver) { log('Start a game first (mode 1).'); return; }
+    logEvent('🧪 اختبار جودة البحرية بدأ — راقب الكونسول', 'info');
+    const C = GAME_CONSTANTS;
+    const R = { checks: {}, notes: [], perf: null, pass: false };
+    window.__navalQAResult = R;
+    const pump = async (n) => {
+        for (let i = 0; i < n; i++) {
+            gameFrame();
+            if (i % 300 === 299) await new Promise(r => setTimeout(r, 0));
+        }
+    };
+    const fakePort = (ll) => ({ lat: ll.lat, lon: ll.lon });
+    const lastLog = () => { const s = document.getElementById('slog'); return s && s.firstChild ? s.firstChild.textContent : ''; };
+    const key = (code, opts = {}) => window.dispatchEvent(new KeyboardEvent('keydown',
+        Object.assign({ code, key: code.replace('Key', '').toLowerCase(), bubbles: true }, opts)));
+
+    // ── 1. KEY HANDLERS (behavioral — the J→L→Z / K→P rebind history) ──
+    try {
+        const keep = fleetStanceIdx;
+        key('KeyP');
+        R.checks.keyP = lastLog().includes('تشكيل الأسطول') && fleetStanceIdx === (keep + 1) % C.FLEET_STANCES.length;
+        fleetStanceIdx = keep;                       // restore (probe shouldn't drift user state)
+        key('KeyZ');
+        R.checks.keyZ = mineMode === true && lastLog().includes('الألغام');
+        // V on key-REPEAT must NOT cycle hulls (audit #12): arm the slot
+        // first (real V), then fire two repeat=true events and compare.
+        key('KeyV');                                 // arm (or cycle if already armed)
+        const before = warshipBuildClass;
+        key('KeyV', { repeat: true });
+        key('KeyV', { repeat: true });
+        R.checks.keyVRepeat = warshipBuildClass === before;
+        key('Escape');                               // leave modes tidy
+        R.checks.keysClean = !mineMode && buildMode !== 'warship';
+        log(`keys: P=${R.checks.keyP} Z=${R.checks.keyZ} V-repeat-guard=${R.checks.keyVRepeat} clean=${R.checks.keysClean}`);
+    } catch (e) { R.checks.keyP = R.checks.keyZ = R.checks.keyVRepeat = false; R.notes.push('keys: ' + e.message); }
+
+    // ── 2. SINKING ANIMATION ──
+    try {
+        const t = { lat: -30, lon: -20 };
+        const victim = new Warship('player', fakePort(t), t, 'destroyer');
+        warships.push(victim);
+        const n0 = navalSinking.length;
+        victim._sink();
+        R.checks.sinkStart = navalSinking.length === n0 + 1;
+        const sk = navalSinking[navalSinking.length - 1];
+        const meshId = sk.mesh.id;
+        await pump(C.SINK_ANIM_FRAMES + 60);         // animation + margin
+        R.checks.sinkDone = navalSinking.every(k => k.mesh.id !== meshId) &&
+                            !scene.children.includes(sk.mesh);
+        log(`sink: start=${R.checks.sinkStart} expired=${R.checks.sinkDone}`);
+    } catch (e) { R.checks.sinkStart = R.checks.sinkDone = false; R.notes.push('sink: ' + e.message); }
+
+    // ── 3. MINE CAP UI ──
+    try {
+        for (const f of mineFields) f._expire(NAVAL_CTX, true);   // clean slate
+        const spots = [{ lat: -40, lon: -40 }, { lat: -40, lon: -30 }, { lat: -40, lon: -20 },
+                       { lat: -35, lon: -40 }, { lat: -35, lon: -30 }, { lat: -35, lon: -20 }];
+        spots.forEach(ll => layMineField(NAVAL_CTX, 'player', ll));
+        if (window.__refreshHotbar) window.__refreshHotbar();
+        const bar = document.getElementById('hotbar');
+        const slot = bar ? Array.from(bar.children).find(el => el.dataset.type === 'mine') : null;
+        const cnt = slot ? slot.querySelector('.hcnt') : null;
+        const txt = cnt ? cnt.textContent : '';
+        R.checks.mineCapUI = txt === `${C.MINE_CAP}/${C.MINE_CAP}` && cnt.classList.contains('capped');
+        // refusal arithmetic the click path uses (verified live in QA phase by hand)
+        const active = mineFields.filter(f => !f.dead && f.owner === 'player').length;
+        R.checks.mineCapRefuse = active >= C.MINE_CAP;
+        for (const f of mineFields) f._expire(NAVAL_CTX, true);   // cleanup
+        log(`mineCapUI=${R.checks.mineCapUI} (slot '${txt}', capped-class=${cnt ? cnt.classList.contains('capped') : 'n/a'}) refuse=${R.checks.mineCapRefuse}`);
+    } catch (e) { R.checks.mineCapUI = R.checks.mineCapRefuse = false; R.notes.push('mineCap: ' + e.message); }
+
+    // ── 4. SONAR RINGS (TASK-502 FINISH) ──
+    try {
+        clearSelection();
+        for (const w of warships) if (!w.dead) w._sink();
+        for (const tp of torpedoes) tp._fizzle(NAVAL_CTX, true);
+        warships.length = 0; torpedoes.length = 0;
+        const A = { lat: 8, lon: -140 };
+        const esc = new Warship('player', fakePort(A), A, 'escort');
+        const eSub = new Warship('enemy', fakePort({ lat: 8.1, lon: -139.9 }), { lat: 8.1, lon: -139.9 }, 'submarine');
+        warships.push(esc, eSub);
+        await pump(30);                               // settle spawn course picks
+        eSub._detectedT = 0; eSub._revealT = 0; eSub.detected = false;
+        eSub.curLat = 8.05; eSub.curLon = -139.95;    // inside the 260km ASW dome
+        let rings = 0;
+        const orig = NAVAL_CTX.sonarPingFX;
+        NAVAL_CTX.sonarPingFX = (...a) => { rings++; return orig(...a); };
+        await pump(60);
+        NAVAL_CTX.sonarPingFX = orig;
+        R.checks.sonarRing = rings > 0 && eSub.detected === true;
+        log(`sonarRing=${R.checks.sonarRing} (fx fired ×${rings}, sub.detected=${eSub.detected})`);
+        for (const w of [esc, eSub]) if (!w.dead) w._sink();
+        await pump(10);
+    } catch (e) { R.checks.sonarRing = false; R.notes.push('sonar: ' + e.message); }
+
+    // ── 5. PERF @ SCALE — 26 mixed hulls, all 7 classes ──
+    try {
+        clearSelection();
+        for (const w of warships) if (!w.dead) w._sink();
+        warships.length = 0;
+        const classes = ['destroyer', 'escort', 'submarine', 'missile', 'drone', 'carrier', 'transport'];
+        const fleet = [];
+        for (let i = 0; i < 26; i++) {
+            const cls = classes[i % 7];
+            const own = i < 13 ? 'player' : 'enemy';
+            const ll = { lat: (i % 13) * 0.7 - 4, lon: -150 + (i % 13) * 0.5 };
+            const w = new Warship(own, fakePort(ll), ll, cls);
+            warships.push(w); fleet.push(w);
+        }
+        await pump(240);                              // wings/bays warm up, settle targeting
+        const S = window.__perfState;
+        S.frameTimes.length = 0; S.tGame = 0; S.frames = 0;
+        const t0 = performance.now();
+        await pump(900);
+        const wall = performance.now() - t0;
+        const p = window.__perf();
+        R.perf = {
+            hulls: fleet.length, planes: planes.filter(p => !p.dead).length,
+            drones: drones.filter(d => !d.dead).length,
+            avgGameFrameMs: p.avgGameFrameMs, p95Ms: p.p95Ms, maxMs: p.maxMs,
+            wallMsPer300: +(wall / 3).toFixed(1),
+            fpsAvg: S.fpsAvg ? +S.fpsAvg.toFixed(0) : null,          // RAF-based (visible tab only)
+            drawCalls: renderer && renderer.info ? renderer.info.render.calls : null,
+        };
+        log(`perf@26 hulls (+${R.perf.planes} planes +${R.perf.drones} drones): avg ${R.perf.avgGameFrameMs}ms p95 ${R.perf.p95Ms}ms max ${R.perf.maxMs}ms`);
+        R.checks.perfScale = p.avgGameFrameMs < 8;    // logic budget per frame at fleet scale
+        // cleanup
+        for (const w of fleet) if (!w.dead) w._sink();
+        await pump(30);
+        for (const p2 of planes) if (!p2.dead) { p2.dead = true; if (p2.mesh) { scene.remove(p2.mesh); disposeMeshDeep(p2.mesh); } }
+        for (const d of drones) if (!d.dead) d._crash();
+        warships.length = 0;
+    } catch (e) { R.checks.perfScale = false; R.notes.push('perf: ' + e.message); }
+
+    const checks = [
+        ['P stance / Z mines / V repeat-guard', R.checks.keyP && R.checks.keyZ && R.checks.keyVRepeat && R.checks.keysClean],
+        ['Sinking animation (start+expire)', R.checks.sinkStart && R.checks.sinkDone],
+        ['Mine cap UI (N/N + capped flag)', R.checks.mineCapUI && R.checks.mineCapRefuse],
+        ['Sonar contact rings fire', R.checks.sonarRing],
+        ['Perf @ 26 hulls (avg<8ms)', R.checks.perfScale],
+    ];
+    let ok = 0;
+    for (const [name, pass] of checks) { if (pass) ok++; log(`${pass ? '✅' : '❌'} ${name}`); }
+    R.pass = ok === checks.length;
+    if (R.notes.length) log('notes: ' + R.notes.join(' | '));
+    log(`RESULT: ${R.pass ? 'PASS' : 'FAIL'} (${ok}/${checks.length} checks) — window.__navalQAResult`);
+    logEvent(R.pass ? '🧪 اختبار جودة البحرية: نجح ✅' : '🧪 اختبار جودة البحرية: فشل ❌ — انظر الكونسول', R.pass ? 'info' : 'err');
+    return R;
+};
+
 
 // ═══════════════════════════════════════════════════════════════════════
 //  TASK-302: TANK SYSTEM PROBES
