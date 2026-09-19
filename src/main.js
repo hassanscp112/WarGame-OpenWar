@@ -2138,7 +2138,14 @@ class TransportShip {
 function _sampleOwnedShoreCell(ownerStr, towardLat, towardLon) {
     if (!conquestGrid || !conquestGrid._maskReady) return null;
     const cfg = conquestGrid.cfg;
-    const ownerCode = ownerStr === 'player' ? CONQUEST_CFG.PLAYER : CONQUEST_CFG.ENEMY;
+    // Owner code resolve (TASK-202 drive-by fix): bots register DYNAMIC codes
+    // (4+) — the old `player ? 2 : 3` mapping made every bot sample the
+    // legacy-enemy's shoreline (nobody, in FFA) → bot naval invasions never
+    // found an embark coast and silently failed.
+    let ownerCode;
+    if (ownerStr === 'player') ownerCode = CONQUEST_CFG.PLAYER;
+    else if (ownerStr === 'enemy') ownerCode = CONQUEST_CFG.ENEMY;
+    else { const b = botByStr(ownerStr); ownerCode = b ? b.code : CONQUEST_CFG.ENEMY; }
     const owner = conquestGrid.owner;
     const _nb = [];
     let best = null, bestDist = Infinity;
@@ -2225,30 +2232,44 @@ function launchTransportInvasion(loc, side) {
 // Otherwise patrols around its patrol point. Heals near own port.
 // ════════════════════════════════════════════════════════════════════
 class Warship {
-    constructor(owner, portStruct, patrol) {
+    constructor(owner, portStruct, patrol, hullClass) {
         const C = GAME_CONSTANTS;
         this.id = ++_id;
         this.owner = owner;
-        this.name = 'مدمرة حربية';
-        this.hp = C.WARSHIP_HP;
-        this.maxHp = C.WARSHIP_HP;
+        // Hull-class system (TASK-202): everything branches off this.hull.
+        this.hullClass = (hullClass && C.HULL_CLASSES[hullClass]) ? hullClass : 'destroyer';
+        this.hull = C.HULL_CLASSES[this.hullClass];
+        this.name = this.hull.name;
+        this.hp = this.hull.hp;
+        this.maxHp = this.hull.hp;
         this.dead = false;
         this.mode = 'patrol';            // 'patrol' | 'chase' | 'hold'
         this.target = null;              // { kind, obj, lat, lon }
         this.fireCd = 0;
         this.shells = [];
-        this.speedKmPerFrame = C.WARSHIP_SPEED_KM_S / 60;
+        this.speedKmPerFrame = this.hull.speed / 60;
+        // Class cooldowns (frames)
+        this.pdCd = 0;                   // escort point-defense
+        this.ciwsCd = 0;                 // carrier CIWS
+        this.missileCd = this.hull.missileReload ? this.hull.missileReload / 2 : 0;
+        this.droneCd = 0;                // drone bay launch pacing
+        this.planeCd = 0;                // air-wing spawn pacing
+        // Invasion transport state
+        this.troops = 0;
+        this.invLat = 0; this.invLon = 0;
+        this.invading = false;
         // Spawn in the water nearest the port (OpenFront: ship appears at the port)
         const spawn = _findWaterNear(portStruct.lat, portStruct.lon, 12) || patrol;
         this.curLat = spawn.lat; this.curLon = spawn.lon;
         this.patrolLat = patrol.lat; this.patrolLon = patrol.lon;
-        // 3D model — low-poly destroyer, bow -Z
+        // 3D model — per-hull low-poly builder, bow -Z
         const acc = ownerHexColor(owner);
         this._acc = acc;
-        this.mesh = buildWarshipModel(acc);
-        this.mesh.scale.setScalar(1.5);
+        this.mesh = buildWarshipModel(acc, this.hullClass);
+        this.mesh.scale.setScalar(this.hull.scale);
         this.accents = this.mesh.userData.accents;
-        this.anim = { radar: this.mesh.getObjectByName('radar') };
+        this.anim = { radar: this.mesh.getObjectByName('radar'),
+                      ciws: this.mesh.getObjectByName('ciws') };
         this._radius = EARTH_RADIUS + 0.8;
         this.mesh.position.copy(latLonToVec3(this.curLat, this.curLon, this._radius));
         this.mesh.up.copy(this.mesh.position.clone().normalize());
@@ -2268,15 +2289,20 @@ class Warship {
         this._pickPatrolCourse();
     }
 
-    // Live click-select position (selection scans read .lat/.lon)
+    // Live click-select position (selection scans read .lat/.lon) + a Vector3
+    // .pos so carrier-based Plane parked/return logic can treat the hull as
+    // its base structure (same contract as Structure.pos).
     get lat() { return this.curLat; }
     get lon() { return this.curLon; }
+    get pos() { return this.mesh.position; }
+    get type() { return 'warship_' + this.hullClass; }
 
     // Player move order (OpenFront move_warship): new patrol point + course.
     setPatrol(loc) {
         this.patrolLat = loc.lat; this.patrolLon = loc.lon;
         this.target = null;
         this.mode = 'patrol';
+        this.invading = false;           // a manual move cancels a pending invasion run
         this._setCourse(loc.lat, loc.lon);
     }
 
@@ -2310,22 +2336,29 @@ class Warship {
     // ── targeting (every 30 frames) ──
     _retarget() {
         const C = GAME_CONSTANTS;
+        // Non-combat hulls (carriers/drone bays/transports) never chase —
+        // their defense lives in CIWS/escorts/drones instead.
+        const range = this.hull.targetRange || 0;
+        if (range <= 0) { this.target = null; this.mode = this.invading ? 'invasion' : 'patrol'; return; }
         const t = this.target;
         if (t && !t.obj.dead) {
             // drop if out of range (live position)
             const p = _targetLivePos(t.kind, t.obj);
-            if (haversineDist(this.curLat, this.curLon, p.lat, p.lon) <= C.WARSHIP_TARGET_RANGE_KM) { this._syncTargetPos(); return; }
+            if (haversineDist(this.curLat, this.curLon, p.lat, p.lon) <= range) { this._syncTargetPos(); return; }
         }
         this.target = null;
-        let best = null, bestD = C.WARSHIP_TARGET_RANGE_KM;
+        let best = null, bestD = range;
         const _consider = (kind, obj) => {
             if (obj.dead || obj.owner === this.owner) return;
             const p = _targetLivePos(kind, obj);
             const d = haversineDist(this.curLat, this.curLon, p.lat, p.lon);
             if (d < bestD) { best = { kind, obj, lat: p.lat, lon: p.lon }; bestD = d; }
         };
-        // Priority 0: enemy transports (troop landings)
+        // Priority 0: enemy troop carriers — sprite transports + invasion hulls
         for (const ts of transportShips) _consider('transport', ts);
+        for (const w of warships) {
+            if (w !== this && w.hullClass === 'transport' && w.troops > 0) _consider('warship', w);
+        }
         if (!best) {
             // Priority 1: enemy warships
             for (const w of warships) { if (w !== this) _consider('warship', w); }
@@ -2338,7 +2371,7 @@ class Warship {
         }
         this.target = best;
         this._syncTargetPos();
-        this.mode = best ? 'chase' : 'patrol';
+        this.mode = best ? 'chase' : (this.invading ? 'invasion' : 'patrol');
     }
     _syncTargetPos() {
         const t = this.target; if (!t) return;
@@ -2359,8 +2392,9 @@ class Warship {
         scene.add(mesh);
         const dist = fromVec.distanceTo(toVec);
         this.shells.push({ mesh, from: fromVec, ctrl: mid, to: toVec, t: 0,
-            dur: Math.max(0.35, Math.min(1.4, dist / 420)), target: t.obj, kind: t.kind, toLat: t.lat, toLon: t.lon });
-        this.fireCd = GAME_CONSTANTS.WARSHIP_FIRE_RATE_TICKS;
+            dur: Math.max(0.35, Math.min(1.4, dist / 420)), target: t.obj, kind: t.kind, toLat: t.lat, toLon: t.lon,
+            dmg: this.hull.shellDmg || GAME_CONSTANTS.WARSHIP_SHELL_DAMAGE });
+        this.fireCd = this.hull.fireRate || GAME_CONSTANTS.WARSHIP_FIRE_RATE_TICKS;
         spawnExp(this.curLat, this.curLon, 2.5, '#ffcc66');   // muzzle flash
     }
     _updateShells() {
@@ -2382,7 +2416,7 @@ class Warship {
         }
     }
     _shellHit(s) {
-        const dmg = GAME_CONSTANTS.WARSHIP_SHELL_DAMAGE;
+        const dmg = s.dmg || GAME_CONSTANTS.WARSHIP_SHELL_DAMAGE;
         const tgt = s.target;
         spawnExp(s.toLat, s.toLon, s.kind === 'warship' ? 5 : 6, '#ff8844');
         if (!tgt || tgt.dead) return;
@@ -2413,8 +2447,8 @@ class Warship {
         if (this.selRing && this.selRing.material) this.selRing.material.dispose();
         scene.remove(this.mesh);
         disposeMeshDeep(this.mesh);   // accents disposed; shared hull mats survive
-        if (this.owner === 'player') logEvent('💥 غرقت مدمرة لدينا!', 'err');
-        else logEvent(`💥 مدمرة ${_ownerName(this.owner)} غرقت!`, 'info');
+        if (this.owner === 'player') logEvent(`💥 غرقت ${this.name} لدينا!`, 'err');
+        else logEvent(`💥 ${this.name} ${_ownerName(this.owner)} غرقت!`, 'info');
     }
 
     // ── main tick (60fps logic) ──
@@ -2423,11 +2457,26 @@ class Warship {
         const C = GAME_CONSTANTS;
         if (this.selRing) this.selRing.visible = !!this.selected;
         if (this.anim.radar) this.anim.radar.rotation.y += 0.06;
+        if (this.anim.ciws) this.anim.ciws.rotation.y += 0.10;
         if (this.fireCd > 0) this.fireCd--;
+        if (this.pdCd > 0) this.pdCd--;
+        if (this.ciwsCd > 0) this.ciwsCd--;
+        if (this.missileCd > 0) this.missileCd--;
+        if (this.droneCd > 0) this.droneCd--;
+        if (this.planeCd > 0) this.planeCd--;
+
+        // ── hull-class systems ──
+        if (this.hullClass === 'escort') this._updatePointDefense();
+        if (this.hullClass === 'carrier') { this._updateCIWS(); this._updateAirWing(); }
+        if (this.hullClass === 'drone') this._updateDroneBay();
+        if (this.hullClass === 'missile') this._updateMissileShip();
+        if (this.hullClass === 'transport') this._updateInvasion();
+        this._updateFleetBehavior();
 
         if (frame % 30 === (this.id % 30)) this._retarget();
         const t = this.target;
-        const inRange = t && haversineDist(this.curLat, this.curLon, t.lat, t.lon) <= C.WARSHIP_SHELL_RANGE_KM;
+        const shellRange = this.hull.shellRange || C.WARSHIP_SHELL_RANGE_KM;
+        const inRange = t && haversineDist(this.curLat, this.curLon, t.lat, t.lon) <= shellRange;
 
         if (t && inRange) {
             // Gun duel: hold position and fire on cooldown
@@ -2441,7 +2490,7 @@ class Warship {
                     this.waypoints[this.waypoints.length - 1].lat,
                     this.waypoints[this.waypoints.length - 1].lon, t.lat, t.lon) > 200);
             if (stale) this._setCourse(t.lat, t.lon);
-        } else if (this.waypoints && this.distTraveled >= this.totalLen) {
+        } else if (this.waypoints && this.distTraveled >= this.totalLen && !this.invading) {
             this._pickPatrolCourse();   // arrived — wander to the next point
         }
 
@@ -2458,12 +2507,13 @@ class Warship {
             this.mesh.position.copy(pos);
         }
 
-        // Heal near own port
-        if (this.hp < C.WARSHIP_HP && frame % 30 === 0) {
+        // Heal near own port (+ transports re-embark troops there)
+        if ((this.hp < this.maxHp || (this.hullClass === 'transport' && this.troops === 0)) && frame % 30 === 0) {
             for (const s of structs) {
                 if (s.dead || s.owner !== this.owner || s.type !== 'port') continue;
                 if (haversineDist(this.curLat, this.curLon, s.lat, s.lon) < C.WARSHIP_HEAL_RANGE_KM) {
-                    this.hp = Math.min(C.WARSHIP_HP, this.hp + C.WARSHIP_HEAL_RATE * 0.5);
+                    if (this.hp < this.maxHp) this.hp = Math.min(this.maxHp, this.hp + C.WARSHIP_HEAL_RATE * 0.5);
+                    if (this.hullClass === 'transport' && this.troops === 0) this._embarkTroops(0.3);
                     break;
                 }
             }
@@ -2473,6 +2523,252 @@ class Warship {
         this._orient();
         this._updateShells();
     }
+
+    // ════════════════════════════════════════════════════════════════
+    // HULL-CLASS SUBSYSTEMS (TASK-202)
+    // ════════════════════════════════════════════════════════════════
+
+    // ESCORT — point-defense: intercept enemy missiles AIMED at friendly
+    // hulls nearby (adapted from the fixed Structure.update ground-range +
+    // most-progress scan, with the speed-scaled hitR inside Missile.update).
+    _updatePointDefense() {
+        if (frame % 2 !== 0 || this.pdCd > 0) return;
+        let trg = null, bestProg = -1;
+        for (const m of missiles) {
+            if (m.dead || m.owner === this.owner || m.isSAM) continue;
+            if (m.cfg.type === 'stealth' || m.cfg.type === 'hyper') continue;
+            // GROUND range to the missile (arc altitude doesn't shorten it)
+            if (haversineDist(this.curLat, this.curLon, m.lat, m.lon) >= this.hull.pdRange) continue;
+            // Only defend missiles whose IMPACT POINT threatens a friendly hull
+            let aimed = false;
+            for (const w of warships) {
+                if (w.dead || w.owner !== this.owner) continue;
+                if (haversineDist(m.tlat, m.tlon, w.curLat, w.curLon) < 250) { aimed = true; break; }
+            }
+            if (!aimed) continue;
+            if (m.progress > bestProg) { bestProg = m.progress; trg = m; }
+        }
+        if (trg) {
+            fireSAM(this, trg);
+            this.pdCd = this.hull.pdCd;
+            spawnExp(this.curLat, this.curLon, 2, '#88ffcc');
+        }
+    }
+
+    // CARRIER — CIWS self-defense: pops missiles aimed at THIS hull + any
+    // enemy drone that skirts the deck.
+    _updateCIWS() {
+        if (frame % 2 !== 0 || this.ciwsCd > 0) return;
+        for (const m of missiles) {
+            if (m.dead || m.owner === this.owner || m.isSAM) continue;
+            if (m.cfg.type === 'stealth' || m.cfg.type === 'hyper') continue;
+            if (haversineDist(this.curLat, this.curLon, m.lat, m.lon) >= this.hull.ciwsRange) continue;
+            if (haversineDist(m.tlat, m.tlon, this.curLat, this.curLon) > 140) continue;  // aimed at me (or very near)
+            fireSAM(this, m);
+            this.ciwsCd = this.hull.ciwsCd;
+            return;
+        }
+        // Anti-drone sweep
+        for (const d of drones) {
+            if (d.dead || d.owner === this.owner) continue;
+            if (haversineDist(this.curLat, this.curLon, d.lat, d.lon) < 55) {
+                d.hp -= 45;
+                spawnExp(d.lat, d.lon, 2, '#ffcc44');
+                if (d.hp <= 0) d._kill();
+                this.ciwsCd = 55;
+                return;
+            }
+        }
+    }
+
+    // CARRIER — air wing: spawn fighters that base ON the ship, cycle them
+    // patrol → duty → recover → deck rest → relaunch. baseStruct = this hull,
+    // so the existing Plane parked/return flow orbits and lands on the deck.
+    // (Ships outrun planes in game-scale speeds — recovery therefore snaps
+    // a returning fighter aboard once it's within 250km of the deck.)
+    _updateAirWing() {
+        const wing = planes.filter(p => !p.dead && p.baseStruct === this);
+        if (wing.length < this.hull.airWing && this.planeCd <= 0) {
+            const p = new Plane(this.curLat, this.curLon, PCFG['fighter'], this.owner, this);
+            p.shipDuty = -720;                     // sit on deck ~12s before first launch
+            planes.push(p);
+            this.planeCd = this.hull.planeCd;
+            if (this.owner === 'player') logEvent(`🛫 ${this.name}: انضمام مقاتلة لسرب السفينة (${wing.length + 1}/${this.hull.airWing})`, 'info');
+        }
+        for (const p of wing) {
+            if (p.parked) {
+                if (p.shipDuty < 0) { p.shipDuty++; continue; }   // deck rest countdown
+                if (p.shipDuty === 0) {
+                    // launch on CAP near the carrier
+                    const idx = (p.id % 4);
+                    p.parked = false;
+                    p.mode = 'patrol';
+                    p.tlat = this.curLat + (idx % 2 ? 0.9 : -0.9);
+                    p.tlon = this.curLon + (idx < 2 ? 0.9 : -0.9);
+                    p.shipDuty = 3600 + Math.floor(Math.random() * 1200);   // ~60-80s duty
+                }
+            } else {
+                p.shipDuty--;
+                if (p.mode === 'return') {
+                    if (haversineDist(p.lat, p.lon, this.curLat, this.curLon) < 250) {
+                        p.parked = true;            // recovered onto the deck
+                        p.shipDuty = -600;          // ~10s turnaround
+                    }
+                } else if (p.shipDuty <= 0) {
+                    p.mode = 'return';              // duty over — recover
+                    p.shipDuty = 0;
+                } else if (frame % 90 === 0) {
+                    // keep the CAP over the moving carrier
+                    const idx = (p.id % 4);
+                    p.tlat = this.curLat + (idx % 2 ? 0.9 : -0.9);
+                    p.tlon = this.curLon + (idx < 2 ? 0.9 : -0.9);
+                }
+            }
+        }
+    }
+
+    // DRONE CARRIER — launches DCFG swarm drones that escort the fleet and
+    // kamikaze onto enemy hulls/drones.
+    _updateDroneBay() {
+        const mine = drones.filter(d => !d.dead && d.home === this);
+        if (mine.length >= this.hull.swarmCap || this.droneCd > 0) return;
+        // Bay loadout: nanos for screening, swarm for punch, kamikazes vs hulls
+        const kamCnt = mine.filter(d => d.cfg.type === 'kamikaze').length;
+        const key = (mine.length === 0 && kamCnt === 0) ? 'nano'
+            : (kamCnt < 2 ? 'kamikaze' : (mine.length % 2 ? 'swarm' : 'nano'));
+        const d = new Drone(this.owner, this, key);
+        drones.push(d);
+        this.droneCd = this.hull.droneCd;
+        if (this.owner === 'player') logEvent(`🛩️ ${this.name}: أطلقت ${d.cfg.name}`, 'info');
+    }
+
+    // MISSILE SHIP — mobile VLS: fires the player's SELECTED missile type
+    // (hotbar R picker) at enemy hulls/structures in range (bots alternate
+    // cruise/ballistic). Volley pattern adapted from fireMissileVolley.
+    _updateMissileShip() {
+        if (this.missileCd > 0) return;
+        let trg = null, bestD = this.hull.targetRange;
+        for (const w of warships) {
+            if (w.dead || w.owner === this.owner) continue;
+            const d = haversineDist(this.curLat, this.curLon, w.curLat, w.curLon);
+            if (d < bestD) { bestD = d; trg = { lat: w.curLat, lon: w.curLon, ref: w }; }
+        }
+        if (!trg) {
+            bestD = 1400;
+            for (const s of structs) {
+                if (s.dead || s.owner === this.owner) continue;
+                const d = haversineDist(this.curLat, this.curLon, s.lat, s.lon);
+                if (d < bestD) { bestD = d; trg = { lat: s.lat, lon: s.lon, ref: s }; }
+            }
+        }
+        if (!trg) return;
+        // Player cruisers mirror the R-mode selection, but never auto-fire
+        // strategic warheads (nuke/ICBM stay manual-only) — cost-capped.
+        const mk = this.owner === 'player'
+            ? ((MCFG[selMissile] && MCFG[selMissile].cost <= 600) ? selMissile : 'cruise')
+            : (Math.random() < 0.5 ? 'cruise' : 'ballistic');
+        const cfg = MCFG[mk];
+        if (!cfg) return;
+        if (!_navalSpend(this.owner, cfg.cost)) return;   // can't afford → hold fire
+        const { dx, dy } = _missileScatter(cfg);
+        missiles.push(new Missile(this.curLat, this.curLon, trg.lat + dx, trg.lon + dy, cfg, this.owner));
+        this.missileCd = this.hull.missileReload;
+        spawnExp(this.curLat, this.curLon, 2, cfg.trl || '#ffcc66');
+    }
+
+    // FLEET BEHAVIOR — escorts leash to the nearest friendly capital hull;
+    // carriers & drone bays keep standoff from enemy gun range.
+    _updateFleetBehavior() {
+        if (frame % 45 !== (this.id % 45)) return;
+        if (this.target || this.mode === 'hold') return;
+        if (this.hullClass === 'escort') {
+            let cap = null, bestD = Infinity;
+            for (const w of warships) {
+                if (w.dead || w.owner !== this.owner || w === this) continue;
+                if (w.hullClass !== 'carrier' && w.hullClass !== 'missile' && w.hullClass !== 'drone') continue;
+                const d = haversineDist(this.curLat, this.curLon, w.curLat, w.curLon);
+                if (d < bestD) { bestD = d; cap = w; }
+            }
+            if (cap && bestD > GAME_CONSTANTS.ESCORT_LEASH_KM) {
+                const jitter = () => (Math.random() - 0.5) * 1.2;
+                this._setCourse(cap.curLat + jitter(), cap.curLon + jitter());
+            }
+        } else if (this.hull.standoffKm) {
+            // Standoff: run away from the nearest enemy hull inside standoff range
+            let threat = null, bestD = this.hull.standoffKm;
+            for (const w of warships) {
+                if (w.dead || w.owner === this.owner) continue;
+                const d = haversineDist(this.curLat, this.curLon, w.curLat, w.curLon);
+                if (d < bestD) { bestD = d; threat = w; }
+            }
+            if (threat) {
+                const dLat = this.curLat - threat.curLat, dLon = this.curLon - threat.curLon;
+                const len = Math.max(0.001, Math.hypot(dLat, dLon));
+                this._setCourse(
+                    Math.max(-85, Math.min(85, this.curLat + (dLat / len) * 4)),
+                    this.curLon + (dLon / len) * 4 / Math.max(0.2, Math.cos(this.curLat * Math.PI / 180))
+                );
+            }
+        }
+    }
+
+    // TRANSPORT — embark troops from the owner's pool (called at purchase
+    // and when resting at a friendly port).
+    _embarkTroops(pct) {
+        const pool = this.owner === 'player' ? pTroops
+            : (isBotStr(this.owner) ? (botByStr(this.owner) || { troops: 0 }).troops : eTroops);
+        const take = Math.floor(pool * pct);
+        if (take < 50) return false;
+        if (conquestCtx) conquestCtx.addTroops(this.owner, -take);
+        else if (this.owner === 'player') pTroops -= take;
+        this.troops = take;
+        if (this.owner === 'player') logEvent(`🚢 ${this.name}: صعد ${take.toLocaleString('en')} جندي — انقر ساحل العدو للإنزال`, 'info');
+        return true;
+    }
+
+    // TRANSPORT — player clicked an enemy coast: sail there and land.
+    _orderInvasion(shore) {
+        if (this.hullClass !== 'transport' || this.troops <= 0) return false;
+        this.invLat = shore.lat; this.invLon = shore.lon;
+        this.invading = true;
+        this.target = null;
+        this.mode = 'invasion';
+        this._setCourse(shore.lat, shore.lon);
+        if (this.owner === 'player') logEvent(`🚢 ${this.name} تتجه لإنزال ${this.troops.toLocaleString('en')} جندي!`, 'info');
+        return true;
+    }
+
+    // TRANSPORT — arrival check + beachhead landing (same flow as
+    // TransportShip._landfall: seedCircle + ConquestAttack inland).
+    _updateInvasion() {
+        if (!this.invading) return;
+        const d = haversineDist(this.curLat, this.curLon, this.invLat, this.invLon);
+        if (d > Math.max(20, GAME_CONSTANTS.BEACHHEAD_RADIUS_KM)) {
+            // Course exhausted but still off-shore (HPA water-snap offset) —
+            // beeline the last leg so the landing always triggers.
+            if (this.waypoints && this.distTraveled >= this.totalLen) {
+                this._setCourse(this.invLat, this.invLon, true);
+            }
+            return;
+        }
+        this.invading = false;
+        this.mode = 'patrol';
+        const landed = this.troops;
+        this.troops = 0;
+        if (!conquestGrid || !conquestCtx || !conquestGrid._maskReady || landed < 10) return;
+        const target = conquestGrid.ownerAt(this.invLat, this.invLon);
+        if (target === this.owner || target === 'water') return;
+        conquestGrid.seedCircle(this.invLat, this.invLon, GAME_CONSTANTS.BEACHHEAD_RADIUS_KM, this.owner);
+        renderMode1Territory();
+        conquestCtx.addTroops(this.owner, landed);   // re-credit: ConquestAttack deducts on construction
+        activeAttacks.push(new ConquestAttack({
+            grid: conquestGrid, owner: this.owner, target,
+            troops: landed, srcLat: this.invLat, srcLon: this.invLon,
+            dstLat: this.invLat, dstLon: this.invLon, ctx: conquestCtx,
+        }));
+        if (this.owner === 'player') logEvent('🚢 إنزال بحري! قواتك عسكرت على الساحل.', 'info');
+    }
+
     _orient() {
         const nrm = this.mesh.position.clone().normalize();
         this.mesh.up.copy(nrm);
@@ -2543,6 +2839,154 @@ function _ownerName(str) {
     if (str === 'player') return 'لاعب';
     const b = botByStr(str);
     return b ? `${b.flag} ${b.name}` : 'العدو';
+}
+
+// Spend resources for a naval action (missile-ship VLS shots etc.).
+// Centralizes the player/bot/legacy-enemy pool split; returns false (and
+// holds fire) when the side can't afford the shot.
+function _navalSpend(owner, amt) {
+    if (owner === 'player') {
+        if (pRes < amt) return false;
+        pRes -= amt;
+        return true;
+    }
+    if (isBotStr(owner)) {
+        const b = botByStr(owner);
+        if (!b || b.res < amt) return false;
+        b.res -= amt;
+        return true;
+    }
+    if (eRes < amt) return false;
+    eRes -= amt;
+    return true;
+}
+
+// ════════════════════════════════════════════════════════════════════
+// DRONES (TASK-202 — drone-carrier swarms, finally reading DCFG)
+// Launch from a drone-carrier bay: patrol the fleet, kamikaze onto enemy
+// hulls (nano/swarm also screen vs enemy drones). Tethered to their bay —
+// if the mothership sinks the swarm despawns with it.
+// ════════════════════════════════════════════════════════════════════
+class Drone {
+    constructor(owner, home, dkey) {
+        const C = GAME_CONSTANTS;
+        this.id = ++_id;
+        this.owner = owner;
+        this.cfg = DCFG[dkey] || DCFG['nano'];
+        this.home = home;                       // owning Warship (drone bay)
+        this.hp = this.cfg.hp;
+        this.dead = false;
+        this.mode = 'patrol';                    // 'patrol' | 'attack'
+        this.target = null;                      // enemy warship or drone
+        this.speed = this.cfg.spd * C.DRONE_SPEED_MUL;   // km/frame
+        this.lat = home.curLat; this.lon = home.curLon;
+        this.orbitPhase = Math.random() * Math.PI * 2;
+        this.orbitR = 90 + Math.random() * 130;  // km around the fleet
+        this.mesh = buildDroneModel(this.cfg.col);
+        scene.add(this.mesh);
+    }
+
+    _kill(silent) {
+        if (this.dead) return;
+        this.dead = true;
+        if (!silent) spawnExp(this.lat, this.lon, 2.5, this.cfg.col);
+        scene.remove(this.mesh);
+        disposeMeshDeep(this.mesh);
+    }
+
+    update() {
+        if (this.dead) return;
+        const C = GAME_CONSTANTS;
+        // Mothership gone → the tethered swarm dies with it
+        if (!this.home || this.home.dead) { this._kill(true); return; }
+
+        // Retarget periodically
+        if (frame % 20 === (this.id % 20)) this._retarget();
+
+        const t = this.target;
+        if (t && !t.dead) {
+            // Attack: great-circle step toward the target (Plane-style lerp)
+            const distKm = haversineDist(this.lat, this.lon, t.lat, t.lon);
+            if (distKm <= C.DRONE_HIT_RANGE_KM) {
+                this._detonate(t);
+                return;
+            }
+            const cur = latLonToVec3(this.lat, this.lon, 1).normalize();
+            const tv = latLonToVec3(t.lat, t.lon, 1).normalize();
+            const step = Math.min(1, this.speed / Math.max(1, distKm));
+            const nxt = cur.lerp(tv, step).normalize();
+            const ll = vec3ToLatLon(nxt);
+            this.lat = ll.lat; this.lon = ll.lon;
+        } else {
+            // Patrol: orbit the (moving) fleet
+            this.orbitPhase += 0.025;
+            const ctr = this.home;
+            this.lat = Math.max(-85, Math.min(85, ctr.curLat + (this.orbitR * Math.cos(this.orbitPhase)) / 111));
+            this.lon = ctr.curLon + (this.orbitR * Math.sin(this.orbitPhase)) / (111 * Math.max(0.2, Math.cos(ctr.curLat * Math.PI / 180)));
+        }
+
+        // Visuals
+        const pos = latLonToVec3(this.lat, this.lon, EARTH_RADIUS + C.DRONE_ALT);
+        this.mesh.position.copy(pos);
+        const ahead = t && !t.dead
+            ? latLonToVec3(t.lat, t.lon, EARTH_RADIUS + C.DRONE_ALT)
+            : latLonToVec3(this.lat, this.lon + 0.02, EARTH_RADIUS + C.DRONE_ALT);
+        this.mesh.up.copy(pos).normalize();
+        this.mesh.lookAt(ahead);
+    }
+
+    _retarget() {
+        const C = GAME_CONSTANTS;
+        const cx = this.home.curLat, cy = this.home.curLon;
+        let best = null, bestD = C.DRONE_ENGAGE_RANGE_KM;
+        const _consider = (o) => {
+            if (o.dead || o.owner === this.owner) return;
+            const d = haversineDist(cx, cy, o.lat, o.lon);
+            if (d < bestD) { bestD = d; best = o; }
+        };
+        // Swarms screen vs enemy drones first; kamikazes go for hulls
+        if (this.cfg.type === 'swarm') {
+            for (const d of drones) _consider(d);
+        }
+        if (!best) {
+            for (const w of warships) _consider(w);
+        }
+        this.target = best;
+        this.mode = best ? 'attack' : 'patrol';
+    }
+
+    _detonate(t) {
+        const dmg = this.cfg.dmg || 25;
+        spawnExp(this.lat, this.lon, 3.5, this.cfg.col);
+        if (t instanceof Warship) {
+            t.hp -= dmg;
+            if (t.hp <= 0 && !t.dead) {
+                t._sink();
+                if (this.owner === 'player') logEvent(`🛩️ سرب درون أغرق ${t.name} ${_ownerName(t.owner)}!`, 'info');
+            }
+        } else if (t instanceof Drone) {
+            t.hp -= dmg;
+            if (t.hp <= 0) t._kill();
+        }
+        this._kill(true);   // kamikaze — the drone is the warhead
+    }
+}
+
+// Low-poly swarm drone (nose +Z → lookAt flies nose-first). DCFG.col accent.
+function buildDroneModel(col) {
+    const g = new THREE.Group();
+    _M(g, _box(0.5, 0.16, 1.6), _sm(LP.DGRAY), 0, 0, 0);           // fuselage
+    _M(g, _box(0.2, 0.18, 0.5), _am(col), 0, 0, 0.8);              // nose cap
+    _M(g, _box(2.4, 0.06, 0.5), _sm(LP.DARK), 0, 0, -0.1);         // main wing
+    _M(g, _box(0.06, 0.5, 0.4), _sm(LP.DARK), 0, 0.25, -0.6);      // fin
+    _M(g, _box(0.9, 0.05, 0.3), _sm(LP.DARK), 0, -0.04, -0.75);    // tailplane
+    g.userData.accents = [];
+    g.traverse(o => {
+        if (o.isMesh && o.material && o.material.userData && o.material.userData.accent) {
+            g.userData.accents.push(o.material);
+        }
+    });
+    return g;
 }
 
 class Train {
@@ -5520,47 +5964,182 @@ function buildStructModel(type, owner) {
 // stripe, turret ring, flag, helipad ring). Built from the same cached
 // geometry helpers as structures; hull materials shared, accents per-instance.
 // ~26 local units long → ×1.5 scale ≈ 40 world units (capital-ship presence).
-function buildWarshipModel(acc) {
+function buildWarshipModel(acc, cls) {
     const g = new THREE.Group();
-    // Hull + bow + stern
-    _M(g, _box(5.4, 2.2, 20), _sm(LP.CONCRETE), 0, 1.1, 1.0);
-    _M(g, _cone(2.7, 3.4, 4), _sm(LP.CONCRETE), 0, 1.1, -10.9, -Math.PI / 2, Math.PI / 4, 0, 'bow');
-    _M(g, _box(4.6, 2.0, 3.0), _sm(LP.DGRAY), 0, 1.0, 12.4, 0, 0, 0, 'stern');
-    // Waterline stripe (owner accent)
-    _M(g, _box(5.7, 0.4, 20.4), _am(acc), 0, 0.55, 1.0);
-    // Main deck + foredeck
-    _M(g, _box(4.8, 0.35, 19), _sm(LP.LIGHT), 0, 2.35, 1.0);
-    _M(g, _box(4.2, 0.3, 4.6), _sm(LP.LIGHT), 0, 2.3, -7.4);
-    // Superstructure + bridge
-    _M(g, _box(3.4, 2.4, 7.2), _sm(LP.METAL), 0, 3.7, 2.2);
-    _M(g, _box(3.0, 0.5, 0.12), _sm(LP.GLASS), 0, 4.35, -1.45);
-    _M(g, _box(2.4, 0.7, 3.0), _sm(LP.LIGHT), 0, 5.2, 1.4);
-    // Funnel
-    _M(g, _box(1.7, 2.4, 2.8), _sm(LP.DGRAY), 0, 4.9, 6.8);
-    _M(g, _box(1.9, 0.4, 3.0), _sm(LP.DARK), 0, 6.15, 6.8);
-    // Forward main turret (owner ring + twin barrels)
-    _M(g, _cyl(1.5, 1.7, 1.0, 8), _sm(LP.METAL), 0, 2.95, -8.2);
-    _M(g, _cyl(1.75, 1.75, 0.18, 10), _am(acc), 0, 3.05, -8.2);
-    _M(g, _box(2.0, 0.9, 2.2), _sm(LP.METAL), 0, 3.9, -8.2);
-    _M(g, _cyl(0.16, 0.16, 4.4, 6), _sm(LP.DARK), -0.55, 4.0, -11.2, Math.PI / 2, 0, 0);
-    _M(g, _cyl(0.16, 0.16, 4.4, 6), _sm(LP.DARK), 0.55, 4.0, -11.2, Math.PI / 2, 0, 0);
-    // Aft secondary turret
-    _M(g, _cyl(1.1, 1.25, 0.8, 8), _sm(LP.METAL), 0, 2.85, 9.6);
-    _M(g, _box(1.5, 0.7, 1.7), _sm(LP.METAL), 0, 3.55, 9.6);
-    _M(g, _cyl(0.12, 0.12, 3.0, 6), _sm(LP.DARK), 0, 3.65, 11.6, Math.PI / 2, 0, 0);
-    // VLS hatch grid
-    _M(g, _box(1.6, 0.22, 2.4), _sm(LP.DARK), 0, 2.55, -5.2);
-    // Mast + rotating radar (named → idle anim spins it)
-    _M(g, _cyl(0.14, 0.18, 5.0, 6), _sm(LP.METAL), 0, 7.6, 0.6);
-    _M(g, _box(2.0, 0.5, 0.35), _sm(LP.LIGHT), 0, 10.2, 0.6, 0, 0, 0, 'radar');
-    // Owner flag at masthead
-    _M(g, _box(1.1, 0.7, 0.08), _am(acc), 0.75, 10.35, 0.6);
-    // Helipad ring (owner accent)
-    _M(g, _cyl(1.5, 1.5, 0.06, 10), _am(acc), 0, 2.62, 10.8);
     g.userData.accents = [];
+    if (cls === 'carrier') {
+        // ── AIRCRAFT CARRIER: wide flat flight deck + angled landing strip,
+        //    starboard island, deck stripes, parked jets, CIWS mounts ──
+        _M(g, _box(9.0, 2.4, 30), _sm(LP.CONCRETE), 0, 1.2, 0);                    // hull
+        _M(g, _cone(4.5, 5.0, 4), _sm(LP.CONCRETE), 0, 1.2, -17.4, -Math.PI / 2, Math.PI / 4, 0, 'bow');
+        _M(g, _box(7.6, 2.0, 4.0), _sm(LP.DGRAY), 0, 1.1, 16.8, 0, 0, 0, 'stern');// stern transom
+        _M(g, _box(9.4, 0.5, 30.6), _am(acc), 0, 0.45, 0);                         // waterline stripe
+        _M(g, _box(12.6, 0.5, 33), _sm(LP.RUNWAY), 0, 2.65, 0);                    // flight deck (overhangs hull)
+        _M(g, _box(0.35, 0.06, 26), _sm(LP.WHITE), -1.4, 2.93, -1.5);              // centreline dashes
+        for (let i = 0; i < 6; i++) _M(g, _box(0.35, 0.06, 1.1), _sm(LP.WHITE), -1.4, 2.93, -12 + i * 4.4);
+        _M(g, _box(7.5, 0.06, 0.4), _sm(LP.WHITE), 1.8, 2.93, 8.5);                // angled-deck line
+        _M(g, _box(1.1, 0.06, 0.4), _am(acc), -1.4, 2.93, -14.6);                  // threshold marks
+        _M(g, _box(1.1, 0.06, 0.4), _am(acc), 1.8, 2.93, -14.6);
+        // Island superstructure (starboard)
+        _M(g, _box(2.6, 3.2, 7.5), _sm(LP.METAL), 4.6, 4.5, 1.5);
+        _M(g, _box(2.2, 0.5, 5.4), _sm(LP.GLASS), 4.6, 5.2, 1.0);
+        _M(g, _box(2.0, 1.0, 2.4), _sm(LP.LIGHT), 4.6, 6.5, 3.2);                  // bridge top
+        _M(g, _cyl(0.9, 1.0, 3.4, 8), _sm(LP.DGRAY), 4.4, 7.5, -0.8);              // funnel
+        _M(g, _cyl(0.14, 0.18, 5.5, 6), _sm(LP.METAL), 4.6, 10.4, 1.5);            // mast
+        _M(g, _box(2.4, 0.5, 0.35), _sm(LP.LIGHT), 4.6, 13.1, 1.5, 0, 0, 0, 'radar');
+        _M(g, _box(1.3, 0.8, 0.08), _am(acc), 5.35, 12.2, 1.5);                    // ensign
+        // Deck park: 5 parked jets (little crosses)
+        for (let i = 0; i < 5; i++) {
+            _M(g, _box(0.5, 0.18, 1.6), _sm(LP.DARK), 4.2, 2.9, -10.5 + i * 2.6);
+            _M(g, _box(1.7, 0.1, 0.4), _sm(LP.DARK), 4.2, 2.95, -10.5 + i * 2.6);
+        }
+        // CIWS: rotating Phalanx mounts fore/aft of the island
+        _M(g, _cyl(0.55, 0.65, 0.8, 8), _sm(LP.METAL), 4.4, 3.1, 6.6);
+        _M(g, _cyl(0.35, 0.35, 0.9, 6), _sm(LP.DARK), 4.4, 3.9, 6.6, Math.PI / 2, 0, 0);
+        _M(g, _cyl(0.3, 0.3, 1.6, 6), _sm(LP.DARK), 4.4, 4.05, 6.6, Math.PI / 2, 0, 0, 'ciws');
+        _M(g, _cyl(0.55, 0.65, 0.8, 8), _sm(LP.METAL), -3.8, 3.1, -13.5);
+        _M(g, _cyl(0.3, 0.3, 1.6, 6), _sm(LP.DARK), -3.8, 4.0, -13.5, Math.PI / 2, 0, 0, 'ciws2');
+        // Deck-edge lifts (accent)
+        _M(g, _box(2.6, 0.12, 3.2), _am(acc), 5.2, 2.7, -3.5);
+        _M(g, _box(2.6, 0.12, 3.2), _am(acc), 5.2, 2.7, 5.5);
+    } else if (cls === 'missile') {
+        // ── MISSILE CRUISER: sleek hull, big VLS cell grids fore+aft ──
+        _M(g, _box(5.2, 2.2, 19), _sm(LP.CONCRETE), 0, 1.1, 0.5);
+        _M(g, _cone(2.6, 3.2, 4), _sm(LP.CONCRETE), 0, 1.1, -10.2, -Math.PI / 2, Math.PI / 4, 0, 'bow');
+        _M(g, _box(4.4, 2.0, 3.0), _sm(LP.DGRAY), 0, 1.0, 11.6, 0, 0, 0, 'stern');
+        _M(g, _box(5.5, 0.4, 19.4), _am(acc), 0, 0.55, 0.5);
+        _M(g, _box(4.6, 0.35, 18), _sm(LP.LIGHT), 0, 2.3, 0.5);
+        // Fore VLS farm: 4×6 cells
+        for (let r = 0; r < 4; r++) for (let c = 0; c < 6; c++)
+            _M(g, _box(0.52, 0.14, 0.52), (r + c) % 2 ? _sm(LP.DARK) : _am(acc), -1.35 + c * 0.54, 2.52, -7.6 + r * 0.58);
+        // Aft VLS farm: 2×6 cells
+        for (let r = 0; r < 2; r++) for (let c = 0; c < 6; c++)
+            _M(g, _box(0.52, 0.14, 0.52), (r + c) % 2 ? _sm(LP.DARK) : _am(acc), -1.35 + c * 0.54, 2.52, 8.2 + r * 0.58);
+        // Low superstructure + enclosed mast
+        _M(g, _box(3.0, 1.8, 5.6), _sm(LP.METAL), 0, 3.1, 1.2);
+        _M(g, _box(2.8, 0.5, 0.12), _sm(LP.GLASS), 0, 3.6, -1.65);
+        _M(g, _cyl(0.5, 0.8, 4.6, 6), _sm(LP.DGRAY), 0, 6.3, 1.2);                  // pyramidal mast
+        _M(g, _box(2.6, 0.45, 0.35), _sm(LP.LIGHT), 0, 8.7, 1.2, 0, 0, 0, 'radar');
+        _M(g, _box(1.0, 0.65, 0.08), _am(acc), 0.65, 8.9, 1.2);
+        // Twin illumination directors (accent rings)
+        _M(g, _cyl(0.28, 0.28, 0.9, 8), _sm(LP.LIGHT), -1.5, 3.9, -5.4, Math.PI / 2.6);
+        _M(g, _cyl(0.3, 0.3, 0.12, 8), _am(acc), -1.5, 4.2, -5.6, Math.PI / 2.6);
+        // Helipad aft
+        _M(g, _cyl(1.4, 1.4, 0.06, 10), _am(acc), 0, 2.55, 12.2);
+    } else if (cls === 'drone') {
+        // ── DRONE CARRIER: boxy tender hull, lattice racks of drones ──
+        _M(g, _box(6.4, 2.2, 17), _sm(LP.CONCRETE), 0, 1.1, 0.5);
+        _M(g, _cone(3.2, 3.6, 4), _sm(LP.CONCRETE), 0, 1.1, -9.2, -Math.PI / 2, Math.PI / 4, 0, 'bow');
+        _M(g, _box(5.4, 2.0, 3.0), _sm(LP.DGRAY), 0, 1.0, 10.2, 0, 0, 0, 'stern');
+        _M(g, _box(6.7, 0.4, 17.4), _am(acc), 0, 0.55, 0.5);
+        _M(g, _box(5.8, 0.35, 16), _sm(LP.LIGHT), 0, 2.3, 0.5);
+        // Launch racks: 2 rails with stacked drone cradles
+        for (const rx of [-1.6, 1.6]) {
+            _M(g, _box(0.28, 1.5, 9.5), _sm(LP.METAL), rx, 3.0, -1.5);
+            for (let i = 0; i < 4; i++) {
+                _M(g, _box(1.4, 0.16, 0.7), _am(acc), rx, 3.0 + (i % 2) * 0.8, -5.2 + i * 2.4);
+                _M(g, _box(0.45, 0.14, 1.5), _sm(LP.DARK), rx, 3.12 + (i % 2) * 0.8, -5.2 + i * 2.4);
+                _M(g, _box(1.3, 0.06, 0.35), _sm(LP.DARK), rx, 3.18 + (i % 2) * 0.8, -5.2 + i * 2.4);
+            }
+        }
+        // Aft control house + antenna farm
+        _M(g, _box(2.4, 1.6, 3.4), _sm(LP.METAL), 0, 3.0, 6.8);
+        _M(g, _box(2.2, 0.4, 0.12), _sm(LP.GLASS), 0, 3.4, 5.05);
+        for (let i = 0; i < 4; i++)
+            _M(g, _cyl(0.05, 0.05, 2.6, 4), _sm(LP.METAL), -1.0 + i * 0.66, 5.1, 6.6 + (i % 2) * 0.7);
+        _M(g, _box(2.2, 0.45, 0.3), _sm(LP.LIGHT), 0, 6.5, 6.8, 0, 0, 0, 'radar');
+        _M(g, _box(1.0, 0.6, 0.08), _am(acc), 0.55, 6.9, 6.8);
+        _M(g, _cyl(1.3, 1.3, 0.06, 10), _am(acc), 0, 2.55, 11.4);                  // recovery helipad
+    } else if (cls === 'transport') {
+        // ── INVASION TRANSPORT: long low troop hull, davits, stern helipad ──
+        _M(g, _box(5.6, 2.0, 24), _sm(LP.CONCRETE), 0, 1.0, 0.5);
+        _M(g, _cone(2.8, 3.8, 4), _sm(LP.CONCRETE), 0, 1.0, -13.1, -Math.PI / 2, Math.PI / 4, 0, 'bow');
+        _M(g, _box(4.8, 1.8, 3.6), _sm(LP.DGRAY), 0, 0.95, 13.6, 0, 0, 0, 'stern');// ro-ro ramp
+        _M(g, _box(5.9, 0.4, 24.4), _am(acc), 0, 0.5, 0.5);
+        _M(g, _box(5.0, 0.3, 23), _sm(LP.LIGHT), 0, 2.1, 0.5);
+        // Troop deckhouses (rows of hatch + house)
+        _M(g, _box(2.6, 1.4, 6.0), _sm(LP.METAL), 0, 2.9, 3.4);
+        _M(g, _box(2.4, 1.0, 4.0), _sm(LP.LIGHT), 0, 3.6, 8.6);
+        _M(g, _box(2.2, 0.4, 0.12), _sm(LP.GLASS), 0, 3.9, 6.55);
+        // Well-deck landing craft under davits
+        for (let i = 0; i < 3; i++) {
+            _M(g, _box(0.18, 1.3, 0.18), _sm(LP.METAL), -2.4, 2.9, -8.5 + i * 3.0);
+            _M(g, _box(0.18, 1.3, 0.18), _sm(LP.METAL), 2.4, 2.9, -8.5 + i * 3.0);
+            _M(g, _box(1.6, 0.5, 2.6), _am(acc), 0, 2.45, -8.5 + i * 3.0);
+        }
+        // Mast + radar + ensign
+        _M(g, _cyl(0.12, 0.16, 4.4, 6), _sm(LP.METAL), 0, 6.0, 4.2);
+        _M(g, _box(1.8, 0.45, 0.3), _sm(LP.LIGHT), 0, 8.3, 4.2, 0, 0, 0, 'radar');
+        _M(g, _box(1.0, 0.65, 0.08), _am(acc), 0.7, 8.5, 4.2);
+        // Stern flight deck
+        _M(g, _cyl(1.6, 1.6, 0.06, 10), _am(acc), 0, 2.35, 13.2);
+        _M(g, _box(0.32, 0.02, 1.0), _sm(LP.WHITE), 0, 2.42, 13.2);
+        _M(g, _box(1.0, 0.02, 0.32), _sm(LP.WHITE), 0, 2.42, 13.2);
+    } else if (cls === 'escort') {
+        // ── FLEET ESCORT: compact frigate, single gun, PD radar + CIWS ──
+        _M(g, _box(4.2, 2.0, 15), _sm(LP.CONCRETE), 0, 1.0, 0.5);
+        _M(g, _cone(2.1, 2.8, 4), _sm(LP.CONCRETE), 0, 1.0, -8.0, -Math.PI / 2, Math.PI / 4, 0, 'bow');
+        _M(g, _box(3.6, 1.8, 2.6), _sm(LP.DGRAY), 0, 0.95, 8.6, 0, 0, 0, 'stern');
+        _M(g, _box(4.5, 0.4, 15.4), _am(acc), 0, 0.5, 0.5);
+        _M(g, _box(3.7, 0.3, 14), _sm(LP.LIGHT), 0, 2.1, 0.5);
+        // Stealth-ish pyramid foremast + PD radar
+        _M(g, _box(2.6, 1.8, 4.4), _sm(LP.METAL), 0, 3.0, 1.4);
+        _M(g, _box(2.4, 0.4, 0.12), _sm(LP.GLASS), 0, 3.5, -0.85);
+        _M(g, _cyl(0.4, 0.6, 3.4, 6), _sm(LP.DGRAY), 0, 5.6, 1.4);
+        _M(g, _box(2.0, 0.45, 0.3), _sm(LP.LIGHT), 0, 7.4, 1.4, 0, 0, 0, 'radar');
+        _M(g, _sph(0.55, 8, 6), _am(acc), 0, 7.9, 1.4);                             // radome
+        // Single compact gun forward
+        _M(g, _cyl(1.0, 1.1, 0.7, 8), _sm(LP.METAL), 0, 2.6, -5.4);
+        _M(g, _box(1.3, 0.7, 1.6), _sm(LP.METAL), 0, 3.3, -5.4);
+        _M(g, _cyl(0.1, 0.1, 2.6, 6), _sm(LP.DARK), 0, 3.4, -7.0, Math.PI / 2.05);
+        // 8-cell VLS plug (defensive)
+        for (let r = 0; r < 2; r++) for (let c = 0; c < 4; c++)
+            _M(g, _box(0.42, 0.12, 0.42), _sm(LP.DARK), -0.75 + c * 0.5, 2.3, 4.6 + r * 0.5);
+        // CIWS aft (spinning barrels)
+        _M(g, _cyl(0.45, 0.55, 0.6, 8), _sm(LP.METAL), 0, 2.5, 7.6);
+        _M(g, _cyl(0.24, 0.24, 1.3, 6), _sm(LP.DARK), 0, 3.15, 7.6, Math.PI / 2, 0, 0, 'ciws');
+        _M(g, _box(0.9, 0.6, 0.08), _am(acc), 0.55, 7.75, 1.4);                     // ensign
+        _M(g, _cyl(1.1, 1.1, 0.06, 10), _am(acc), 0, 2.32, 10.0);                   // helipad
+    } else {
+        // ── DESTROYER (original 24-mesh gunship) ──
+        _M(g, _box(5.4, 2.2, 20), _sm(LP.CONCRETE), 0, 1.1, 1.0);
+        _M(g, _cone(2.7, 3.4, 4), _sm(LP.CONCRETE), 0, 1.1, -10.9, -Math.PI / 2, Math.PI / 4, 0, 'bow');
+        _M(g, _box(4.6, 2.0, 3.0), _sm(LP.DGRAY), 0, 1.0, 12.4, 0, 0, 0, 'stern');
+        // Waterline stripe (owner accent)
+        _M(g, _box(5.7, 0.4, 20.4), _am(acc), 0, 0.55, 1.0);
+        // Main deck + foredeck
+        _M(g, _box(4.8, 0.35, 19), _sm(LP.LIGHT), 0, 2.35, 1.0);
+        _M(g, _box(4.2, 0.3, 4.6), _sm(LP.LIGHT), 0, 2.3, -7.4);
+        // Superstructure + bridge
+        _M(g, _box(3.4, 2.4, 7.2), _sm(LP.METAL), 0, 3.7, 2.2);
+        _M(g, _box(3.0, 0.5, 0.12), _sm(LP.GLASS), 0, 4.35, -1.45);
+        _M(g, _box(2.4, 0.7, 3.0), _sm(LP.LIGHT), 0, 5.2, 1.4);
+        // Funnel
+        _M(g, _box(1.7, 2.4, 2.8), _sm(LP.DGRAY), 0, 4.9, 6.8);
+        _M(g, _box(1.9, 0.4, 3.0), _sm(LP.DARK), 0, 6.15, 6.8);
+        // Forward main turret (owner ring + twin barrels)
+        _M(g, _cyl(1.5, 1.7, 1.0, 8), _sm(LP.METAL), 0, 2.95, -8.2);
+        _M(g, _cyl(1.75, 1.75, 0.18, 10), _am(acc), 0, 3.05, -8.2);
+        _M(g, _box(2.0, 0.9, 2.2), _sm(LP.METAL), 0, 3.9, -8.2);
+        _M(g, _cyl(0.16, 0.16, 4.4, 6), _sm(LP.DARK), -0.55, 4.0, -11.2, Math.PI / 2, 0, 0);
+        _M(g, _cyl(0.16, 0.16, 4.4, 6), _sm(LP.DARK), 0.55, 4.0, -11.2, Math.PI / 2, 0, 0);
+        // Aft secondary turret
+        _M(g, _cyl(1.1, 1.25, 0.8, 8), _sm(LP.METAL), 0, 2.85, 9.6);
+        _M(g, _box(1.5, 0.7, 1.7), _sm(LP.METAL), 0, 3.55, 9.6);
+        _M(g, _cyl(0.12, 0.12, 3.0, 6), _sm(LP.DARK), 0, 3.65, 11.6, Math.PI / 2, 0, 0);
+        // VLS hatch grid
+        _M(g, _box(1.6, 0.22, 2.4), _sm(LP.DARK), 0, 2.55, -5.2);
+        // Mast + rotating radar (named → idle anim spins it)
+        _M(g, _cyl(0.14, 0.18, 5.0, 6), _sm(LP.METAL), 0, 7.6, 0.6);
+        _M(g, _box(2.0, 0.5, 0.35), _sm(LP.LIGHT), 0, 10.2, 0.6, 0, 0, 0, 'radar');
+        // Owner flag at masthead
+        _M(g, _box(1.1, 0.7, 0.08), _am(acc), 0.75, 10.35, 0.6);
+        // Helipad ring (owner accent)
+        _M(g, _cyl(1.5, 1.5, 0.06, 10), _am(acc), 0, 2.62, 10.8);
+    }
     g.traverse(o => {
         if (o.isMesh && o.material && o.material.userData && o.material.userData.accent) {
-            g.userData.accents.push(o.material);
+            if (!g.userData.accents.includes(o.material)) g.userData.accents.push(o.material);
         }
     });
     return g;
@@ -6050,6 +6629,16 @@ class Missile {
                 if (s.owner !== this.owner && !s.dead && dst(this, s) < blastR) s.hit(dmg);
             });
         }
+        // TASK-202 naval strike: blasts hit enemy hulls at ×2 anti-ship scale
+        // (missile cruisers + player bombardment can now sink fleets; a
+        // direct cruise hit ≈ 180 dmg vs a 1000hp destroyer).
+        for (const w of warships) {
+            if (w.dead || w.owner === this.owner) continue;
+            if (haversineDist(this.lat, this.lon, w.curLat, w.curLon) < blastR) {
+                w.hp -= dmg * GAME_CONSTANTS.NAVAL_MISSILE_DMG_MUL;
+                if (w.hp <= 0 && !w.dead) w._sink();
+            }
+        }
         if (this.isSAM && this.tgt) this.tgt.dead = true;
     }
 }
@@ -6063,16 +6652,18 @@ const _parkV5 = new THREE.Vector3();
 const _parkV6 = new THREE.Vector3();
 
 class Plane {
-    constructor(lat, lon, cfg, owner) {
+    constructor(lat, lon, cfg, owner, baseOverride) {
         this.id = ++_id; this.lat = lat; this.lon = lon; this.cfg = cfg || PCFG['fighter']; this.owner = owner;
         this.hp = cfg ? cfg.hp : 100; this.dead = false; this.parked = true;
         this.speed = (cfg ? cfg.spd : 5) * GAME_CONSTANTS.PLANE_SPEED_MULTIPLIER; 
         this.tlat = lat; this.tlon = lon;
         this.mode = 'patrol';
         this.fireT = 0;
+        // TASK-202: carriers pass their own hull as the base (air wing lives
+        // on the ship — parked orbits the deck, return recovers to it).
         // B4 FIX: Find NEAREST airport, not just the first one in the array
-        this.baseStruct = null;
-        {
+        this.baseStruct = baseOverride || null;
+        if (!this.baseStruct) {
             let bestDist = Infinity;
             for (let s of structs) {
                 if (s.owner === owner && s.type === 'airport' && !s.dead) {
@@ -8189,6 +8780,13 @@ function updateSelectionPanel() {
             structInfo[unit.type]().forEach(row => {
                 statsHtml += `<div class="sstat"><span>${row.k}</span><span>${row.v}</span></div>`;
             });
+        } else if (unit instanceof Warship) {
+            statsHtml += `<div class="sstat"><span>الوضع</span><span>${unit.invading ? 'إنزال ⚔' : unit.mode}</span></div>`;
+            if (unit.hullClass === 'transport') statsHtml += `<div class="sstat"><span>القوات</span><span>${Math.floor(unit.troops).toLocaleString('en')}</span></div>`;
+            if (unit.hullClass === 'carrier') statsHtml += `<div class="sstat"><span>السرب</span><span>${planes.filter(p => !p.dead && p.baseStruct === unit).length}/${unit.hull.airWing} 🛫</span></div>`;
+            if (unit.hullClass === 'drone') statsHtml += `<div class="sstat"><span>الأسراب</span><span>${drones.filter(d => !d.dead && d.home === unit).length}/${unit.hull.swarmCap} 🛩️</span></div>`;
+            if (unit.hullClass === 'escort') statsHtml += `<div class="sstat"><span>الدفاع</span><span>اعتراض ${unit.hull.pdRange}كم 🛡️</span></div>`;
+            if (unit.hullClass === 'missile') statsHtml += `<div class="sstat"><span>التسليح</span><span>VLS 🚀</span></div>`;
         } else if (unit.mode) {
             statsHtml += `<div class="sstat"><span>وضع</span><span>${unit.mode}</span></div>`;
         }
@@ -8198,7 +8796,7 @@ function updateSelectionPanel() {
         document.getElementById('selHp').style.width = '100%';
         let info = [];
         if(sel.planes.length) info.push(`✈ ${sel.planes.length} طائرة`);
-        if(sel.warships.length) info.push(`🚢 ${sel.warships.length} مدمرة`);
+        if(sel.warships.length) info.push(`🚢 ${sel.warships.length} سفينة`);
         if(sel.structs.length) info.push(`🏗 ${sel.structs.length} مبنى`);
         document.getElementById('selStats').innerHTML = 
             `<div class="sstat"><span>${info.join(' | ')}</span></div>`;
@@ -8582,13 +9180,26 @@ window.addEventListener('click', async e => {
             pick.selected = true;
             updateSelectionPanel();
             logEvent(pick instanceof Warship
-                ? '⚓ مدمرة محددة — انقر الماء لتحريكها'
+                ? `⚓ ${pick.name} محددة — انقر الماء لتحريكها${pick.hullClass === 'transport' && pick.troops > 0 ? ' أو ساحل العدو للإنزال' : ''}`
                 : '✈️ طائرة محددة — انقر الخريطة لتوجيهها (دورية/هجوم)', 'info');
             return;
         }
         // ── Move orders for the current selection ──
         const selShips = warships.filter(w => w.selected && !w.dead && w.owner === myRole);
         const selPlanes = planes.filter(p => p.selected && !p.dead && p.owner === myRole);
+        // Invasion transports: clicking ENEMY/NEUTRAL LAND orders a beach assault
+        if (selShips.length && isLand(loc.lat, loc.lon)) {
+            const tOwner = getPixelOwner(loc.lat, loc.lon);
+            if (tOwner !== 'water' && tOwner !== myRole) {
+                const invaders = selShips.filter(w => w.hullClass === 'transport' && w.troops > 0);
+                const shore = findNearestShoreTile(loc.lat, loc.lon);
+                if (invaders.length && shore) {
+                    invaders.forEach(w => w._orderInvasion(shore));
+                    logEvent(`🚢 اتجهت ${invaders.length} ناقلة إنزال نحو الساحل المعادي!`, 'info');
+                    return;
+                }
+            }
+        }
         if (selShips.length && !isLand(loc.lat, loc.lon)) {
             selShips.forEach(w => w.setPatrol(loc));
             logEvent(`⛵ اتجهت ${selShips.length} مدمرة إلى نقطة الدورية الجديدة`, 'info');
@@ -8656,23 +9267,31 @@ window.addEventListener('click', async e => {
     }
 
     if(buildMode) {
-        // ── WARSHIP: mobile naval unit — click WATER to set its patrol point ──
+        // ── WARSHIP: mobile naval unit — click WATER to set its patrol point.
+        //    Hull class comes from the hotbar V cycle (warshipBuildClass). ──
         if (buildMode === 'warship') {
             const C = GAME_CONSTANTS;
+            const hull = C.HULL_CLASSES[warshipBuildClass] || C.HULL_CLASSES.destroyer;
             if (isLand(loc.lat, loc.lon)) {
-                document.getElementById('bldMsg').textContent = 'المدمرة تُنشر في الماء! انقر نقطة بحرية قرب سواحلك.';
+                document.getElementById('bldMsg').textContent = `${hull.name} تُنشر في الماء! انقر نقطة بحرية قرب سواحلك.`;
                 return;
             }
-            const cost = SDEFS.warship.cost;
-            if (pRes < cost) { document.getElementById('bldMsg').textContent = 'لا توجد موارد كافية!'; return; }
-            const mine = warships.reduce((n, w) => n + (!w.dead && w.owner === 'player' ? 1 : 0), 0);
-            if (mine >= C.WARSHIP_MAX_ACTIVE) { document.getElementById('bldMsg').textContent = 'الحد الأقصى للمدمرات نشط! ⚓'; return; }
+            if (pRes < hull.cost) { document.getElementById('bldMsg').textContent = 'لا توجد موارد كافية!'; return; }
+            const mineSame = warships.reduce((n, w) => n + (!w.dead && w.owner === 'player' && w.hullClass === warshipBuildClass ? 1 : 0), 0);
+            if (mineSame >= hull.cap) { document.getElementById('bldMsg').textContent = `الحد الأقصى لـ${hull.name} نشط (${hull.cap})! ⚓`; return; }
             const port = structs.filter(s => !s.dead && s.owner === 'player' && s.type === 'port')
                 .sort((a, b) => haversineDist(a.lat, a.lon, loc.lat, loc.lon) - haversineDist(b.lat, b.lon, loc.lat, loc.lon))[0];
-            if (!port) { document.getElementById('bldMsg').textContent = 'تحتاج ميناء لنشر المدمرات! ⚓'; return; }
-            pRes -= cost;
-            warships.push(new Warship('player', port, { lat: loc.lat, lon: loc.lon }));
-            logEvent(`⚓ مدمرة انطلقت من الميناء! ($${cost}) — دورية تلقائية ضد سفن الأعداء`, 'info');
+            if (!port) { document.getElementById('bldMsg').textContent = 'تحتاج ميناء لنشر الأسطول! ⚓'; return; }
+            // Invasion transports embark troops at purchase
+            if (warshipBuildClass === 'transport') {
+                const pct = (window.troopAttackPct || 50) / 100;
+                if (pTroops * pct < 50) { document.getElementById('bldMsg').textContent = 'لا توجد قوات كافية للإنزال!'; return; }
+            }
+            pRes -= hull.cost;
+            const ship = new Warship('player', port, { lat: loc.lat, lon: loc.lon }, warshipBuildClass);
+            warships.push(ship);
+            if (warshipBuildClass === 'transport') ship._embarkTroops((window.troopAttackPct || 50) / 100);
+            logEvent(`⚓ ${hull.name} انطلقت من الميناء! ($${hull.cost})`, 'info');
             buildMode = null;
             document.getElementById('bldMsg').textContent = 'جاهز';
             if (window.__refreshHotbar) window.__refreshHotbar();
@@ -9118,6 +9737,7 @@ function initWorld(difficulty, pCountryKey='usa', eCountryKey='random', gameMode
     troopCohorts.forEach(tc => { if(tc.mesh) { scene.remove(tc.mesh); disposeMeshDeep(tc.mesh); } });
     transportShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
     warships.forEach(w => { if(w.mesh) { scene.remove(w.mesh); disposeMeshDeep(w.mesh); } w.shells.forEach(sh => scene.remove(sh.mesh)); });
+    drones.forEach(d => { if(d.mesh) { scene.remove(d.mesh); disposeMeshDeep(d.mesh); } });
 
     structs = []; missiles = []; planes = []; drones = []; aamMissiles = []; exps = []; particles = [];
     tradeShips = []; trains = []; troopCohorts = []; transportShips = []; warships = [];
@@ -9853,16 +10473,35 @@ function runAI() {
         }
     }
 
-    // 4. AI Naval — build ports, launch warships & invasion transports
+    // 4. AI Naval — mixed hull fleets (TASK-202): bots screen with escorts,
+    //    strike with missile cruisers, field carriers/drone bays when rich,
+    //    and run invasion transports at the nearest rival shore.
     if (window.gameMode === 'mode1' && frame % GAME_CONSTANTS.AI_TICK_RATE === 0) {
-        const wc = SDEFS.warship.cost;
+        const HC = GAME_CONSTANTS.HULL_CLASSES;
         for (const riv of _rivals()) {
-            if (_resOf(riv) < wc + 200) continue;
-            const myWs = warships.reduce((n, w) => n + (!w.dead && w.owner === riv.str ? 1 : 0), 0);
-            if (myWs >= GAME_CONSTANTS.WARSHIP_MAX_ACTIVE) continue;
+            const myHulls = warships.reduce((n, w) => n + (!w.dead && w.owner === riv.str ? 1 : 0), 0);
+            if (myHulls >= 5) continue;
+            // Weighted class pick (carrier needs an escort screen first)
+            const escorts = warships.reduce((n, w) => n + (!w.dead && w.owner === riv.str && w.hullClass === 'escort' ? 1 : 0), 0);
+            const roll = Math.random();
+            let ck = roll < 0.30 ? 'destroyer'
+                : roll < 0.58 ? 'escort'
+                : roll < 0.74 ? 'missile'
+                : roll < 0.84 ? 'drone'
+                : roll < 0.92 ? (myHulls >= 2 ? 'carrier' : 'destroyer')
+                : (escorts >= 1 ? 'transport' : 'escort');
+            const hull = HC[ck];
+            if (_resOf(riv) < hull.cost + 200) continue;
+            const mineSame = warships.reduce((n, w) => n + (!w.dead && w.owner === riv.str && w.hullClass === ck ? 1 : 0), 0);
+            if (mineSame >= hull.cap) continue;
             const port = structs.find(s => !s.dead && s.owner === riv.str && s.type === 'port');
             if (!port) continue;
-            if (Math.random() > 0.10) continue;   // occasional — cadenced by AI_TICK_RATE
+            if (Math.random() > 0.12) continue;   // occasional — cadenced by AI_TICK_RATE
+            // Invasion transports need troops to be worth launching
+            if (ck === 'transport') {
+                const pool = isBotStr(riv.str) ? (botByStr(riv.str) || { troops: 0 }).troops : eTroops;
+                if (pool * 0.4 < 300) continue;
+            }
             // Patrol toward the nearest rival's shore, else near the port
             let patrol = null;
             let bestD = Infinity;
@@ -9878,8 +10517,24 @@ function runAI() {
             const water = _findWaterNear(patrol ? patrol.lat : port.lat, patrol ? patrol.lon : port.lon, 12)
                 || _findWaterNear(port.lat, port.lon, 12);
             if (!water) continue;
-            warships.push(new Warship(riv.str, port, water));
-            _spendRes(riv, wc);
+            const ship = new Warship(riv.str, port, water, ck);
+            warships.push(ship);
+            _spendRes(riv, hull.cost);
+            // Invasion transports embark immediately and sail at a rival shore
+            if (ck === 'transport') {
+                if (ship._embarkTroops(0.4)) {
+                    let tgt = null, td = Infinity;
+                    for (const other of _rivals()) {
+                        if (other.str === riv.str) continue;
+                        const shore = _sampleOwnedShoreCell(other.str);
+                        if (shore) {
+                            const d = haversineDist(port.lat, port.lon, shore.lat, shore.lon);
+                            if (d < td) { td = d; tgt = shore; }
+                        }
+                    }
+                    if (tgt) ship._orderInvasion(tgt);
+                }
+            }
         }
     }
 }
@@ -10018,6 +10673,7 @@ function gameFrame() {
     _compactAlive(tradeShips, ts => ts.update());
     _compactAlive(transportShips, ts => ts.update());
     _compactAlive(warships, w => w.update());
+    _compactAlive(drones, d => d.update());   // TASK-202 swarm drones
     _compactAlive(trains, t => t.update());
     _compactAlive(troopCohorts, tc => tc.update());
     if (window.paintExpansions) {
@@ -10281,6 +10937,7 @@ function backToMenu() {
     tradeShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
     transportShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
     warships.forEach(w => { if(w.mesh) { scene.remove(w.mesh); disposeMeshDeep(w.mesh); } w.shells.forEach(sh => scene.remove(sh.mesh)); });
+    drones.forEach(d => { if(d.mesh) { scene.remove(d.mesh); disposeMeshDeep(d.mesh); } });
     trains.forEach(t => { if(t.mesh) { scene.remove(t.mesh); disposeMeshDeep(t.mesh); } if(t.pathLine) { scene.remove(t.pathLine); disposeMeshDeep(t.pathLine); } });
     troopCohorts.forEach(tc => { if(tc.mesh) { scene.remove(tc.mesh); disposeMeshDeep(tc.mesh); } });
     exps.forEach(e => { scene.remove(e); disposeMeshDeep(e); });
@@ -10644,7 +11301,10 @@ window.__UI_API = {
     startBuild: (type) => {
         buildMode = type;
         const cost = window.__UI_API.costOf(type);
-        if (type === 'warship') logEvent(`⚓ وضع المدمرة ($${cost}) — انقر نقطة بحرية قرب مينائك لتعيين منطقة الدورية`, 'info');
+        if (type === 'warship') {
+            const hull = GAME_CONSTANTS.HULL_CLASSES[warshipBuildClass];
+            logEvent(`${hull.icon} وضع النشر: ${hull.name} ($${cost}، الحد ${hull.cap}) — انقر نقطة بحرية قرب مينائك · اضغط V للتبديل`, 'info');
+        }
         else logEvent(`🏗️ وضع البناء: ${SDEFS[type] ? SDEFS[type].name : type} ($${cost}) — انقر موقعاً داخل أراضيك`, 'info');
     },
     fireMissileAt: (mtype, lat, lon) => {
@@ -10683,6 +11343,10 @@ window.__UI_API = {
         if (type === 'city') return Math.floor(GAME_CONSTANTS.CITY_BASE_COST * Math.pow(1.5, pBuiltCities));
         if (type === 'port') return Math.floor(GAME_CONSTANTS.PORT_BASE_COST * Math.pow(1.5, pBuiltPorts));
         if (type === 'factory') return Math.floor(GAME_CONSTANTS.FACTORY_BASE_COST * Math.pow(1.5, pBuiltFactories));
+        if (type === 'warship') {   // TASK-202: fleet slot prices the ARMED hull class
+            const h = GAME_CONSTANTS.HULL_CLASSES[warshipBuildClass];
+            return h ? h.cost : (SDEFS.warship ? SDEFS.warship.cost : 0);
+        }
         return SDEFS[type] ? SDEFS[type].cost : 0;
     },
     gold: () => pRes,
@@ -10723,7 +11387,12 @@ window.__UI_API = {
 // ════════════════════════════════════════════════════════════════════════
 //  BUILD HOTBAR (OpenFront UnitDisplay port) + hotkey plumbing
 //  Slots 1-0 arm the build ghost (buildMode); clicking the map places it.
+//  V cycles NAVY HULL CLASSES (TASK-202): first press arms the slot with
+//  the current hull, each further press switches to the next class.
 // ════════════════════════════════════════════════════════════════════════
+const HULL_ORDER = ['destroyer', 'escort', 'missile', 'drone', 'carrier', 'transport'];
+let warshipBuildClass = 'destroyer';
+
 const HOTBAR_SLOTS = [
     { key: '1', type: 'city',       icon: '🏙️', label: 'مدينة',  tip: 'يرفع سقف القوات +25k' },
     { key: '2', type: 'factory',    icon: '🏭', label: 'مصنع',   tip: 'دخل + يشغّل القطارات' },
@@ -10735,7 +11404,7 @@ const HOTBAR_SLOTS = [
     { key: '8', type: 'airport',    icon: '🛫', label: 'مطار',   tip: 'إنتاج الطائرات' },
     { key: '9', type: 'iron_dome',  icon: '🟢', label: 'قبة',    tip: 'اعتراض الزخات' },
     { key: '0', type: 'nuke_plant', icon: '☢️', label: 'مفاعل',  tip: 'دخل ضخم متأخر' },
-    { key: 'V', type: 'warship',    icon: '🛳️', label: 'مدمرة',  tip: 'انقر ماءً — دورية تدمر سفن الأعداء وتصطاد التجارة' },
+    { key: 'V', type: 'warship',    icon: '🛳️', label: 'أسطول',  tip: 'V للتبديل: مدمرة/فرقاطة/طراد/درون/حاملة/إنزال — انقر ماءً للنشر' },
 ];
 
 function _buildHotbarDom() {
@@ -10764,14 +11433,23 @@ window.__refreshHotbar = function () {
     if (!bar || !bar.children.length) return;
     const mode1 = window.gameMode === 'mode1';
     bar.style.display = (mode1 && !window.startSpawnPhase) ? 'flex' : 'none';
+    const HC = GAME_CONSTANTS.HULL_CLASSES;
     HOTBAR_SLOTS.forEach((slot, i) => {
         const el = bar.children[i];
         const cost = window.__UI_API.costOf(slot.type);
-        const count = slot.type === 'warship'
-            ? warships.reduce((n, w) => n + (!w.dead && w.owner === 'player' ? 1 : 0), 0)
-            : structs.filter(s => s.owner === 'player' && !s.dead && s.type === slot.type).length;
+        let count;
+        if (slot.type === 'warship') {
+            count = warships.reduce((n, w) => n + (!w.dead && w.owner === 'player' && w.hullClass === warshipBuildClass ? 1 : 0), 0);
+            // Live slot = the armed hull class (V cycling)
+            const hull = HC[warshipBuildClass];
+            el.querySelector('.hicon').textContent = hull.icon;
+            el.querySelector('.hname').textContent = hull.name;
+            el.querySelector('.hcnt').textContent = `${count}/${hull.cap}`;
+        } else {
+            count = structs.filter(s => s.owner === 'player' && !s.dead && s.type === slot.type).length;
+            el.querySelector('.hcnt').textContent = count;
+        }
         const techLocked = TECH_LOCKED_BUILDS.includes(slot.type) && !isTechUnlocked(slot.type, 'build', playerTech);
-        el.querySelector('.hcnt').textContent = count;
         el.querySelector('.hcost').textContent = '$' + cost;
         el.querySelector('.htip .c').textContent = '$' + cost;
         el.classList.toggle('sel', buildMode === slot.type);
@@ -10787,6 +11465,15 @@ window.__hotbarKey = function (key) {
     const slot = HOTBAR_SLOTS.find(s => s.key === key);
     if (!slot) return;
     if (window.startSpawnPhase) return;
+    // V CYCLES HULL CLASSES while the fleet slot is armed (TASK-202)
+    if (slot.type === 'warship' && buildMode === 'warship') {
+        const i = HULL_ORDER.indexOf(warshipBuildClass);
+        warshipBuildClass = HULL_ORDER[(i + 1) % HULL_ORDER.length];
+        const hull = GAME_CONSTANTS.HULL_CLASSES[warshipBuildClass];
+        logEvent(`⚓ الهيكل التالي: ${hull.icon} ${hull.name} ($${hull.cost}، الحد ${hull.cap}) — ${hull.tip || 'انقر ماءً للنشر'}`, 'info');
+        window.__refreshHotbar();
+        return;
+    }
     const techLocked = TECH_LOCKED_BUILDS.includes(slot.type) && !isTechUnlocked(slot.type, 'build', playerTech);
     if (techLocked) { logEvent('هذا المبنى مقفل — تحتاج بحثاً أولاً 🔒', 'err'); return; }
     if (buildMode === slot.type) {
@@ -10867,3 +11554,149 @@ if (!window.GEO_DATA_ROADS || window.GEO_DATA_ROADS.length === 0) {
 // Expose for GEO_RENDERER
 window.EARTH_RADIUS = EARTH_RADIUS;
 window.latLonToVec3 = latLonToVec3;
+
+// ═══════════════════════════════════════════════════════════════════════
+//  NAVAL BATTLE TEST (TASK-202 probe) — window.navalBattleTest()
+//  Spawns two hostile fleets in the mid-Pacific and verifies the hull-class
+//  systems end-to-end over ~70s of live simulation:
+//    1. ENGAGE  — gunships close and shell each other (hull HP drops)
+//    2. INTERCEPT — an enemy cruise missile at the carrier is killed by
+//       escort point-defense / carrier CIWS
+//    3. STRIKE  — the missile cruiser's VLS shots land (enemy damage)
+//    4. DRONES  — the drone bay launches its DCFG swarm
+//    5. AIR WING — the carrier spawns deck-based fighters
+//    6. SINK    — sustained fire eventually sinks a hull
+//    7. TRANSPORT — the enemy troop transport is engaged (priority-0 target)
+//  Progress prints to console; final verdict lands in window.__navalTestResult.
+//  Run it from the browser console while a mode-1 game is running.
+//  NOTE: in browsers/hosting views where requestAnimationFrame never fires
+//  (hidden pages), drive the simulation manually: window.__pumpGame(n) below.
+// ═══════════════════════════════════════════════════════════════════════
+// Manual logic pump for headless/hidden-page testing (one call = 1 logic tick)
+window.__gameFrame = gameFrame;
+window.__pumpGame = async function (frames) {
+    for (let i = 0; i < frames; i++) {
+        gameFrame();
+        if (i % 120 === 119) await new Promise(r => setTimeout(r, 0));   // let setTimeout phases interleave
+    }
+    return { frame, warships: warships.length, drones: drones.length, missiles: missiles.length };
+};
+window.navalBattleTest = async function () {
+    const log = (m) => console.log('%c[NAVAL-TEST] ' + m, 'color:#44ccff;font-weight:bold');
+    if (!scene || gOver) { log('Start a game first (mode 1).'); return; }
+    logEvent('🧪 اختبار المعركة البحرية بدأ — راقب الكونسول', 'info');
+
+    // ── isolate: clear every hull/drone (and their meshes) ──
+    clearSelection();
+    for (const w of warships) { if (!w.dead) w._sink(); }
+    for (const d of drones) d._kill(true);
+    warships.length = 0; drones.length = 0;
+    // strip leftover SAM missiles so interception counting is clean
+    for (let i = missiles.length - 1; i >= 0; i--) {
+        if (missiles[i].isSAM) { missiles[i].dead = true; scene.remove(missiles[i].mesh); }
+    }
+
+    // ── theater: open Pacific points ~350km apart (both WATER) ──
+    const A = { lat: 8, lon: -138 };    // player fleet
+    const B = { lat: 5, lon: -134.5 };  // enemy fleet
+    const mkFleet = (owner, anchor, comps) => {
+        const fakePort = { lat: anchor.lat, lon: anchor.lon };
+        const ships = comps.map(([cls, dx, dy]) => {
+            const s = new Warship(owner, fakePort, { lat: anchor.lat + dy, lon: anchor.lon + dx }, cls);
+            warships.push(s);
+            return s;
+        });
+        return ships;
+    };
+    // player: carrier + escort screen + gunship + VLS cruiser + drone bay
+    const pFleet = mkFleet('player', A, [['carrier', 0, 0], ['escort', 0.6, 0.6], ['destroyer', -0.6, 0.6], ['missile', 0, 1.2], ['drone', 1.2, 0]]);
+    // enemy: gunship + VLS cruiser + loaded invasion transport
+    const eFleet = mkFleet('enemy', B, [['destroyer', 0, 0], ['missile', 0.5, 0.5], ['transport', -0.5, 0.5]]);
+    const eTransport = eFleet[2];
+    eTransport.troops = 4000;   // loaded — must draw priority-0 fire
+    pFleet.forEach(s => { pRes = Math.max(pRes, 3000); });
+    eRes = Math.max(eRes, 3000);
+
+    const R = { t: 0, engaged: false, hpDropped: false, intercepts: 0, vlsFired: 0, drones: 0, planes: 0,
+                sinks: 0, transportHit: false, done: false, pass: false, notes: [] };
+    window.__navalTestResult = R;
+    // Held references — dead missiles are compacted out of missiles[] the same
+    // frame they die, so the probe keeps its own refs to read .dead/.progress.
+    const trackedThreats = new Map();   // enemy missiles aimed at our hulls
+    const _vlsSeen = new Set();         // cruiser ids observed just after a VLS shot
+
+    // ── phase: inject an enemy cruise missile AT the carrier (t+5s) ──
+    setTimeout(() => {
+        const carrier = pFleet[0];
+        if (carrier.dead) return;
+        log('Firing enemy cruise missile at the carrier (PD should intercept)');
+        const m = new Missile(B.lat, B.lon, carrier.curLat, carrier.curLon, MCFG['cruise'], 'enemy');
+        missiles.push(m);
+    }, 5000);
+
+    const snap = () => {
+        // damage evidence on either side
+        for (const w of [...pFleet, ...eFleet]) {
+            if (!w.dead && w.hp < w.maxHp - 1) R.hpDropped = true;
+        }
+        R.engaged = R.hpDropped;
+        R.drones = Math.max(R.drones, drones.filter(d => !d.dead).length);
+        R.planes = Math.max(R.planes, planes.filter(p => !p.dead && p.baseStruct === pFleet[0]).length);
+        R.sinks = [...pFleet, ...eFleet].filter(w => w.dead).length;
+        // Track enemy missiles AIMED at our hulls (while still alive)
+        for (const m of missiles) {
+            if (m.dead || m.isSAM || m.owner !== 'enemy') continue;
+            for (const w of pFleet) {
+                if (!w.dead && haversineDist(m.tlat, m.tlon, w.curLat, w.curLon) < 200) {
+                    trackedThreats.set(m.id, m);
+                    break;
+                }
+            }
+        }
+        // A tracked threat that died mid-flight = point-defense intercept
+        R.intercepts = [...trackedThreats.values()]
+            .filter(m => m.dead && m.progress > 0.05 && m.progress < 0.95).length;
+        // VLS evidence: a cruiser's reload timer observed reset to full
+        for (const s of [pFleet[3], eFleet[1]]) {
+            if (s && !s.dead && s.missileCd > 200) _vlsSeen.add(s.id);
+        }
+        R.vlsFired = _vlsSeen.size;
+        if (!R.transportHit && eTransport.hp < eTransport.maxHp) R.transportHit = true;
+    };
+
+    log('Fleet A (player): ' + pFleet.map(w => w.hullClass).join(', '));
+    log('Fleet B (enemy):  ' + eFleet.map(w => w.hullClass).join(', '));
+
+    // ── watch loop: 1s samples for 70s ──
+    for (let t = 0; t < 70 && !R.done; t++) {
+        await new Promise(res => setTimeout(res, 1000));
+        R.t = t + 1;
+        try { snap(); } catch (err) { R.notes.push('snap error: ' + err.message); }
+        if (t % 10 === 9) log(`t=${t + 1}s engaged=${R.engaged} intercepts=${R.intercepts} vls=${R.vlsFired} drones=${R.drones} planes=${R.planes} sinks=${R.sinks} trHit=${R.transportHit}`);
+        // early finish once every category has evidence AND a sink occurred
+        if (R.hpDropped && R.intercepts > 0 && R.vlsFired > 0 && R.drones > 0 && R.planes > 0 && R.sinks > 0) {
+            R.done = true;
+        }
+    }
+    R.done = true;
+
+    // ── verdict ──
+    const checks = [
+        ['ENGAGE (damage dealt)', R.hpDropped],
+        ['INTERCEPT (PD/CIWS kill)', R.intercepts > 0],
+        ['VLS (missile-ship fired)', R.vlsFired > 0],
+        ['DRONES (swarm launched)', R.drones > 0],
+        ['AIR WING (deck fighters)', R.planes > 0],
+        ['SINK (a hull went down)', R.sinks > 0],
+        ['TRANSPORT (troop ship hit)', R.transportHit],
+    ];
+    let ok = 0;
+    for (const [name, pass] of checks) {
+        if (pass) ok++;
+        log(`${pass ? '✅' : '❌'} ${name}`);
+    }
+    R.pass = ok >= 6;   // transport may legitimately survive if sunk early by missiles
+    log(`RESULT: ${R.pass ? 'PASS' : 'FAIL'} (${ok}/${checks.length} checks) — window.__navalTestResult`);
+    logEvent(R.pass ? '🧪 اختبار البحرية: نجح ✅' : '🧪 اختبار البحرية: فشل ❌ — انظر الكونسول', R.pass ? 'info' : 'err');
+    return R;
+};

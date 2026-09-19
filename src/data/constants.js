@@ -172,6 +172,37 @@ export const GAME_CONSTANTS = {
   WARSHIP_PATROL_RADIUS_KM: 350,    // wander radius around the clicked patrol point
   WARSHIP_HEAL_RATE: 4,             // HP/sec repaired near own port
   WARSHIP_HEAL_RANGE_KM: 400,       // 'near own port' distance
+  // ── Navy hull classes (TASK-202 — the destroyer generalizes into a fleet).
+  //    destroyer = legacy WARSHIP_* stats; the rest branch on these fields:
+  //    shellDmg>0 → gun platform | missileReload → VLS striker | airWing →
+  //    carrier | swarmCap → drone bay | invadePct → troop transport.
+  HULL_CLASSES: {
+    destroyer: { key:'destroyer', name:'مدمرة',        icon:'🛳️', cost:800,  cap:4, hp:1000, speed:140, scale:1.5,
+                 shellDmg:250, shellRange:300, fireRate:120, targetRange:700 },
+    escort:    { key:'escort',    name:'فرقاطة مرافقة', icon:'🚤', cost:650,  cap:4, hp:750,  speed:150, scale:1.15,
+                 shellDmg:120, shellRange:250, fireRate:180, targetRange:650, pdRange:170, pdCd:95,
+                 tip:'مرافقة — تقترن بسفينة القيادة وتعترض الصواريخ المعادية' },
+    missile:   { key:'missile',   name:'طراد صواريخ',  icon:'🚀', cost:1600, cap:2, hp:1100, speed:120, scale:1.5,
+                 shellDmg:0, targetRange:950, missileReload:240,
+                 tip:'منصة إطلاق متحركة — يطلق الصاروخ المختار (R) على الأهداف البحرية' },
+    drone:     { key:'drone',     name:'حاملة درون',   icon:'🛩️', cost:1200, cap:2, hp:950,  speed:125, scale:1.4,
+                 shellDmg:0, targetRange:0, swarmCap:8, droneCd:200,
+                 tip:'تطلق أسراب درون (نانو/سرب/انتحارية) ترافق الأسطول وتنقض على الأعداء' },
+    carrier:   { key:'carrier',   name:'حاملة طائرات', icon:'🛫', cost:2600, cap:1, hp:1600, speed:110, scale:2.1,
+                 shellDmg:0, targetRange:0, airWing:5, planeCd:420, ciwsRange:65, ciwsCd:80, standoffKm:420,
+                 tip:'سفينة القيادة — سرب جوي خاص + CIWS دفاعي + تبقى بعيداً عن المدفعية' },
+    transport: { key:'transport', name:'ناقلة إنزال',  icon:'🚢', cost:500,  cap:3, hp:700,  speed:100, scale:1.7,
+                 shellDmg:0, targetRange:0, invadePct:0.4,
+                 tip:'تحمل قواتاً — حددها وانقر ساحل العدو لإنزالها (تُعاد تعبئتها في مينائك)' },
+  },
+  // ── Drone swarms (TASK-202 — finally reads the DCFG configs) ──
+  DRONE_ENGAGE_RANGE_KM: 750,       // drones aggro enemy hulls/drones inside this radius of the bay
+  DRONE_HIT_RANGE_KM: 20,           // kamikaze detonation distance
+  DRONE_ALT: 32,                    // flight altitude (world units above the sphere)
+  DRONE_SPEED_MUL: 0.11,            // DCFG.spd × this = km/frame
+  // ── Fleet behavior ──
+  ESCORT_LEASH_KM: 240,             // escorts shadow their capital inside this radius
+  NAVAL_MISSILE_DMG_MUL: 2.0,       // missile blasts hit ships at ×2 (anti-ship precision)
   // ── Win conditions (mode 1) ──
   WIN_LAND_PERCENT: 0.8,            // OpenFront FFA: own 80% of the land → victory
   WIN_TIME_LIMIT_S: 10200,          // 170-minute hard limit → draw (OpenFront)
