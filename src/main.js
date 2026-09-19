@@ -3329,6 +3329,19 @@ function getPixelOwner(lat, lon) {
 window.getPixelOwner = getPixelOwner;
 // Debug probe for the FFA bot system (console-driven testing)
 window.__ffaProbe = {
+    // TASK-406 follow-up: water-mask probes — ownerAt passthrough + ASCII scan
+    // (from→to, N segments; '#'=land '~'=water). tankRiverProbe companion.
+    ownerAt: (lat, lon) => conquestGrid ? conquestGrid.ownerAt(lat, lon) : 'no-grid',
+    maskScan: (flat, flon, tlat, tlon, segs = 24) => {
+        if (!conquestGrid) return 'no-grid';
+        let out = '';
+        for (let i = 0; i <= segs; i++) {
+            const lat = flat + (tlat - flat) * i / segs;
+            const lon = flon + (tlon - flon) * i / segs;
+            out += conquestGrid.ownerAt(lat, lon) === 'water' ? '~' : '#';
+        }
+        return out;
+    },
     // camera/controls state (module-scoped camera+controls not on window)
     cam: () => camera && controls ? {
         dist: camera.position.length(),
@@ -3787,6 +3800,50 @@ window.__ffaProbe = {
     }),
 };
 
+// ── TASK-406 follow-up (over-watered coasts) ──
+// Wait (bounded) for the country polygons to finish loading — the geo-gated
+// water dilation needs them to tell interior water (rivers, inside a country)
+// from ocean (outside them). The spawn phase already gates on the same data,
+// so this wait is invisible to the player flow.
+function _awaitGeoJson(ms = 10000) {
+    return new Promise(resolve => {
+        const t0 = performance.now();
+        const poll = () => {
+            const f = (window.GEOJSON_DATA && window.GEOJSON_DATA.features) || [];
+            if (f.length || performance.now() - t0 > ms) return resolve(f);
+            setTimeout(poll, 250);
+        };
+        poll();
+    });
+}
+
+// Rasterize the GeoJSON country polygons at full grid res into a 0/1
+// Uint8Array (1 = cell center inside a polygon). Same projection + sampling
+// as the GeoJSON fallback mask path (proven at 7200×3600). The conquest
+// dilation uses it so rivers thicken but ocean coasts/straits keep their true
+// width — the blanket dilation had eroded every coast ~5.5km and pushed the
+// major straits (Dover, Gibraltar) past the armor wade threshold.
+function _buildGeoLandRef(feats) {
+    if (!feats || feats.length === 0) return null;
+    try {
+        const W = CONQUEST_CFG.GRID_W, H = CONQUEST_CFG.GRID_H;
+        const mc = document.createElement('canvas');
+        mc.width = W; mc.height = H;
+        const mctx = mc.getContext('2d', { willReadFrequently: true });
+        const mproj = d3.geoEquirectangular().scale(W / (2 * Math.PI)).translate([W / 2, H / 2]);
+        const mpath = d3.geoPath(mproj, mctx);
+        mctx.fillStyle = '#ffffff';
+        for (const f of feats) { mctx.beginPath(); mpath(f); mctx.fill(); }
+        const d = mctx.getImageData(0, 0, W, H).data;
+        const ref = new Uint8Array(W * H);
+        for (let i = 0, p = 0; i < ref.length; i++, p += 4) ref[i] = d[p + 3] > 40 ? 1 : 0;
+        return ref;
+    } catch (e) {
+        console.warn('[CONQUEST] geoLand ref build failed:', e.message);
+        return null;
+    }
+}
+
 // Build the conquest grid + land mask from GeoJSON country polygons.
 // Rasterize at 720×360 (reliable canvas size), sample up to the full grid,
 // then verify with a few probes. Fall back to d3.geoContains if needed.
@@ -3813,8 +3870,18 @@ async function initConquestGrid() {
                 const tb = await ensureTerrainBuf();
                 conquestGrid.loadTerrainFromBin(tb.buf, tb.w, tb.h);
                 conquestGrid.buildLandMaskFromTerrain();
-                // Option 1: dilate water so rivers/straits (1-cell-wide in the
-                // 4108px source) become navigable. Thicken by N rings.
+                // TASK-406 follow-up (over-watered coasts): rivers/lakes sit
+                // INSIDE country polygons while ocean/straits lie outside
+                // them. Give the dilation a GeoJSON land reference so it
+                // thickens only interior water — coastlines and straits
+                // (Dover, Gibraltar, Hormuz) keep their true width and stay
+                // wadeable for armor. Blanket fallback when GeoJSON is absent.
+                const geoFeats = (feats.length ? feats : await _awaitGeoJson(10000));
+                const geoLand = _buildGeoLandRef(geoFeats);
+                if (geoLand) conquestGrid.setGeoLandRef(geoLand);
+                // Option 1: dilate water so thin rivers (1-cell-wide in the
+                // 4108px source) read + navigate at grid res. Thicken by N
+                // rings (rivers only when the geoLand ref is set — see above).
                 conquestGrid.dilateWater(
                     CONQUEST_CFG.WATER_DILATION_RINGS,
                     CONQUEST_CFG.WATER_DILATION_MIN_NEIGHBORS
@@ -3823,7 +3890,8 @@ async function initConquestGrid() {
                 usedTerrain = true;
                 console.log('[CONQUEST] terrain binary loaded:',
                     conquestGrid.countCells('neutral'), 'land cells',
-                    '| water dilated', CONQUEST_CFG.WATER_DILATION_RINGS, 'ring(s)');
+                    '| water dilated', CONQUEST_CFG.WATER_DILATION_RINGS,
+                    'ring(s)', geoLand ? '(rivers-only, geo-gated)' : '(blanket — no GeoJSON)');
             } catch (err) {
                 console.warn('[CONQUEST] terrain binary unavailable, using GeoJSON mask:', err.message);
             }

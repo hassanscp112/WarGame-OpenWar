@@ -336,6 +336,12 @@ export class ConquestGrid {
     this._ovRect = undefined;
     this._lastFlush = { full: false, rect: null };
 
+    // TASK-406 follow-up (over-watered coasts): GeoJSON inside-polygon ref
+    // (1 = cell center is inside a country polygon). When set, dilateWater
+    // only lets INTERIOR water (rivers/lakes/canals) push banks outward —
+    // ocean/strait water never dilates, so coastlines keep their true width.
+    this._geoLand = null;
+
     // TASK-406: frontline heat — cells involved in recent ownership flips
     // (the active frontline glows; ages out after HEAT_AGE_MS).
     this._heat = new Map();               // cell → performance.now() stamp
@@ -583,18 +589,27 @@ export class ConquestGrid {
     this._dirty = true;
   }
 
-  // ── Water dilation: thicken rivers/straits/lakes so they are navigable. ──
+  // ── Water dilation: thicken rivers/lakes so they read + navigate at grid res. ──
   // Morphological dilation of water cells. For each ring iteration, a LAND cell
   // becomes WATER if it has ≥ minNeighbors water neighbours (8-connected).
   //   rings=0           → no change
-  //   rings=1, min=1    → +1 cell around every water feature (rivers → 3 wide)
+  //   rings=1, min=1    → +1 cell around every eligible water feature (rivers → 3 wide)
   //   rings=1, min=2    → only cells touching water on 2+ sides (gentler coasts)
+  // TASK-406 follow-up (over-watered coasts): when a GeoJSON land reference is
+  // set (setGeoLandRef), only water cells INSIDE country polygons (rivers,
+  // lakes, canals — geo 1) push their banks outward. Ocean/sea cells (geo 0)
+  // never dilate, so coastlines and straits keep their true width — the old
+  // blanket dilation eroded EVERY coast by one cell (~5.5km) and pushed the
+  // major straits (Dover 34km, Gibraltar 14km) past the armor wade threshold
+  // (GAME_CONSTANTS.TANK_RIVER_PROBE_KM = 48km), making them un-crossable.
+  // Without a reference the behaviour is unchanged (blanket dilation).
   // Longitude wraps; latitude clamps at poles. Recounts neutral cells after.
   dilateWater(rings = 1, minNeighbors = 1) {
     if (rings <= 0) return;
     const cfg = this.cfg;
     const W = cfg.GRID_W, H = cfg.GRID_H, WATER = cfg.WATER, NEUTRAL = cfg.NEUTRAL;
     const owner = this.owner;
+    const geo = this._geoLand || null;     // null → legacy blanket dilation
     for (let ring = 0; ring < rings; ring++) {
       const snap = owner.slice();          // snapshot — avoid in-place cascade
       for (let row = 0; row < H; row++) {
@@ -609,7 +624,9 @@ export class ConquestGrid {
             for (let dx = -1; dx <= 1; dx++) {
               if (dx === 0 && dy === 0) continue;
               const nc = (((col + dx) % W) + W) % W;   // longitude wraps
-              if (snap[nr * W + nc] === WATER) wn++;
+              const ncell = nr * W + nc;
+              // geo-gated: interior water (rivers) counts, ocean does not
+              if (snap[ncell] === WATER && (!geo || geo[ncell] === 1)) wn++;
             }
           }
           if (wn >= minNeighbors) owner[cell] = WATER;  // convert land → water
@@ -621,6 +638,13 @@ export class ConquestGrid {
     for (let i = 0; i < owner.length; i++) if (owner[i] === NEUTRAL) n++;
     this._counts.neutral = n;
     this._dirty = true;
+  }
+
+  // ── TASK-406 follow-up: GeoJSON inside-polygon reference for dilateWater. ──
+  // u8: Uint8Array(W*H), 1 = cell center inside a country polygon. Passing
+  // null/undefined clears it (dilation returns to blanket mode).
+  setGeoLandRef(u8) {
+    this._geoLand = (u8 && u8.length === this.cfg.GRID_W * this.cfg.GRID_H) ? u8 : null;
   }
 
   // ── Paint the biome base canvas tile-by-tile from terrainByte[] via ofTerrainColor(). ──
