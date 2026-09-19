@@ -6633,14 +6633,21 @@ class Structure {
             // RANGE = GROUND distance: ballistic missiles fly high arcs (up to
             // 40% of range in altitude) — 3D distance only brings them "in
             // range" during the final descent, far too late to intercept.
+            // TASK-403 (audit #18): the radar chain is only consulted inside
+            // the CHAIN BAND (base, base×mult] — inside base range we engage
+            // with no radar check at all, beyond the band no lock is possible
+            // so the chain (and its per-source haversines) is never touched.
             let trg = null, bestProg = -1;
+            const chainMax = this.type === 'sam' ? this.fireRange * GAME_CONSTANTS.RADAR_CHAIN_MULT : this.fireRange;
             for (const m of missiles) {
                 if (m.dead || m.owner === this.owner) continue;
                 if (m.cfg.type === 'stealth' || m.cfg.type === 'hyper') continue;
-                // TASK-204 radar chain: a friendly radar (or recon drone)
-                // covering the missile gives SAMs early lock (×2.2 range).
-                const effR = this.type === 'sam' ? _samEffRange(this, m) : this.fireRange;
-                if (haversineDist(this.lat, this.lon, m.lat, m.lon) >= effR) continue;
+                const d = haversineDist(this.lat, this.lon, m.lat, m.lon);
+                if (d >= this.fireRange) {
+                    if (d >= chainMax) continue;                       // out of even the chained envelope
+                    if (this.type !== 'sam') continue;                 // only SAMs get the chain
+                    if (!_radarCovers(m.lat, m.lon, this.owner)) continue;   // band missile, no radar → no lock
+                }
                 if (m.progress > bestProg) { bestProg = m.progress; trg = m; }
             }
             if(trg) { fireSAM(this, trg); this.reload = this.maxReload; }
@@ -7883,23 +7890,60 @@ function _updateCraters() {
     craterDecals.length = w;
 }
 
-// ── TASK-204 RADAR CHAIN ──
+// ── TASK-204 RADAR CHAIN — TASK-403 perf rewrite (audit #18, the worst
+// offender: was O(SAMs × missiles × (structs+drones)) ≈ 1.95M haversines/s).
 // A friendly radar (or recon drone) covering the incoming missile's position
 // gives SAM batteries early lock: fireRange × RADAR_CHAIN_MULT. EMP'd (or
 // jammed) radars are dark and contribute nothing.
-function _radarCovers(lat, lon, owner) {
-    for (const s of structs) {
-        if (s.dead || s.owner !== owner || (s.empT || 0) > 0) continue;
-        const rr = s.radarRange || 0;
-        if (rr && haversineDist(lat, lon, s.lat, s.lon) < rr) return true;
+// TWO FIXES:
+//  1. The radar SOURCE LIST is cached per owner (30-frame TTL + instant
+//     invalidation whenever the struct/drone arrays change size). Sources
+//     keep LIVE object refs — EMP/death still blinds the chain the same
+//     frame; only the array ITERATION is cached, never the state.
+//  2. The chain is only consulted inside the CHAIN BAND (base, base×mult]
+//     — see Structure.update: missiles inside base range engage with NO
+//     radar check at all, missiles beyond the band are skipped before the
+//     chain is ever touched.
+const _radarSrcCache = { frame: -1, nStructs: -1, nDrones: -1, byOwner: new Map() };
+function _radarSources(owner) {
+    if (frame - _radarSrcCache.frame >= 30
+        || structs.length !== _radarSrcCache.nStructs
+        || drones.length !== _radarSrcCache.nDrones) {
+        _radarSrcCache.frame = frame;
+        _radarSrcCache.nStructs = structs.length;
+        _radarSrcCache.nDrones = drones.length;
+        _radarSrcCache.byOwner.clear();
     }
-    for (const d of drones) {
-        if (d.dead || d.owner !== owner || d.cfg.type !== 'recon') continue;
-        if (haversineDist(lat, lon, d.lat, d.lon) < GAME_CONSTANTS.DRONE_RECON_COVER) return true;
+    let list = _radarSrcCache.byOwner.get(owner);
+    if (!list) {
+        list = [];
+        for (const s of structs) {
+            if (s.dead || s.owner !== owner) continue;
+            const rr = s.radarRange || 0;
+            if (rr) list.push({ src: s, rr });
+        }
+        for (const d of drones) {
+            if (d.dead || d.owner !== owner || d.cfg.type !== 'recon') continue;
+            list.push({ src: d, rr: GAME_CONSTANTS.DRONE_RECON_COVER });   // moves: lat/lon read LIVE below
+        }
+        _radarSrcCache.byOwner.set(owner, list);
+    }
+    return list;
+}
+function _radarCovers(lat, lon, owner) {
+    const srcs = _radarSources(owner);
+    for (let i = 0; i < srcs.length; i++) {
+        const r = srcs[i], s = r.src;
+        // LIVE state: cached iteration, never cached state. (owner check
+        // included so a CAPTURED radar flips sides the same frame.)
+        if (s.dead || s.owner !== owner || (s.empT || 0) > 0) continue;
+        if (haversineDist(lat, lon, s.lat, s.lon) < r.rr) return true;
     }
     return false;
 }
 function _samEffRange(sam, m) {
+    // Effective envelope vs ONE missile (probes/compat) — the hot path no
+    // longer calls this per missile; Structure.update gates by band instead.
     let r = sam.fireRange;
     if ((sam.empT || 0) <= 0 && _radarCovers(m.lat, m.lon, sam.owner)) r *= GAME_CONSTANTS.RADAR_CHAIN_MULT;
     return r;
@@ -8057,8 +8101,18 @@ class Drone {
     }
     // Default target picker hook — override Drone.ACQUIRE to specialize
     // (e.g. a navy carrier hunting only warships). Returns candidate list.
+    // TASK-403 (audit #21): the list is CACHED per owner (30f TTL + length
+    // signature). Liveness is NOT cached — _posOf() filters dead/moved
+    // entities live on every read, so semantics are identical, only the
+    // array churn is gone (was: a fresh array of every enemy entity per
+    // drone per scan).
     static ACQUIRE(owner) {
-        const out = [];
+        const c = Drone._candCache;
+        const sig = structs.length + '/' + troopCohorts.length + '/' + warships.length + '/' + tanks.length;
+        if (c.frame < frame - 30 || c.sig !== sig) { c.frame = frame; c.sig = sig; c.byOwner.clear(); }
+        let out = c.byOwner.get(owner);
+        if (out) return out;
+        out = [];
         for (const s of structs) {
             if (!s.dead && s.owner !== owner && s.owner !== 'neutral') out.push({ kind: 'struct', obj: s });
         }
@@ -8071,6 +8125,7 @@ class Drone {
         for (const t of tanks) {   // TASK-302: Reapers/kamikazes hunt armor columns
             if (!t.dead && t.owner !== owner) out.push({ kind: 'tank', obj: t });
         }
+        c.byOwner.set(owner, out);
         return out;
     }
     _acquire() {
@@ -8138,7 +8193,7 @@ class Drone {
         } else {
             // One-way strikers: beeline and detonate on impact
             this._nudgeToward(t.lat, t.lon, this.speed);
-            if (d < 12) { this._detonate(); return; }
+            if (d < GAME_CONSTANTS.DRONE_HIT_RANGE_KM) { this._detonate(); return; }   // TASK-403: dead const wired
         }
     }
     _strike(dmg) {
@@ -8252,6 +8307,8 @@ class Drone {
         for (const r of this._rotors) r.rotation.y += 0.55;
     }
 }
+// TASK-403 (audit #21): cache store backing Drone.ACQUIRE (see the method).
+Drone._candCache = { frame: -1, sig: '', byOwner: new Map() };
 
 // Generic launcher — THE entry point for other platforms (navy carriers):
 // launchDrone(owner, 'kamikaze', {lat, lon}, {homeLat, homeLon}) → [Drone]
@@ -13212,8 +13269,10 @@ function gameFrame() {
     }
     
     // In-place compaction (swap-and-pop) — avoids per-frame array allocation/GC
+    // (TASK-403 drive-by: the duplicate `_compactAlive(drones, ...)` that used
+    //  to sit here was removed — drones were updated TWICE per tick, doubling
+    //  their speed/fuel burn. The single update lives with the mobile units below.)
     _compactAlive(missiles, m => m.update());
-    _compactAlive(drones, d => d.update());          // TASK-204 drone system
     _updateTransients();                             // tracers / debris / EMP rings
     _updateCraters();                                // fading impact scars
     for (let p of planes) p.update();

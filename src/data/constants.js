@@ -53,19 +53,22 @@ export const MCFG={
  * samEvade (was DEAD) is now the evade stat: ONE flare/chaff dodge vs the
  * FIRST interceptor of each flight (consumed on roll, win or lose). */
 
+/* ── MTAGS (TASK-403): short tooltip tags per warhead, synced to the
+ * TASK-204/403 balance numbers. WIRED into the missile-mode HUD chips +
+ * build-menu buttons (title attr). 4 tags each, Arabic. ── */
 export const MTAGS={
- scud:       ['دقة ضعيفة جداً 1-3كم','مسار باليستي','رخيص وسريع الإطلاق','راداره بسهولة يكشفه'],
- ballistic:  ['دقة متوسطة 50م','مسار عالٍ يصعب اعتراضه','ضرر انفجار متوسط','أسرع من السكود'],
- cruise:     ['دقة عالية 10م','يحلق على 50م من الأرض','يراوغ الرادار','يتحاشى 28% من SAM'],
- cluster:    ['تغطية 200م واسعة','10 قنابل فرعية','فعّال ضد المناطق','دقة منخفضة'],
- emp:        ['يشل الإلكترونيات 350م','لا ضرر مادي تقريباً','يعطل SAM والرادار','يجمّد الطائرات'],
- tomahawk:   ['أدق كروز 10م','مسار منخفض جداً 35م','30% يراوغ SAM','دقيق جداً'],
- thermobaric:['موجة ضغط 185م','يضرب بالتساوي','فعّال داخل المباني','لا ضرر مدرع'],
- stealth_m:  ['RCS منخفض جداً','62% يراوغ SAM','مسار 35م من الأرض','صعب الاكتشاف'],
- bunker_bust:['يخترق 6م من الباطون','ضرر مضاعف ×2.2','سرعة عالية 9.5','حجم اختراق صغير'],
- hyper:      ['22 وحدة سرعة Mach 6+','88% يراوغ كل الدفاعات','بلازما + موجة صدمة','مستحيل الاعتراض'],
- icbm:       ['مدى عابر قاري','ضرر 500 + شظايا','55% يتخطى الدفاعات','مسار 650 عالٍ جداً'],
- nuke_tac:   ['انفجار نووي 360م','EMP 500م + دمار شامل','72% يراوغ الدفاعات','يدمر كل شيء في النطاق'],
+ scud:       ['رخيص $80 — أرخص ضربة','رعب: يصدم إعادة التعبئة','دقة ضعيفة ±16كم','يكشفه الرادار بسهولة'],
+ ballistic:  ['حصان العمل $130/110','أفضل ضرر لكل دولار','دقة متوسطة','مسار باليستي عالٍ'],
+ cruise:     ['دقة عالية','يحلق على 50م','يتفادى 28% من SAM','دقيق ضد الأهداف المفردة'],
+ cluster:    ['8 قنابل فرعية','يفتّت المشاة ×3.2','تغطية 200م واسعة','دقة منخفضة — للمجموعات'],
+ emp:        ['يشل الإلكترونيات 10ث','يعطل SAM والرادار والسلسلة','ضرر مادي شبه معدوم','افتح به هجومك'],
+ tomahawk:   ['أدق صاروخ (دقة 52%)','مسار منخفض جداً 35م','يتفادى 35% من الاعتراض','دقيق لكنه غالٍ'],
+ thermobaric:['موجة ضغط 280 هائلة','أعمق تخريب للأرض ×1.8','يحرق المشاة ×1.5','بطيء — قابل للاعتراض'],
+ stealth_m:  ['غير مرئي للرادار','يتفادى 62% من الاعتراض','مسار 35م من الأرض','سلاح اختراق الدفاعات'],
+ bunker_bust:['×2.6 ضد التحصينات','يخترق 6م باطون','ضرر 420 هائل','سلاح كسر الحصار'],
+ hyper:      ['ماخ 6+ — لا يُعترض','يتفادى 88% من الدفاعات','غلاف بلازما متوهج','أغنى سرعة بأغلى سعر'],
+ icbm:       ['MIRV: 3 رؤوس ×55%','مدى عابر للقارات','انتشار واسع للرؤوس','يتفادى 55% من الدفاعات'],
+ nuke_tac:   ['انفجار نووي 750','EMP عميق 7 ثوان','يتفادى 72% من الدفاعات','نهاية اللعبة — غالٍ جداً'],
 };
 
 export const PCFG={
@@ -145,6 +148,17 @@ export const GAME_CONSTANTS = {
   RADAR_CHAIN_MULT: 2.2,
   // Recon drones act as mobile radar with this coverage radius (km).
   DRONE_RECON_COVER: 400,
+  // ── TASK-403: Missiles deep pass ──
+  // Radar-ECM station: enemy missiles entering this radius get their guidance
+  // degraded ONCE (mid-course re-scatter). Hyper sprinters are exempt.
+  ECM_SCATTER_MUL: 3.0,
+  // Launcher magazine: launches per loader, then this many frames of bulk
+  // re-arm ("reload-while-empty") before the magazine is full again.
+  LAUNCHER_MAG: 6,
+  LAUNCHER_REARM_FRAMES: 600,      // 10s @60fps
+  // AA defenses detect DRONES at this range regardless of gun range (they
+  // are big slow radar targets — detection is easy, hitting is the chance).
+  AA_DRONE_DETECT: 160,
   // Jammer drones disable enemy defense scans within this radius (km).
   DRONE_JAM_RADIUS: 300,
   // Max active drones per owner.
@@ -297,9 +311,10 @@ export const GAME_CONSTANTS = {
   },
   // ── Drone swarms (TASK-202 fleet params — the Drone class itself is TASK-204's) ──
   DRONE_ENGAGE_RANGE_KM: 750,       // drones aggro enemy hulls/drones inside this radius of the bay
-  DRONE_HIT_RANGE_KM: 20,           // kamikaze detonation distance
+  // TASK-403: was a DEAD constant while the class hardcoded 12 — now WIRED
+  // (kamikaze detonation distance, km).
+  DRONE_HIT_RANGE_KM: 12,           // kamikaze detonation distance
   DRONE_ALT: 32,                    // flight altitude (world units above the sphere)
-  DRONE_SPEED_MUL: 0.11,            // DCFG.spd × this = km/frame
   // ── Fleet behavior ──
   ESCORT_LEASH_KM: 240,             // escorts shadow their capital inside this radius
   NAVAL_MISSILE_DMG_MUL: 2.0,       // missile blasts hit ships at ×2 (anti-ship precision)
@@ -454,8 +469,12 @@ export const WORLD_CITIES = [
 ];
 
 export const SDEFS={
- launcher:  {name:'منصة إطلاق',  w:28,h:26,hp:130,cost:180,  reload:250},
+ // TASK-403: mag = launcher magazine (launches before a bulk re-arm cycle)
+ launcher:  {name:'منصة إطلاق',  w:28,h:26,hp:130,cost:180,  reload:250, mag:6},
  radar:     {name:'رادار',        w:18,h:42,hp:70, cost:260,  reload:0, radarRange:700},
+ // TASK-403: radarECM — passive jammer: enemy missiles inside ecmRadius get
+ // their guidance degraded (one mid-course re-scatter ×ECM_SCATTER_MUL).
+ radar_ecm: {name:'تشويش ECM',   w:26,h:34,hp:110,cost:650,  reload:0, ecmRadius:520},
  flak:      {name:'مضاد FLAK',    w:26,h:28,hp:80, cost:320,  reload:65, fireRange: 20},
  sam:       {name:'SAM باتريوت',  w:24,h:34,hp:100,cost:450,  reload:180, fireRange: 80},
  factory:   {name:'مصنع حربي',    w:44,h:30,hp:150,cost:600,  reload:0},
