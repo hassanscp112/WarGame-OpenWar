@@ -1,4 +1,5 @@
 import { MCFG, MTAGS, PCFG, DCFG, TCFG, GAME_CONSTANTS, WORLD_CITIES, SDEFS, ITEM_ICONS, TECH_TREE, BOT_COUNTRIES, BOTS_MAX } from './data/constants.js';
+import { ECON_CONSTANTS } from './econ/constants.js';   // TASK-504: qaTest verifies the GAME_CONSTANTS spread
 import { FormationLayout, TANK_BEHAVIORS, IndirectFire } from './land/landUnits.js';   // TASK-405
 import { ConquestGrid, ConquestAttack, CONQUEST_CFG, registerOwner, clearRegisteredOwners, setBiomeFlatMode, setBiomeBandColor, getBiomeBandColor, getBiomeBands, attackLogic, attackTilesPerTickCtx } from './core/conquest.js';
 import { initNewUI, uiToast } from './ui.js';
@@ -216,21 +217,64 @@ const SFX = {
    this.playNoiseLayer(0.8, 0.25, 2000, 400, 200, 80);
   }
  },
+ // TASK-504: bgm variation — three 16-step patterns rotate every bar-group,
+ // picked by the war-tension mood (bedTension feeds this._tension):
+ //   P0 "pulse"   — the original TASK-408 heartbeat (peacetime anchor)
+ //   P1 "march"   — bass + backbeat blip + ghost note (forward motion)
+ //   P2 "tension" — minor-second alternation + heartbeat double (war dread)
+ // Step spec: {w:waveform, f0→f1 freq ramp, g:gain, d:decay}. One oscillator
+ // per non-null step (P2 doubles on step 0) — same node budget as the old
+ // single pattern, so the mixer/active-source accounting is unchanged.
  bgmStep(f){
   if(this.muted||!this.ctx)return;
-  const osc=this.ctx.createOscillator();
-  const gn=this.ctx.createGain();
-  const beat=f%16;
-  osc.type=beat%4===0?'triangle':'sine';
-  osc.frequency.setValueAtTime(beat%4===0?65:120,this.ctx.currentTime);
-  osc.frequency.exponentialRampToValueAtTime(beat%4===0?40:60,this.ctx.currentTime+.1);
-  gn.gain.setValueAtTime(0,this.ctx.currentTime);
-  gn.gain.linearRampToValueAtTime(beat%4===0?.06:.02,this.ctx.currentTime+.02);
-  gn.gain.exponentialRampToValueAtTime(.001,this.ctx.currentTime+(beat%4===0?.2:.1));
-  osc.connect(gn);gn.connect(this._bus('bgm'));
-  osc.start();osc.stop(this.ctx.currentTime+.25);
-  this._track(osc);
+  const P = this._bgmPat(f);
+  if (!P) return;
+  const t=this.ctx.currentTime;
+  const mk=(s)=>{
+   const osc=this.ctx.createOscillator();
+   const gn=this.ctx.createGain();
+   osc.type=s.w;
+   osc.frequency.setValueAtTime(s.f0,t);
+   if(s.f1&&s.f1!==s.f0)osc.frequency.exponentialRampToValueAtTime(s.f1,t+s.d);
+   gn.gain.setValueAtTime(0,t);
+   gn.gain.linearRampToValueAtTime(s.g,t+.02);
+   gn.gain.exponentialRampToValueAtTime(.001,t+s.d);
+   osc.connect(gn);gn.connect(this._bus('bgm'));
+   osc.start(t);osc.stop(t+s.d+.05);
+   this._track(osc);
+  };
+  if (Array.isArray(P)) for (const s of P) mk(s); else mk(P);
  },
+ // Pattern rotation (TASK-504): 16 steps per bar, pattern held for 2 bars,
+ // sequence cycles every 12 bars (~43s at the 9-frame step cadence). War
+ // tension ≥ .5 swaps to the tension-heavy sequence.
+ _bgmPat(f){
+  const B=this.BGM_PATTERNS;
+  const seq=(this._tension>=.5?this.BGM_SEQ_WAR:this.BGM_SEQ_PEACE);
+  const pat=seq[(f>>5)%seq.length];        // f>>5 = bar/2 (pattern per 2 bars)
+  return B[pat][f&15];
+ },
+ BGM_PATTERNS:[
+  // P0 — pulse (TASK-408 original, exact): bass thump every 4 + soft sine
+  // on EVERY other 16th (12 soft notes per bar, like the original)
+  [ {w:'triangle',f0:65,f1:40,g:.06,d:.2}, {w:'sine',f0:120,f1:60,g:.02,d:.1}, {w:'sine',f0:120,f1:60,g:.02,d:.1}, {w:'sine',f0:120,f1:60,g:.02,d:.1},
+    {w:'triangle',f0:65,f1:40,g:.06,d:.2}, {w:'sine',f0:120,f1:60,g:.02,d:.1}, {w:'sine',f0:120,f1:60,g:.02,d:.1}, {w:'sine',f0:120,f1:60,g:.02,d:.1},
+    {w:'triangle',f0:65,f1:40,g:.06,d:.2}, {w:'sine',f0:120,f1:60,g:.02,d:.1}, {w:'sine',f0:120,f1:60,g:.02,d:.1}, {w:'sine',f0:120,f1:60,g:.02,d:.1},
+    {w:'triangle',f0:65,f1:40,g:.06,d:.2}, {w:'sine',f0:120,f1:60,g:.02,d:.1}, {w:'sine',f0:120,f1:60,g:.02,d:.1}, {w:'sine',f0:120,f1:60,g:.02,d:.1} ],
+  // P1 — march: bass on 0/8, backbeat blip on 4/12, ghost note on 14
+  [ {w:'triangle',f0:65,f1:40,g:.065,d:.22}, null, null, null,
+    {w:'triangle',f0:196,f1:196,g:.028,d:.07}, null, null, null,
+    {w:'triangle',f0:65,f1:40,g:.065,d:.22}, null, null, null,
+    {w:'triangle',f0:196,f1:196,g:.028,d:.07}, null, {w:'sine',f0:98,f1:98,g:.02,d:.08}, null ],
+  // P2 — tension: minor-second alternation (55/58.27 Hz) on even steps,
+  // heartbeat double-thump on step 0 (array = two simultaneous notes)
+  [ [ {w:'sine',f0:55,f1:55,g:.05,d:.18}, {w:'sine',f0:55,f1:55,g:.04,d:.14} ], {w:'sine',f0:58.27,f1:58.27,g:.03,d:.1}, null, null,
+    {w:'sine',f0:55,f1:55,g:.045,d:.18}, {w:'sine',f0:58.27,f1:58.27,g:.03,d:.1}, null, null,
+    {w:'sine',f0:55,f1:55,g:.045,d:.18}, {w:'sine',f0:58.27,f1:58.27,g:.03,d:.1}, null, null,
+    {w:'sine',f0:55,f1:55,g:.045,d:.18}, {w:'sine',f0:58.27,f1:58.27,g:.03,d:.1}, null, null ],
+ ],
+ BGM_SEQ_PEACE:[0,0,1,0,2,1],
+ BGM_SEQ_WAR:[0,2,1,2,1,2],
  ui(t){ 
   this.init(); 
   if(!this.ctx||this.muted)return;
@@ -4368,10 +4412,19 @@ function spawnTradeShipsForActivePorts() {
     // loaded. Without the HPA highway graph, ships cannot compute bounded
     // routes. Skipping spawn is strictly better than spawning without a graph.
     if (!_waterwayNetwork || !_waterwayNetwork.hwCellSet) {
-        console.log('[SHIP] spawn skipped — HPA graph not ready yet');
+        // TASK-504: warn once — a permanently unavailable graph used to log
+        // every spawn interval (console noise). Silent skip afterwards.
+        if (!spawnTradeShipsForActivePorts._hpaWarned) {
+            spawnTradeShipsForActivePorts._hpaWarned = true;
+            console.log('[SHIP] spawn skipped — HPA graph not ready yet (retrying silently)');
+        }
         return;
     }
     let ports = structs.filter(s => s.type === 'port' && !s.dead);
+    // TASK-504: hoist the live-ship count out of the per-port loop (was
+    // re-reduced per port — O(ports×ships) per interval); +1 per spawn keeps
+    // the exact semantics the per-port recount had.
+    let alive = tradeShips.reduce((n, ts) => n + (ts.dead ? 0 : 1), 0);
     ports.forEach(port => {
         // TASK-301 BLOCKADE: enemy warships parked nearby seal this port —
         // no trade ships may sail from it while blocked.
@@ -4379,7 +4432,6 @@ function spawnTradeShipsForActivePorts() {
         // OpenFront tradeShipSpawnRate(): sigmoid decay on the GLOBAL ship count
         // + a per-port pity counter that raises the chance after each failed
         // attempt. P(spawn per check) ≈ baseRate·(rejections+1)/20.
-        const alive = tradeShips.reduce((n, ts) => n + (ts.dead ? 0 : 1), 0);
         if (alive >= C.TRADE_SHIP_MAX_ACTIVE) return;   // cap re-checked INSIDE the loop
         const baseRate = 1 - 1 / (1 + Math.exp(-0.1155 * (alive - 12))); // midpoint: 12 ships
         const rej = port._shipRej || 0;
@@ -4396,7 +4448,7 @@ function spawnTradeShipsForActivePorts() {
                 let target = coastalCities[Math.floor(Math.random() * coastalCities.length)];
                 try {
                     let s = new TradeShip(port, { lat: target.lat, lon: target.lon, pos: latLonToVec3(target.lat, target.lon), owner: target.owner }, port.owner);
-                    if (!s.dead) tradeShips.push(s);
+                    if (!s.dead) { tradeShips.push(s); alive++; }   // TASK-504: tracked hoisted count
                 } catch (err) { console.warn('[SHIP] spawn failed (city fallback):', err.message); }
             }
             return;
@@ -4404,18 +4456,18 @@ function spawnTradeShipsForActivePorts() {
 
         // OpenFront tradingPorts(): sort by distance, apply proximity weighting.
         targets.sort((a, b) =>
-            haversineDist(port.lat, port.lon, a.lat, a.lon) - haversineDist(port.lat, port.lon, b.lat, b.lon)
+            _econHavNA(port.lat, port.lon, a.lat, a.lon) - _econHavNA(port.lat, port.lon, b.lat, b.lon)
         );
         const weighted = [];
         targets.forEach((t, i) => {
-            const d = haversineDist(port.lat, port.lon, t.lat, t.lon);
+            const d = _econHavNA(port.lat, port.lon, t.lat, t.lon);   // TASK-504: no-alloc
             weighted.push(t);
             if (d > C.TRADE_SHIP_SHORT_RANGE_KM && i < Math.min(3, targets.length)) weighted.push(t);
         });
         const target = weighted[Math.floor(Math.random() * weighted.length)];
         try {
             let s = new TradeShip(port, target, port.owner);
-            if (!s.dead) tradeShips.push(s);
+            if (!s.dead) { tradeShips.push(s); alive++; }   // TASK-504: tracked hoisted count
         } catch (err) { console.warn('[SHIP] spawn failed:', err.message); }
     });
 }
@@ -13539,7 +13591,7 @@ function econResetState() {
     window.__fuelBreakdown = null;
     _econScan = { frame: -1, sideData: {} };
     econTeardownForMenu();   // TASK-404: drop lanes/intel/medal visuals
-    _sfxSt.stung = false; _sfxSt.shells = null; _sfxSt.threats = null;   // TASK-408: re-arm the stinger for the new game
+    _sfxSt.stung = false; _sfxSt.shells = null; _sfxThreats.clear();   // TASK-408/504: re-arm stinger + drop stale threat entries
 }
 
 function troopsOf(side) {
@@ -13569,6 +13621,23 @@ function isPortBlockaded(port) {
     return econState._blockedPorts.has(port.id);
 }
 
+// TASK-504 OPTIMIZE: allocation-free great-circle distance for the econ
+// hot loops (scan/war/lane passes run per frame at scale). The shared
+// haversineDist() allocates TWO Vector3 per call (latLonToVec3 ×2) — at
+// 20+ ports/cities/factories that's ~1000+ Vector3/frame of pure churn.
+// Same spherical law of cosines, zero allocations, identical results to
+// float epsilon (probe-verified in qaTest). Econ code only — the shared
+// helper stays untouched for everyone else.
+const _econHavNA = (() => {
+    const RAD = Math.PI / 180;
+    return (lat1, lon1, lat2, lon2) => {
+        const p1 = lat1 * RAD, p2 = lat2 * RAD;
+        const dLambda = (lon2 - lon1) * RAD;
+        const c = Math.sin(p1) * Math.sin(p2) + Math.cos(p1) * Math.cos(p2) * Math.cos(dLambda);
+        return Math.acos(Math.max(-1, Math.min(1, c))) * EARTH_RADIUS;
+    };
+})();
+
 // Per-frame cached scan: synergy links + blockade state, per side. Called from
 // calcIncome (econ tick + HUD) — one scan per frame shared by all callers.
 function econScanFrame() {
@@ -13591,10 +13660,10 @@ function econScanFrame() {
         });
         if (mode2 && cityNodes) cityNodes.forEach(c => { if (c.owner === side) cities.push(c); });
         const factoryLinks = factories.map(f => cities.reduce(
-            (n, c) => n + (haversineDist(f.lat, f.lon, c.lat, c.lon) <= R ? 1 : 0), 0));
+            (n, c) => n + (_econHavNA(f.lat, f.lon, c.lat, c.lon) <= R ? 1 : 0), 0));
         let pcLinks = 0;
         for (const p of ports) for (const c of cities)
-            if (haversineDist(p.lat, p.lon, c.lat, c.lon) <= R) pcLinks++;
+            if (_econHavNA(p.lat, p.lon, c.lat, c.lon) <= R) pcLinks++;
         let blockaded = 0;
         for (const p of ports) {
             const nowBlk = isPortBlockaded(p);
@@ -13736,7 +13805,7 @@ function structSynergyInfo(s) {
     const mode2 = window.gameMode !== 'mode1';
     const cities = structs.filter(x => x.owner === s.owner && !x.dead && x.type === 'city');
     if (mode2 && cityNodes) cityNodes.forEach(c => { if (c.owner === s.owner) cities.push(c); });
-    const near = (a, b) => haversineDist(a.lat, a.lon, b.lat, b.lon) <= R;
+    const near = (a, b) => _econHavNA(a.lat, a.lon, b.lat, b.lon) <= R;   // TASK-504: no-alloc
     if (s.type === 'factory') {
         const links = Math.min(3, cities.reduce((n, c) => n + (near(s, c) ? 1 : 0), 0));
         return { links, label: `مدن مرتبطة ×${links} (+${Math.round(links * GAME_CONSTANTS.SYNERGY_FACTORY_CITY * 100)}% دخل)` };
@@ -14013,7 +14082,7 @@ function econWarTick() {
         if (w.dead) continue;
         for (const p of structs) {
             if (p.type !== 'port' || p.dead || p.owner === w.owner) continue;
-            if (haversineDist(w.lat, w.lon, p.lat, p.lon) <= R) { link(w.owner, p.owner); blocked.add(p.id); }
+            if (_econHavNA(w.lat, w.lon, p.lat, p.lon) <= R) { link(w.owner, p.owner); blocked.add(p.id); }   // TASK-504: no-alloc
         }
     }
     for (const c of troopCohorts) if (!c.dead) link(c.owner, ownerAt(c.tlat, c.tlon));
@@ -14197,9 +14266,9 @@ function laneAtRisk(a, b) {
     const mid = vec3ToLatLon(va.clone().add(vb).normalize());
     for (const w of warships) {
         if (w.dead || w.owner === myRole) continue;
-        if (haversineDist(w.lat, w.lon, a.lat, a.lon) < R) return true;
-        if (haversineDist(w.lat, w.lon, mid.lat, mid.lon) < R) return true;
-        if (haversineDist(w.lat, w.lon, b.lat, b.lon) < R) return true;
+        if (_econHavNA(w.lat, w.lon, a.lat, a.lon) < R) return true;
+        if (_econHavNA(w.lat, w.lon, mid.lat, mid.lon) < R) return true;
+        if (_econHavNA(w.lat, w.lon, b.lat, b.lon) < R) return true;
     }
     return false;
 }
@@ -14216,7 +14285,7 @@ function rebuildTradeLanes() {
     const a = new THREE.Vector3(), b = new THREE.Vector3(), p = new THREE.Vector3();
     for (const p1 of myPorts) {
         const targets = foreign
-            .slice().sort((x, y) => haversineDist(p1.lat, p1.lon, x.lat, x.lon) - haversineDist(p1.lat, p1.lon, y.lat, y.lon))
+            .slice().sort((x, y) => _econHavNA(p1.lat, p1.lon, x.lat, x.lon) - _econHavNA(p1.lat, p1.lon, y.lat, y.lon))
             .slice(0, C.ECON_LANE_TOP_TARGETS);
         for (const p2 of targets) {
             const risk = laneAtRisk(p1, p2);
@@ -14395,9 +14464,13 @@ function refreshMarketPanel() {
     const L = econLoanOf(myRole);
     const canLoan = L.principal + C.ECON_LOAN_AMOUNT <= C.ECON_LOAN_MAX_DEBT;
     const li = document.getElementById('mkLoanInfo');
+    // TASK-504 FINISH: show available credit (cap − outstanding principal) —
+    // the exact-boundary case (principal $1200 + $800 = cap $2000) reads
+    // clearly now instead of the button just going disabled.
+    const avail = Math.max(0, C.ECON_LOAN_MAX_DEBT - L.principal);
     if (li) li.textContent = L.owed > 0
-        ? `دين قائم $${Math.ceil(L.owed)} — تسديد $${C.ECON_LOAN_REPAY_PS}/ث`
-        : `بلا ديون — فائدة ${Math.round((C.ECON_LOAN_INTEREST - 1) * 100)}%`;
+        ? `دين قائم $${Math.ceil(L.owed)} — تسديد $${C.ECON_LOAN_REPAY_PS}/ث (ائتمان متاح $${avail})`
+        : `ائتمان متاح $${avail} — فائدة ${Math.round((C.ECON_LOAN_INTEREST - 1) * 100)}%`;
     const lb = document.getElementById('mkLoanBtn');
     if (lb) { lb.disabled = !canLoan; lb.textContent = canLoan ? `+$${C.ECON_LOAN_AMOUNT}` : 'سقف الائتمان'; }
     const def = econDefensiveWar(myRole);
@@ -14500,11 +14573,38 @@ window.__econProbe = {
 //                navalBattleTest intercept criterion) ⇒ intercept sonar
 //   · navalBass— shells-in-flight delta across warships (gun fire)
 // ════════════════════════════════════════════════════════════════
-const _sfxSt = { bgmStep: 0, shells: null, threats: null, lastBass: -1e9, lastPing: -1e9, stung: false };
+const _sfxSt = { bgmStep: 0, shells: null, lastBass: -1e9, lastPing: -1e9, stung: false, gc: null };
+// TASK-504: persistent threat tracker (was a fresh Map every 3 frames —
+// ~20 Map allocs/s). Entries are mutated in place, one small object per
+// missile LIFETIME (not per sample); vanished ids are pruned by tick mark.
+// Fields: pr (progress), rate (per-frame progress delta), owner, mkey,
+// tgtMine (hostile AND aimed at the player), seen (sample tick mark).
+const _sfxThreats = new Map();
+let _sfxThreatTick = 0;
+// TASK-504 FINISH — intercept-ping criterion, v2. PURE (probe-tested by
+// qaTest): a vanished tracked missile reads as an INTERCEPT when it died
+// with real flight time left. Fixes three v1 gaps:
+//   · terminal-dive intercepts (pr .85–1.0) were missed by the fixed
+//     pr<.85 cutoff — now estimated remaining flight (progress/rate) must
+//     exceed ~0.4s, which catches late intercepts AND still stays silent
+//     for natural impacts (pr≈1, ≈1 sample from arrival)
+//   · the MIRV bus split (icbm dies at pr>.7 spawning 3 RVs) false-pinged
+//     — excluded by mkey
+//   · ANY vanished missile pinged (own missiles shot down by the enemy,
+//     bot-vs-bot wars) — now only hostile missiles aimed at the player
+// Fallback: entries with no rate yet (sighted <2 samples ago) use the old
+// absolute pr<.85 rule; ECM progress-rewinds (rate≤0) also fall back.
+function _sfxPingCheck(e) {
+    if (e.mkey === 'icbm') return false;           // MIRV split, not a kill
+    if (e.owner === myRole) return false;          // our own loss — no cue
+    if (e.tgtMine === false) return false;         // bot-vs-bot, not our war
+    if (e.rate != null && e.rate > 0) return (1 - e.pr) / e.rate > 24;   // >0.4s of flight left
+    return e.pr < 0.85;                            // unknown rate → v1 rule
+}
 function _sfxFrame() {
     if (!SFX.ctx) return;
-    const gc = document.getElementById('gc');
-    const inGame = !window.startSpawnPhase && !gOver && gc && gc.style.display !== 'none';
+    if (!_sfxSt.gc) _sfxSt.gc = document.getElementById('gc');   // TASK-504: cache (was per-frame lookup)
+    const inGame = !window.startSpawnPhase && !gOver && _sfxSt.gc && _sfxSt.gc.style.display !== 'none';
     if (SFX.muted) { if (SFX._bed) SFX.bedOff(); return; }
     if (!inGame) { if (SFX._bed) SFX.bedOff(); return; }
     // beat sequencer (~100bpm feel: one 16th every 9 frames)
@@ -14527,19 +14627,35 @@ function _sfxFrame() {
         }
         _sfxSt.shells = total;
     }
-    // intercept ping — tracked hostile missile vanished mid-flight
+    // intercept ping — tracked hostile missile vanished mid-flight (v2
+    // criterion above; sampling every 3 frames, in-place entry updates).
     if (frame % 3 === 0) {
-        const cur = new Map();
-        for (const m of missiles) if (!m.dead && !m.isSAM) cur.set(m.id, m.progress || 0);
-        const prev = _sfxSt.threats;
-        if (prev) {
-            for (const [id, pr] of prev) {
-                if (!cur.has(id) && pr < 0.85 && frame - _sfxSt.lastPing > 30) {
-                    _sfxSt.lastPing = frame; SFX.ping(); break;
-                }
+        _sfxThreatTick++;
+        for (const m of missiles) {
+            if (m.dead || m.isSAM) continue;
+            let e = _sfxThreats.get(m.id);
+            if (!e) {
+                // target-of-player check: only missiles aimed at OUR land
+                // alert us. Unknown (no conquest grid / mask not ready,
+                // e.g. mode 2) stays permissive like v1.
+                let aimed = null;
+                if (typeof getPixelOwner === 'function' && typeof conquestGrid !== 'undefined' && conquestGrid && conquestGrid._maskReady)
+                    aimed = getPixelOwner(m.tlat, m.tlon) === myRole;
+                e = { pr: m.progress || 0, rate: null, owner: m.owner, mkey: m.mkey, tgtMine: aimed !== false, seen: 0 };
+                _sfxThreats.set(m.id, e);
+            } else {
+                const pr = m.progress || 0;
+                e.rate = Math.max(0, (pr - e.pr) / 3);   // per-frame delta
+                e.pr = pr;
             }
+            e.seen = _sfxThreatTick;
         }
-        _sfxSt.threats = cur;
+        const canPing = frame - _sfxSt.lastPing > 30;
+        for (const [id, e] of _sfxThreats) {
+            if (e.seen === _sfxThreatTick) continue;
+            _sfxThreats.delete(id);                     // vanished — prune always
+            if (canPing && _sfxPingCheck(e)) { _sfxSt.lastPing = frame; SFX.ping(); break; }
+        }
     }
 }
 
@@ -14593,6 +14709,8 @@ ensureSfxMixer();
 // ── TASK-408 probe: audioTest() → node/state census; audioTest(true)
 //    also fires one sound per category so a human can hear each bus.
 window.audioTest = function (playAll) {
+    const _seq = SFX._tension >= .5 ? SFX.BGM_SEQ_WAR : SFX.BGM_SEQ_PEACE;
+    const _pi = _seq[Math.floor(_sfxSt.bgmStep / 32) % _seq.length];
     const out = {
         ctx: SFX.ctx ? { state: SFX.ctx.state, sampleRate: SFX.ctx.sampleRate, t: +SFX.ctx.currentTime.toFixed(1) } : null,
         vol: +SFX.vol.toFixed(2),
@@ -14600,16 +14718,235 @@ window.audioTest = function (playAll) {
         muted: SFX.muted,
         activeSources: SFX._active,
         bed: SFX._bed ? { on: true, tension: SFX._tension } : { on: false },
-        bgmStepCount: _sfxSt.bgmStep,
+        bgm: { steps: _sfxSt.bgmStep, pattern: ['pulse', 'march', 'tension'][_pi], seq: _tensionName(SFX._tension) },
         stingerFired: _sfxSt.stung,
+        trackedThreats: _sfxThreats.size,
         events: SFX._evtLog.slice(-12),
     };
-    if (playAll) { SFX.ui('click'); SFX.ping(); SFX.fanfare(); SFX.navalBass(); SFX.stinger(); SFX.bgmStep(0); SFX.bedOn(); }
+    if (playAll) { SFX.ui('click'); SFX.ping(); SFX.fanfare(); SFX.navalBass(); SFX.stinger(); SFX.bgmStep(0); SFX.bgmStep(64); SFX.bgmStep(128); SFX.bedOn(); }
     console.log('[audioTest]', out);
+    return out;
+};
+function _tensionName(t) { return t >= .5 ? 'war' : (t > 0 ? 'foreign-war' : 'peace'); }
+
+// ════════════════════════════════════════════════════════════════
+// TASK-504 PROBE: qaTest() — economy+sound mastery self-checks.
+//   · constants spread (src/econ/constants.js → GAME_CONSTANTS)
+//   · no-alloc haversine equivalence + zero Vector3 churn in the scan
+//   · credit-cap exact boundary + bond epoch reset (FINISH items)
+//   · sparkline/teardown reset semantics (FINISH item)
+//   · intercept-ping criterion v2 (FINISH item, pure unit cases)
+//   · bgm pattern tables + rotation (FINISH item)
+//   · mixer clamps + persistence round-trip
+// All mutations are save/restore-synchronous (TASK-404 probe pattern);
+// safe to run mid-game. qaTest(true) additionally measures econScanFrame
+// at synthetic scale (20 ports/cities/factories) with a Vector3 counter.
+// ════════════════════════════════════════════════════════════════
+window.qaTest = function (perf) {
+    const C = GAME_CONSTANTS;
+    const out = { when: new Date().toISOString(), checks: [], perf: null, pass: true };
+    const chk = (name, ok, info) => {
+        out.checks.push({ name, ok, info: info == null ? '' : String(info) });
+        if (!ok) out.pass = false;
+        console.log(`${ok ? '✅' : '❌'} [QA] ${name}${info != null ? ' — ' + info : ''}`);
+    };
+    // Count Vector3 constructions while fn() runs — swap a shim namespace
+    // over the global (script-tag) THREE, restore in finally. The game code
+    // resolves THREE dynamically, so the shim sees every construction.
+    const countV3 = (fn) => {
+        const real = globalThis.THREE;
+        let made = 0;
+        const Counting = class extends real.Vector3 { constructor(...a) { super(...a); made++; } };
+        globalThis.THREE = Object.create(real);
+        globalThis.THREE.Vector3 = Counting;
+        try { fn(); } finally { globalThis.THREE = real; }
+        return made;
+    };
+
+    // 1) constants spread: every ECON_CONSTANTS key lands in GAME_CONSTANTS
+    {
+        let missing = 0, drift = 0;
+        for (const k of Object.keys(ECON_CONSTANTS)) {
+            if (!(k in C)) { missing++; continue; }
+            const a = ECON_CONSTANTS[k], b = C[k];
+            if (typeof a === 'object' ? JSON.stringify(a) !== JSON.stringify(b) : a !== b) drift++;
+        }
+        chk('econ constants spread intact (keys+values)', missing === 0 && drift === 0,
+            `${Object.keys(ECON_CONSTANTS).length} keys, missing=${missing}, drift=${drift}`);
+    }
+
+    // 2) no-alloc haversine: numerically identical to the shared helper AND
+    //    constructs zero Vector3 objects (10k-call hot loop under the counter)
+    {
+        let worst = 0;
+        const pts = [[0,0,0,0],[35,42,36,43],[-33,-70,45,12],[89.9,0,-89.9,180],[10,10,10,170]];
+        for (let i = 0; i < 200; i++) pts.push([(Math.random()*2-1)*85, (Math.random()*2-1)*180, (Math.random()*2-1)*85, (Math.random()*2-1)*180]);
+        for (const [a,b,c,d] of pts) worst = Math.max(worst, Math.abs(_econHavNA(a,b,c,d) - haversineDist(a,b,c,d)));
+        const made = countV3(() => { for (let i = 0; i < 10000; i++) _econHavNA(10, 10, 20, 20); });
+        chk('no-alloc haversine: identical results + 0 Vector3', worst < 1e-6 && made === 0,
+            `max |Δ| = ${worst.toExponential(1)} km / ${pts.length} pairs, allocs=${made}/10000 calls`);
+    }
+
+    // 3) credit-cap exact boundary (FINISH: black-market edge cases)
+    {
+        const side = 'probe504';
+        const sv = econState.loans[side];
+        delete econState.loans[side];
+        const L = econLoanOf(side);              // principal 0
+        L.principal = C.ECON_LOAN_MAX_DEBT - C.ECON_LOAN_AMOUNT;   // exactly one loan from cap
+        const atExact = econTakeLoan(side, true);                    // 1200+800=2000 → allowed → 2000
+        const atCap = econTakeLoan(side, true);                      // 2000+800>2000 → refused
+        L.principal = C.ECON_LOAN_MAX_DEBT - C.ECON_LOAN_AMOUNT + 1; // 1201+800>2000
+        const overBy1 = econTakeLoan(side, true);                    // refused, principal untouched
+        const ok = atExact === true && atCap === false && overBy1 === false
+            && L.principal === C.ECON_LOAN_MAX_DEBT - C.ECON_LOAN_AMOUNT + 1;
+        if (sv != null) econState.loans[side] = sv; else delete econState.loans[side];
+        chk('loan cap: exact-boundary allowed, +1 refused', ok,
+            `principal $${C.ECON_LOAN_MAX_DEBT - C.ECON_LOAN_AMOUNT}+$${C.ECON_LOAN_AMOUNT}=${C.ECON_LOAN_MAX_DEBT}`);
+    }
+
+    // 4) bond epoch reset (2nd black-market edge: allowance per defensive war)
+    {
+        const side = 'probe504';
+        const svB = econState.bonds[side], svD = econState.defWar[side];
+        const svDirs = econState._warDirs;
+        econState._warDirs = new Set(['x>' + side]);       // synthetic defensive war
+        const st = { active: true, epoch: 7 };
+        econState.defWar[side] = st;
+        const B = { owed: 0, epoch: 7, count: C.ECON_BOND_MAX_PER_WAR };   // allowance exhausted
+        econState.bonds[side] = B;
+        const refused = econTakeBond(side, true);           // count maxed in epoch 7
+        st.epoch = 8;                                       // NEW defensive war → epoch bumps
+        const allowed = econTakeBond(side, true);           // fresh allowance
+        econState._warDirs = svDirs;
+        if (svB != null) econState.bonds[side] = svB; else delete econState.bonds[side];
+        if (svD != null) econState.defWar[side] = svD; else delete econState.defWar[side];
+        chk('bond: per-war allowance resets on new war epoch', refused === false && allowed === true);
+    }
+
+    // 5) teardown resets derived state (sparkline hygiene — FINISH item;
+    //    the FULL new-game path is live-verified by restarting a game).
+    //    Teardown also drops visuals — rebuild the ones that were live.
+    {
+        const svH = econState.netHist.slice();
+        const svB = window.__econBreakdown, svF = window.__fuelBreakdown;
+        const svIntel = { until: econState.intel.until, had: econState.intel.markers.length > 0 };
+        const blkPorts = (typeof structs !== 'undefined' ? structs : []).filter(s => s && s._blockaded);
+        econState.netHist.push(1, 2, 3);
+        window.__econBreakdown = { marker: true };
+        econTeardownForMenu();
+        const ok = econState.netHist.length === 0 && window.__econBreakdown === null && window.__fuelBreakdown === null;
+        // restore state + visuals teardown cleared
+        econState.intel.until = svIntel.until;
+        if (svIntel.had && svIntel.until > frame) _intelBuildMarkers();
+        for (const p of blkPorts) _blkMarkAdd(p);
+        if (typeof rebuildTradeLanes === 'function') rebuildTradeLanes();
+        econState.netHist.push(...svH);
+        window.__econBreakdown = svB; window.__fuelBreakdown = svF;
+        chk('teardown clears sparkline + breakdown snapshots', ok);
+    }
+
+    // 6) intercept-ping criterion v2 (pure fn — no audio needed)
+    {
+        const mk = (o) => Object.assign({ pr: .5, rate: .003, owner: 'bot0', mkey: 'ballistic', tgtMine: true }, o);
+        const cases = [
+            ['classic mid-flight intercept pings',        mk({}), true],
+            ['terminal-dive intercept (pr .92) pings',    mk({ pr: .92, rate: .002 }), true],   // v1 missed this
+            ['natural impact (pr .995, 2 frames left)',   mk({ pr: .995, rate: .0025 }), false],
+            ['MIRV bus split (icbm) never pings',         mk({ mkey: 'icbm', pr: .72 }), false],
+            ['own missile lost — no cue',                 mk({ owner: myRole }), false],
+            ['bot-vs-bot (not aimed at us) — no cue',     mk({ tgtMine: false }), false],
+            ['no-rate sighting falls back to pr<.85',     mk({ pr: .8, rate: null }), true],
+            ['no-rate sighting at .9 stays silent',       mk({ pr: .9, rate: null }), false],
+        ];
+        let ok = true;
+        for (const [name, e, want] of cases) if (_sfxPingCheck(e) !== want) { ok = false; console.log('   ↳ failed:', name); }
+        chk('intercept-ping criterion v2 (8 cases)', ok);
+    }
+
+    // 7) bgm pattern tables (FINISH: variation beyond the pulse)
+    {
+        const P = SFX.BGM_PATTERNS;
+        let ok = Array.isArray(P) && P.length === 3;
+        const notesPer = [];
+        if (ok) for (let p = 0; p < 3; p++) {
+            const row = P[p];
+            ok = ok && Array.isArray(row) && row.length === 16;
+            let notes = 0;
+            for (const s of row) {
+                const arr = Array.isArray(s) ? s : (s ? [s] : []);
+                notes += arr.length;
+                for (const n of arr) ok = ok && n.g > 0 && n.g <= 0.1 && n.d > 0 && n.f0 > 0;
+            }
+            notesPer.push(notes);
+        }
+        // rotation: over 12 bars (192 steps) the peace sequence plays all 3
+        // patterns; war tension swaps in the tension-heavy sequence.
+        const seen = new Set();
+        const svT = SFX._tension; SFX._tension = 0;
+        for (let f = 0; f < 192; f++) { if (SFX._bgmPat(f)) seen.add(f >> 5); }
+        SFX._tension = .7;
+        const warPat = SFX._bgmPat(128);   // war seq slot 4 → tension (heartbeat array)
+        SFX._tension = svT;
+        ok = ok && seen.size === 3 && Array.isArray(warPat);
+        chk('bgm: 3 sane patterns + rotation + war weighting', ok,
+            `notes/bar [pulse,march,tension]=${notesPer} (TASK-408 pulse was 16)`);
+    }
+
+    // 8) mixer clamps + persistence round-trip
+    {
+        const svVol = SFX.vol, svBgm = SFX.busVol.bgm, svLS = localStorage.getItem('sfxMix');
+        SFX.setVolume(1.7); SFX.setBus('bgm', -0.5);
+        const clamped = SFX.vol === 1 && SFX.busVol.bgm === 0;
+        SFX.setVolume(.42); SFX._persist();
+        SFX.vol = 1; SFX._restoreMix();
+        const restored = SFX.vol === .42;
+        SFX.setVolume(svVol); SFX.setBus('bgm', svBgm);
+        if (svLS == null) localStorage.removeItem('sfxMix'); else localStorage.setItem('sfxMix', svLS);
+        chk('mixer: clamps [0,1] + localStorage round-trip', clamped && restored);
+    }
+
+    // 9) perf at synthetic scale (qaTest(true)): 20 ports/cities/factories
+    //    × 50 forced scans with the Vector3 construction counter.
+    if (perf && typeof structs !== 'undefined') {
+        const savedStructs = structs.slice();
+        const savedScanFrame = _econScan.frame;
+        try {
+            for (let i = 0; i < 20; i++) {
+                structs.push({ id: 'qa_p' + i, type: 'port', owner: 'player', dead: false, lat: 30 + (i % 7), lon: 10 + i * 1.5, _blockaded: false });
+                structs.push({ type: 'city', owner: 'player', dead: false, lat: 31 + (i % 5), lon: 11 + i * 1.4 });
+                structs.push({ type: 'factory', owner: 'player', dead: false, lat: 29 + (i % 6), lon: 12 + i * 1.3 });
+            }
+            let ms = 0, made = 0;
+            const runs = 50;
+            made = countV3(() => {
+                const t0 = performance.now();
+                for (let r = 0; r < runs; r++) { _econScan.frame = -1; econScanFrame(); }
+                ms = performance.now() - t0;
+            });
+            const d = _econScan.sideData.player || {};
+            out.perf = { msPerScan: +(ms / runs).toFixed(3), vector3AllocsPerScan: made / runs,
+                ports: d.ports, factories: (d.factoryLinks || []).length };
+            console.log(`⏱️ [QA] econScanFrame @20p/20c/20f ×${runs}: ${(ms / runs).toFixed(3)}ms/scan, Vector3 allocs/scan: ${made / runs}`);
+            chk('econScanFrame at scale: zero Vector3 allocations', made === 0);
+        } catch (err) {
+            out.perf = { error: String(err) };
+            chk('econScanFrame at scale: zero Vector3 allocations', false, String(err));
+        } finally {
+            structs.length = 0; structs.push(...savedStructs);
+            _econScan.frame = savedScanFrame;
+        }
+    }
+
+    console.log(`[qaTest] ${out.checks.filter(c => c.ok).length}/${out.checks.length} checks ${out.pass ? 'PASS ✅' : 'FAIL ❌'}`);
+    window.__qaTestLog = (window.__qaTestLog || []).concat([{ at: out.when, pass: out.pass }]);
     return out;
 };
 
 // Remove all TASK-404 visuals (menu return / new game reset).
+// TASK-504: also drops the derived econ state (sparkline history +
+// breakdown snapshots) so a quit-to-menu leaves NOTHING stale — previously
+// these lingered until the next game's econResetState (harmless but unclean).
 function econTeardownForMenu() {
     try {
         if (typeof scene !== 'undefined' && scene && tradeLaneGroup) _disposeGroupChildren(tradeLaneGroup);
@@ -14617,6 +14954,9 @@ function econTeardownForMenu() {
         if (typeof structs !== 'undefined' && structs) for (const s of structs) if (s && s._blkMark) _blkMarkRemove(s);
         const host = document.getElementById('econMedals'); if (host) host.innerHTML = '';
         const p = document.getElementById('econMkt'); if (p) p.classList.remove('open');
+        if (econState.netHist) econState.netHist.length = 0;   // TASK-504: sparkline resets on quit too
+        window.__econBreakdown = null;
+        window.__fuelBreakdown = null;
     } catch (e) { console.warn('[ECON] teardown:', e); }
 }
 
