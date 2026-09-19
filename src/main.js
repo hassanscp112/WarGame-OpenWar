@@ -1,5 +1,5 @@
 import { MCFG, MTAGS, PCFG, DCFG, GAME_CONSTANTS, WORLD_CITIES, SDEFS, ITEM_ICONS, TECH_TREE, BOT_COUNTRIES, BOTS_MAX } from './data/constants.js';
-import { ConquestGrid, ConquestAttack, CONQUEST_CFG, registerOwner, clearRegisteredOwners, setBiomeFlatMode, setBiomeBandColor, getBiomeBandColor, getBiomeBands } from './core/conquest.js';
+import { ConquestGrid, ConquestAttack, CONQUEST_CFG, registerOwner, clearRegisteredOwners, setBiomeFlatMode, setBiomeBandColor, getBiomeBandColor, getBiomeBands, attackLogic, attackTilesPerTickCtx } from './core/conquest.js';
 import { initNewUI } from './ui.js';
 window.GEO_DATA_ROADS = [];
 
@@ -2385,6 +2385,11 @@ class Warship {
         const dmg = GAME_CONSTANTS.WARSHIP_SHELL_DAMAGE;
         const tgt = s.target;
         spawnExp(s.toLat, s.toLon, s.kind === 'warship' ? 5 : 6, '#ff8844');
+        // Naval bombardment paints devastation too (shore bombardment softens
+        // the target for a follow-up invasion).
+        if (conquestGrid && conquestGrid.applyDevastation) {
+            conquestGrid.applyDevastation(s.toLat, s.toLon, 90, 0.5);
+        }
         if (!tgt || tgt.dead) return;
         if (s.kind === 'transport') {
             tgt._remove();          // sunk — embarked troops are lost
@@ -3028,6 +3033,35 @@ window.__ffaProbe = {
             intercepted: t.atk.dead && t.atk.progress < 0.95,
             samAlive: !t.sam.dead
         };
+    },
+    // TASK-102 occupation tests: devastation painting + troop-scale speed
+    // (LAND coords — devastation only paints land cells)
+    devastTest: () => {
+        if (!conquestGrid) return 'no grid';
+        conquestGrid.applyDevastation(35, -98, 200, 1);   // USA midlands
+        const c = conquestGrid.latLonToCell(35, -98);
+        return { dev: +conquestGrid.devastationAt(c).toFixed(2) };
+    },
+    devAt: (lat, lon) => conquestGrid ? +conquestGrid.devastationAt(conquestGrid.latLonToCell(lat, lon)).toFixed(2) : 'no grid',
+    // fire a missile at LAND (devastation target test) — Arabia
+    fireTestMissileLand: (key) => {
+        const cfg = MCFG[key] || MCFG['ballistic'];
+        const m = new Missile(35, -20, 24, 45, cfg, 'player');   // Atlantic → Arabia
+        missiles.push(m);
+        window.__landT = { m };
+        return { distKm: Math.round(m.dist), etaS: +(m.dist / m.speed).toFixed(1) };
+    },
+    troopScaleTest: () => {
+        // neutral expansion: rate at 100 vs 10,000 vs 100,000 committed troops
+        const small = attackTilesPerTickCtx(conquestGrid, 100, 'neutral', 0, 10);
+        const big = attackTilesPerTickCtx(conquestGrid, 10000, 'neutral', 0, 10);
+        const bigger = attackTilesPerTickCtx(conquestGrid, 100000, 'neutral', 0, 10);
+        // attackLogic neutral branch (the one actually reworked):
+        const mkCtx = (t) => ({ getTroops: () => t, addTroops: () => {} });
+        const loss100 = attackLogic(conquestGrid, 100, 'player', 'neutral', conquestGrid.latLonToCell(20, -42), mkCtx(100));
+        const loss10k = attackLogic(conquestGrid, 10000, 'player', 'neutral', conquestGrid.latLonToCell(20, -42), mkCtx(10000));
+        return { tilesAt100: +small.toFixed(1), tilesAt10k: +big.toFixed(1), tilesAt100k: +bigger.toFixed(1),
+                 lossPerTile100: +loss100.attackerTroopLoss.toFixed(1), lossPerTile10k: +loss10k.attackerTroopLoss.toFixed(1) };
     },
     missileCount: () => missiles.filter(m => !m.dead).length,
     // bow-first orientation check: dot(bow-stern vector, toward-patrol vector) > 0
@@ -5994,6 +6028,11 @@ class Missile {
         const rad = cfg.rad || 60;
         const blastR = rad / 5;   // legacy blast-radius scale (world units)
         spawnExp(this.lat, this.lon, rad / 15, cfg.col || '#ffaa00');
+        // TASK-102: blasts paint DEVASTATION — pounded territory resists
+        // less and falls faster to land attacks (see conquest.js attackLogic).
+        if (conquestGrid && conquestGrid.applyDevastation) {
+            conquestGrid.applyDevastation(this.lat, this.lon, Math.max(30, rad * 1.2), Math.min(1.6, 0.4 + (cfg.dmg || 50) / 400));
+        }
         if (SFX && SFX.exp) SFX.exp(rad, cfg.type === 'nuke');
 
         if (this.mkey === 'cluster') {
@@ -9978,6 +10017,11 @@ function loop(now) {
     if (missileMode && frame % 30 === 0) {
         _refreshMissileRings();
         _refreshMissileHud();
+    }
+
+    // TASK-102: devastation decay (rotating window — O(800)/frame)
+    if (conquestGrid && conquestGrid.decayDevastation && frame % 2 === 0) {
+        conquestGrid.decayDevastation(1600);
     }
 
     _applyKeyboardNavigation();

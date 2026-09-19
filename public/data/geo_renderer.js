@@ -201,10 +201,13 @@ const GEO_RENDERER = {
         }
 
         const geometry = new THREE.BufferGeometry();
+        // TASK-103: roads were BRIGHT YELLOW (0xffcc00) — same family as the
+        // owner/territory + gold-UI colors, making countries unreadable.
+        // Now a dark warm charcoal: clearly infrastructure, never a nation.
         const material = new THREE.LineBasicMaterial({
-            color: 0xffcc00,
+            color: 0x4a4238,
             transparent: true,
-            opacity: 0.6,
+            opacity: 0.75,
             linewidth: 2
         });
 

@@ -39,6 +39,14 @@ export const CONQUEST_CFG = {
 
   // ── Terrain combat params (ported from OpenFront attackLogic) ──
   TERRAIN_MAG:   { 1: 80,  2: 100, 3: 120 },
+  // ── DEVASTATION (TASK-102): missile/blast damage paints a weakening
+  // layer onto the grid — pounded territory becomes cheaper + faster to
+  // take. decays slowly so saturation fades after ~3-4 minutes of peace.
+  DEVASTATION_MAX: 1.0,          // full weakness cap
+  DEVASTATION_PER_HIT: 0.55,     // applied at blast center
+  DEVASTATION_DECAY_PER_TICK: 0.00012,  // ~1/5000 per tick ≈ fades in ~3.5 min
+  DEVASTATION_DEF_MULT: 0.35,    // at full devastation, terrain magnitude ×0.35
+  DEVASTATION_SPEED_MULT: 1.8,   // at full devastation, conquest speed ×1.8
   TERRAIN_SPEED: { 1: 16.5, 2: 20, 3: 25  },
 
   // ── Large-empire defense debuff (big defenders are slower/softer) ──
@@ -64,8 +72,10 @@ export const CONQUEST_CFG = {
     highland: [170, 156, 110, 255],  // khaki / olive
     mountain: [122, 116, 108, 255],  // gray-brown
     snow:     [232, 238, 244, 255],  // polar white / tundra
-    player:   [38, 200, 110, 255],   // green — frontier tint
-    enemy:    [220, 70, 70, 255],    // red — frontier tint
+    // TASK-103: stronger territory fills — countries must read instantly
+    // over the (now dark-neutral) roads + biome base.
+    player:   [46, 235, 125, 255],   // vivid green — frontier tint
+    enemy:    [240, 72, 72, 255],    // vivid red — frontier tint
   },
   // Latitude thresholds for biome selection
   SNOW_LAT: 62,        // |lat| above this → snow/tundra
@@ -300,6 +310,8 @@ export class ConquestGrid {
     this._dirtyCells = new Set();        // incremental: cell indices changed
     this._borderCells = new Set();       // cells currently drawn as territory borders
     this._countsOther = new Map();        // bot owner code → owned cell count (O(1) countCells)
+    this._devastation = new Float32Array(cfg.GRID_W * cfg.GRID_H);  // TASK-102 blast-weakening layer
+    this._devCursor = 0;                  // rotating decay cursor
 
     // Biome canvas: the globe's LAND surface, painted tile-by-tile from terrainByte[]
     // (one pixel per cell). This REPLACES the old static photo texture — same resolution
@@ -809,7 +821,7 @@ export class ConquestGrid {
     return null;
   }
 
-  // ── change ownership of one cell (updates counts + render dirty) ──
+    // ── change ownership of one cell (updates counts + render dirty) ──
   conquerCell(cell, newOwnerStr) {
     const cfg = this.cfg;
     const newCode = STR_TO_CODE[newOwnerStr];
@@ -817,6 +829,8 @@ export class ConquestGrid {
     if (old === newCode) return false;
     if (old === cfg.WATER) return false;          // can't conquer ocean
     this.owner[cell] = newCode;
+    // Occupation resets devastation (the new owner garrisons + repairs).
+    if (this._devastation) this._devastation[cell] = 0;
     // adjust counts (ALL owners — bots live in _countsOther for O(1) reads)
     if (old === cfg.PLAYER) this._counts.player--;
     else if (old === cfg.ENEMY) this._counts.enemy--;
@@ -830,7 +844,61 @@ export class ConquestGrid {
     return true;
   }
 
-  // ── seed a circular cluster of cells around a lat/lon as `ownerStr` ──
+  // ── DEVASTATION (TASK-102) ──
+  // Blast damage from missiles/bombs weakens territory: each hit paints
+  // DEVASTATION_PER_HIT at the center, falling off linearly to the blast
+  // rim (in CELLS, ~55km each). attackLogic reads it via devastationAt().
+  // Call from Missile.explode / warship shells / air strikes.
+  applyDevastation(lat, lon, radiusKm, power = 1) {
+    if (!this._devastation) return;
+    const cfg = this.cfg;
+    const center = this.latLonToCell(lat, lon);
+    const { col: cc, row: cr } = this.cellColRow(center);
+    const radiusDeg = radiusKm / 111.12;
+    const spanLat = Math.ceil(radiusDeg / cfg.CELL_DEG) + 1;
+    const spanLon = Math.ceil(radiusDeg / (cfg.CELL_DEG * Math.max(0.25, Math.cos(lat * Math.PI / 180)))) + 1;
+    const hit = cfg.DEVASTATION_PER_HIT * power;
+    const maxD = cfg.DEVASTATION_MAX;
+    for (let dr = -spanLat; dr <= spanLat; dr++) {
+      const row = cr + dr;
+      if (row < 0 || row >= cfg.GRID_H) continue;
+      const dyKm = dr * cfg.CELL_DEG * 111.12;
+      for (let dc = -spanLon; dc <= spanLon; dc++) {
+        let col = (cc + dc) % cfg.GRID_W;
+        if (col < 0) col += cfg.GRID_W;
+        const cell = row * cfg.GRID_W + col;
+        if (this.owner[cell] === cfg.WATER) continue;
+        const dxKm = dc * cfg.CELL_DEG * 111.12 * Math.cos(lat * Math.PI / 180);
+        const dist = Math.hypot(dyKm, dxKm);
+        if (dist > radiusKm) continue;
+        const fall = 1 - dist / Math.max(1, radiusKm);          // 1 at center → 0 at rim
+        const add = hit * fall;
+        const cur = this._devastation[cell];
+        this._devastation[cell] = cur + add > maxD ? maxD : cur + add;
+      }
+    }
+  }
+
+  devastationAt(cell) {
+    return this._devastation ? this._devastation[cell] : 0;
+  }
+
+  // Slow decay — call once per tick batch from the game loop.
+  decayDevastation(nCells = 800) {
+    if (!this._devastation) return;
+    const d = this._devastation;
+    const dec = this.cfg.DEVASTATION_DECAY_PER_TICK;
+    // rotating window: only touches nCells entries per call → O(nCells)
+    this._devCursor = (this._devCursor || 0) % d.length;
+    let idx = this._devCursor;
+    for (let i = 0; i < nCells; i++) {
+      const v = d[idx];
+      if (v > 0) d[idx] = v <= dec ? 0 : v - dec;
+      idx++;
+      if (idx >= d.length) idx = 0;
+    }
+    this._devCursor = idx;
+  }
   seedCircle(lat, lon, radiusKm, ownerStr) {
     const cfg = this.cfg;
     // Snap to nearest land cell if the clicked location falls on water in the grid
@@ -890,7 +958,7 @@ export class ConquestGrid {
       const o = this.owner[cell];
       if (isOwnedCode(o, cfg)) {
         const c = ownerColor(o, cfg);
-        data[p] = c[0]; data[p + 1] = c[1]; data[p + 2] = c[2]; data[p + 3] = 90;
+        data[p] = c[0]; data[p + 1] = c[1]; data[p + 2] = c[2]; data[p + 3] = 150;   // TASK-103: was 90 — nations must POP over neutral roads
       } else {
         data[p + 3] = 0;   // transparent — biome base shows through
       }
@@ -1024,7 +1092,13 @@ export function attackLogic(grid, attackTroops, attackerStr, defenderStr, cell, 
   const cfg = grid.cfg;
   const t = grid.terrainAtCell(cell);
   let mag = cfg.TERRAIN_MAG[t] || 80;
-  let speed = cfg.TERRAIN_SPEED[t] || 16.5;
+  const speed = cfg.TERRAIN_SPEED[t] || 16.5;
+
+  // TASK-102 DEVASTATION: blast-pounded cells fight back weaker AND fall
+  // faster — missiles now shape the land war (was: no effect at all).
+  const dev = grid.devastationAt ? grid.devastationAt(cell) : 0;
+  mag *= 1 - dev * (1 - cfg.DEVASTATION_DEF_MULT);
+  const devSpeed = 1 + dev * (cfg.DEVASTATION_SPEED_MULT - 1);
 
   // Any OWNED territory (player, legacy enemy, or a registered bot nation)
   const isBot = (s) => typeof s === 'string' && s.startsWith('bot');
@@ -1061,20 +1135,31 @@ export function attackLogic(grid, attackTroops, attackerStr, defenderStr, cell, 
     const altAttackerLoss = 1.3 * defenderTroopLoss * (mag / 100);
     const attackerTroopLoss = 0.6 * currentAttackerLoss + 0.4 * altAttackerLoss;
 
+    // TASK-102 TROOP-SCALE: absolute commitment now matters — losses scale
+    // DOWN with a large force (economy of force): a 10× bigger force takes
+    // a tile for ~half the per-tile cost (was: loss independent of size).
+    const forceEff = 1 / (1 + Math.log10(Math.max(1, attackTroops / 500)) * 0.5);
+
     return {
-      attackerTroopLoss,
+      attackerTroopLoss: attackerTroopLoss * Math.max(0.45, forceEff),
       defenderTroopLoss,
       tilesPerTickUsed:
         within(defTroops / (5 * Math.max(1, attackTroops)), 0.2, 1.5) *
-        speed * largeDefenderSpeedDebuff * largeAttackerSpeedBonus,
+        speed * devSpeed * largeDefenderSpeedDebuff * largeAttackerSpeedBonus,
     };
   } else {
     // vs neutral wilderness — OpenFront: bots expand at HALF the human cost
     // (attackerTroopLoss: bot ? mag/10 : mag/5).
+    // TASK-102 TROOP-SCALE: neutral expansion speed now scales with force
+    // commitment via sqrt (soft) instead of the old hard min(…,100) ceiling
+    // where 100 troops and 100,000 troops expanded at the SAME rate.
+    const forceScale = Math.sqrt(Math.max(1, attackTroops) / 100);
+    // TASK-102: big forces also lose FEWER troops per tile (economy of force).
+    const forceEff = Math.max(0.45, 1 / (1 + Math.log10(Math.max(1, attackTroops / 500)) * 0.5));
     return {
-      attackerTroopLoss: (attackerStr === 'enemy' || isBot(attackerStr)) ? mag / 10 : mag / 5,
+      attackerTroopLoss: ((attackerStr === 'enemy' || isBot(attackerStr)) ? mag / 10 : mag / 5) * forceEff,
       defenderTroopLoss: 0,
-      tilesPerTickUsed: within((2000 * Math.max(10, speed)) / Math.max(1, attackTroops), 5, 100),
+      tilesPerTickUsed: Math.min(100, (20 * Math.max(10, speed)) * forceScale * devSpeed),
     };
   }
 }
@@ -1090,7 +1175,11 @@ export function attackTilesPerTickCtx(grid, attackTroops, defenderStr, defenderT
       numAdjacentEnemyCells * 3
     );
   }
-  return numAdjacentEnemyCells * 2;
+  // TASK-102 TROOP-SCALE (neutral): tile rate now scales with committed force
+  // via sqrt — was a flat numAdjacent×2 where 100 and 100,000 troops were
+  // identical. 10k troops ≈ 10× faster expansion (capped by MAX_CELLS_PER_TICK).
+  const forceScale = Math.sqrt(Math.max(1, attackTroops) / 1000);
+  return numAdjacentEnemyCells * 2 * Math.min(10, forceScale);
 }
 
 // ════════════════════════════════════════════════════════════════════
