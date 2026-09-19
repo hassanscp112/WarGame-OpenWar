@@ -138,6 +138,41 @@ console.log('\n[A] ConquestGrid — dirty-region queue / devastation / heat');
   grid.decayDevastation(W * H);   // second pass fully heals the blast core
   ok(grid.flushDevastationRender() === true, 'A6 core heal flush true');
   ok(grid.devImage.data[px] === 0, 'A6 scorch healed to alpha 0');
+  ok(grid.devastationCellCount() === 0, 'A6 dev set drained after full heal (TASK-506)');
+
+  // ── TASK-506: set-based decay semantics ──────────────────────────────
+  // The old rotating-cursor sweep visited each grid cell once per ~9min —
+  // devastation never faded. Decay now visits ONLY live cells, so fade time
+  // is grid-size independent, and occupation clears the scorch VISUALLY.
+  {
+    const g2 = new ConquestGrid(TEST_CFG);
+    g2.owner.fill(TEST_CFG.NEUTRAL);
+    const { lat, lon } = g2.cellToLatLon(100 * W + 100);
+    g2.applyDevastation(lat, lon, 60, 1);
+    const cellsLive = g2.devastationCellCount();
+    ok(cellsLive > 0 && cellsLive < W * H, 'A7 decay tracks only live cells (' + cellsLive + ' of ' + (W * H) + ')');
+    // Fade independent of grid size: with decay=0.5 and a budget that covers
+    // the live set, two visits fully heal (0.55→0.05→0) no matter how big N is.
+    let visits = 0;
+    while (g2.devastationCellCount() > 0 && visits < 100) { g2.decayDevastation(1600); visits++; }
+    ok(g2.devastationCellCount() === 0, 'A7 bounded-budget loop fully heals set (visits=' + visits + ')');
+    // Occupation clears the VISUAL scorch instantly (bucket + dirty + set):
+    const g3 = new ConquestGrid(TEST_CFG);
+    g3.owner.fill(TEST_CFG.NEUTRAL);
+    const c3 = 100 * W + 100;
+    const ll3 = g3.cellToLatLon(c3);
+    g3.applyDevastation(ll3.lat, ll3.lon, 60, 1);
+    g3.flushDevastationRender();
+    const px3 = c3 * 4 + 3;
+    const liveBefore = g3.devastationCellCount();
+    ok(g3.devImage.data[px3] > 0, 'A7 scorch painted before occupation (' + g3.devImage.data[px3] + ' live=' + liveBefore + ')');
+    g3.conquerCell(c3, 'player');                    // occupation resets devastation
+    ok(g3.devastationAt(c3) === 0, 'A7 occupation zeroes logical devastation');
+    ok(g3.hasDevDirty() === true, 'A7 occupation queues scorch repaint (TASK-506 visual fix)');
+    g3.flushDevastationRender();
+    ok(g3.devImage.data[px3] === 0, 'A7 occupation heals scorch pixel to alpha 0');
+    ok(g3.devastationCellCount() === liveBefore - 1, 'A7 occupied cell left the dev set (' + liveBefore + '→' + g3.devastationCellCount() + ')');
+  }
 }
 
 // ═══ B. world/render.js module contract ═══

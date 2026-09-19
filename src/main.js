@@ -15573,7 +15573,9 @@ function loop(now) {
         _refreshMissileHud();
     }
 
-    // TASK-102: devastation decay (rotating window — O(800)/frame)
+    // TASK-102/506: devastation decay — set-based, visits only live-devastation
+    // cells (blasts are sparse; the old full-grid rotating sweep never decayed
+    // anything in practice). O(live cells)/call, bounded by DEVASTATION_SET_CAP.
     if (conquestGrid && conquestGrid.decayDevastation && frame % 2 === 0) {
         conquestGrid.decayDevastation(1600);
     }

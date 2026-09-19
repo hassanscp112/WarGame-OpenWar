@@ -44,7 +44,16 @@ export const CONQUEST_CFG = {
   // take. decays slowly so saturation fades after ~3-4 minutes of peace.
   DEVASTATION_MAX: 1.0,          // full weakness cap
   DEVASTATION_PER_HIT: 0.55,     // applied at blast center
-  DEVASTATION_DECAY_PER_TICK: 0.00012,  // ~1/5000 per tick ≈ fades in ~3.5 min
+  // TASK-506: per-DECAY-CALL step. decayDevastation() visits every live
+  // devastation cell each call (~30 calls/s from the render loop), so a full
+  // blast (0.55) heals in 0.55/0.00012/30 ≈ 150s ≈ 2.5min of peace. (The old
+  // rotating-cursor implementation swept the whole 25.9M-cell grid at 48k
+  // cells/s — each cell was visited once per ~9 MINUTES, making decay
+  // effectively never happen.)
+  DEVASTATION_DECAY_PER_TICK: 0.00012,
+  // Safety cap on the live-devastation set (cells with dev>0). Each blast
+  // paints ~100-300 cells; even a sustained total war stays well under this.
+  DEVASTATION_SET_CAP: 200000,
   DEVASTATION_DEF_MULT: 0.35,    // at full devastation, terrain magnitude ×0.35
   DEVASTATION_SPEED_MULT: 1.8,   // at full devastation, conquest speed ×1.8
   // ── TASK-406: devastation VISUAL layer (scorch reads on the globe) ──
@@ -317,7 +326,11 @@ export class ConquestGrid {
     this._borderCells = new Set();       // cells currently drawn as territory borders
     this._countsOther = new Map();        // bot owner code → owned cell count (O(1) countCells)
     this._devastation = new Float32Array(cfg.GRID_W * cfg.GRID_H);  // TASK-102 blast-weakening layer
-    this._devCursor = 0;                  // rotating decay cursor
+    this._devCursor = 0;                  // rotating decay cursor (legacy, kept for API compat)
+    // TASK-506: live-devastation set — decay iterates ONLY these cells
+    // (blasts are sparse; the old full-grid rotating sweep never revisited a
+    // cell often enough for the decay constant to matter).
+    this._devSet = new Set();
 
     // TASK-406: devastation VISUAL layer — a second canvas painted with a
     // scorched tint whose alpha follows the logical devastation value and
@@ -905,8 +918,18 @@ export class ConquestGrid {
     if (old === newCode) return false;
     if (old === cfg.WATER) return false;          // can't conquer ocean
     this.owner[cell] = newCode;
-    // Occupation resets devastation (the new owner garrisons + repairs).
-    if (this._devastation) this._devastation[cell] = 0;
+    // Occupation resets devastation (the new owner garrisons + repairs) —
+    // BOTH the logical value and the visual scorch pixel (TASK-506: the old
+    // code zeroed the value but never touched the bucket/dirty set, so a
+    // captured land kept its scorch overlay forever).
+    if (this._devastation && this._devastation[cell] > 0) {
+      this._devastation[cell] = 0;
+      this._devSet.delete(cell);
+      if (this._devBuckets[cell] !== 0) {
+        this._devBuckets[cell] = 0;
+        this._devDirty.add(cell);
+      }
+    }
     // adjust counts (ALL owners — bots live in _countsOther for O(1) reads)
     if (old === cfg.PLAYER) this._counts.player--;
     else if (old === cfg.ENEMY) this._counts.enemy--;
@@ -1040,6 +1063,7 @@ export class ConquestGrid {
         const add = hit * fall;
         const cur = this._devastation[cell];
         const nv = cur + add > maxD ? maxD : cur + add;
+        if (nv > 0 && this._devSet.size < cfg.DEVASTATION_SET_CAP) this._devSet.add(cell);
         this._devastation[cell] = nv;
         // TASK-406: track the visual bucket — repaint only when it changes
         const nb = Math.min(cfg.DEV_VIS_LEVELS - 1, Math.round(nv * (cfg.DEV_VIS_LEVELS - 1)));
@@ -1055,32 +1079,35 @@ export class ConquestGrid {
     return this._devastation ? this._devastation[cell] : 0;
   }
 
-  // Slow decay — call once per tick batch from the game loop.
-  decayDevastation(nCells = 800) {
-    if (!this._devastation) return;
+  // TASK-506: decay — iterates ONLY the live-devastation set (cells that
+  // actually carry dev>0), so every devastated cell decays at the full
+  // per-call rate regardless of grid size. nCells remains a per-call budget
+  // cap (defensive only — the set is bounded by DEVASTATION_SET_CAP; entries
+  // beyond the budget decay on a later call). Cells that hit 0 are removed
+  // from the set; bucket changes queue a scorch-pixel repaint.
+  decayDevastation(nCells = 1600) {
+    if (!this._devastation || this._devSet.size === 0) return;
     const d = this._devastation;
     const dec = this.cfg.DEVASTATION_DECAY_PER_TICK;
-    // rotating window: only touches nCells entries per call → O(nCells)
-    this._devCursor = (this._devCursor || 0) % d.length;
-    let idx = this._devCursor;
     const L = this.cfg.DEV_VIS_LEVELS - 1;
-    for (let i = 0; i < nCells; i++) {
+    let budget = Math.min(nCells, this._devSet.size);
+    for (const idx of this._devSet) {
+      if (budget-- <= 0) break;
       const v = d[idx];
-      if (v > 0) {
-        const nv = v <= dec ? 0 : v - dec;
-        d[idx] = nv;
-        // TASK-406: bucket change → scorch pixel repaint (usually stays same → no-op)
-        const nb = nv <= 0 ? 0 : Math.min(L, Math.round(nv * L));
-        if (nb !== this._devBuckets[idx]) {
-          this._devBuckets[idx] = nb;
-          this._devDirty.add(idx);
-        }
+      if (v <= 0) { this._devSet.delete(idx); continue; }   // stale zero (cleared elsewhere)
+      const nv = v <= dec ? 0 : v - dec;
+      d[idx] = nv;
+      if (nv === 0) this._devSet.delete(idx);
+      // bucket change → scorch pixel repaint (usually stays same → no-op)
+      const nb = nv <= 0 ? 0 : Math.min(L, Math.round(nv * L));
+      if (nb !== this._devBuckets[idx]) {
+        this._devBuckets[idx] = nb;
+        this._devDirty.add(idx);
       }
-      idx++;
-      if (idx >= d.length) idx = 0;
     }
-    this._devCursor = idx;
   }
+  // Introspection for probes/tests: how many cells currently carry devastation.
+  devastationCellCount() { return this._devSet.size; }
   seedCircle(lat, lon, radiusKm, ownerStr) {
     const cfg = this.cfg;
     // Snap to nearest land cell if the clicked location falls on water in the grid
@@ -1145,11 +1172,10 @@ export class ConquestGrid {
         data[p + 3] = 0;   // transparent — biome base shows through
       }
     };
-    const clearCell = (cell) => {
-      const p = cell * 4;
-      data[p + 3] = 0;
-    };
-    // ── Territory border: darken owned cells whose neighbor has a different owner ──
+    // ── Territory border: owned cells whose neighbor has a different owner ──
+    // (membership feeds the vector frontier lines + AI frontline targeting;
+    // the canvas itself no longer darkens border pixels — TASK-406 removed the
+    // per-pixel darkening in favour of the crisp vector overlay.)
     const isBorderCell = (cell) => {
       const o = this.owner[cell];
       if (!isOwnedCode(o, cfg)) return false;
@@ -1160,24 +1186,6 @@ export class ConquestGrid {
       if (row > 0 && this.owner[cell - W] !== o) return true;                      // north
       if (row < H - 1 && this.owner[cell + W] !== o) return true;                  // south
       return false;
-    };
-    // Frontier edge: push an owned border cell harder toward its owner color + darken,
-    // so the territory outline reads as a clear green (player) / red (enemy) line over
-    // the photo biome base.
-    const darkenCell = (cell) => {
-      const o = this.owner[cell];
-      const tint = isOwnedCode(o, cfg) ? ownerColor(o, cfg) : null;
-      const p = cell * 4;
-      if (tint) {
-        // 75% owner tint + 25% current, then ×0.70 for contrast
-        data[p]     = ((data[p]     * 0.25 + tint[0] * 0.75) * 0.70) | 0;
-        data[p + 1] = ((data[p + 1] * 0.25 + tint[1] * 0.75) * 0.70) | 0;
-        data[p + 2] = ((data[p + 2] * 0.25 + tint[2] * 0.75) * 0.70) | 0;
-      } else {
-        data[p]     = (data[p]     * 0.30) | 0;
-        data[p + 1] = (data[p + 1] * 0.30) | 0;
-        data[p + 2] = (data[p + 2] * 0.30) | 0;
-      }
     };
 
     let dirtyRect = null; // null = full-canvas copy; otherwise {x,y,w,h}
@@ -1224,9 +1232,9 @@ export class ConquestGrid {
         const n = this.neighbors4(cell, nbBuf);
         for (let k = 0; k < n; k++) recheck.add(nbBuf[k]);
       }
-      // Step 1: repaint dirty cells (ownership may have changed)
+      // Step 1: repaint dirty cells (ownership may have changed — paintCell
+      // fully overwrites the pixel for owned cells and clears alpha otherwise)
       for (const cell of this._dirtyCells) {
-        clearCell(cell);
         paintCell(cell);
       }
       // Step 2: restore normal color for all recheck cells (undo prior border darkening)
@@ -1241,8 +1249,7 @@ export class ConquestGrid {
         } else {
           this._borderCells.delete(cell);
         }
-      }
-      // Bounding box of every touched cell → only copy that slice to the canvas.
+      }      // Bounding box of every touched cell → only copy that slice to the canvas.
       // At 7200x3600 a full putImageData (~104MB) every conquest tick would stutter;
       // the dirty rect bounds the copy to just the changed region.
       let minC = W, minR = H, maxC = -1, maxR = -1;
@@ -1692,10 +1699,9 @@ _enqueueTargetCell(attackerCell, targetCell) {
       this.ctx.addTroops(this.target, -wiped);
       if (this.ctx.onLosses && wiped > 0) this.ctx.onLosses(this.target, wiped);   // TASK-406 morale
     }
+    // Elimination logging is owned by ctx.onEliminated (main.js) — it knows bot
+    // names/flags; the old generic log here duplicated every elimination notice.
     if (this.ctx.onEliminated) this.ctx.onEliminated(this.owner, this.target);
-    if (this.ctx.log) {
-      this.ctx.log(`تم القضاء على قوات ${this.target === 'player' ? 'اللاعب' : 'العدو'}!`, 'info');
-    }
   }
 
   _end() {
