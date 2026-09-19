@@ -1,4 +1,5 @@
 import { MCFG, MTAGS, PCFG, DCFG, TCFG, GAME_CONSTANTS, WORLD_CITIES, SDEFS, ITEM_ICONS, TECH_TREE, BOT_COUNTRIES, BOTS_MAX } from './data/constants.js';
+import { FormationLayout, TANK_BEHAVIORS, IndirectFire } from './land/landUnits.js';   // TASK-405
 import { ConquestGrid, ConquestAttack, CONQUEST_CFG, registerOwner, clearRegisteredOwners, setBiomeFlatMode, setBiomeBandColor, getBiomeBandColor, getBiomeBands, attackLogic, attackTilesPerTickCtx } from './core/conquest.js';
 import { initNewUI, uiToast } from './ui.js';
 window.GEO_DATA_ROADS = [];
@@ -8342,19 +8343,37 @@ function loadTankModels() {
 // ground ring, matching the game's dark-body/bright-accent language.
 function buildTankModel(key, acc) {
     const g = new THREE.Group();
-    const reg = TANK_MODELS[key];
-    if (reg) {
-        g.add(reg.group.clone(true));
+    if (key === 'spg') {
+        // TASK-405 ARTILLERY: gun-carrier silhouette — medium chassis (FBX
+        // when the pack loaded, procedural otherwise) + a big ELEVATED
+        // howitzer + rear recoil spade. Reads "bombardment", not "tank duel".
+        const mreg = TANK_MODELS.medium;
+        if (mreg) {
+            g.add(mreg.group.clone(true));
+        } else {
+            _M(g, _box(2.4, 0.9, 5.2), _sm(LP.METAL), 0, 0.9, 0);                // hull
+            _M(g, _box(2.7, 0.6, 5.6), _sm(LP.DARK), 0, 0.32, 0);               // skirt band
+            _M(g, _box(0.6, 0.7, 5.7), _sm(LP.TIRE), -1.15, 0.35, 0);           // left track
+            _M(g, _box(0.6, 0.7, 5.7), _sm(LP.TIRE), 1.15, 0.35, 0);            // right track
+            _M(g, _box(1.9, 0.9, 2.2), _sm(LP.METAL), 0, 1.75, -0.7);           // casemate
+        }
+        _M(g, _cyl(0.15, 0.15, 4.8, 6), _sm(LP.DARK), 0, 2.15, 1.15, Math.PI / 2 - 0.52);  // howitzer ↑ ~30°
+        _M(g, _box(0.6, 0.55, 0.25), _sm(LP.DARK), 0, 0.55, -2.55);             // recoil spade
     } else {
-        const body = key === 'heavy' ? LP.CONCRETE : key === 'light' ? LP.LIGHT : LP.METAL;
-        const gunLen = key === 'heavy' ? 4.0 : key === 'medium' ? 3.2 : 2.4;
-        _M(g, _box(2.4, 1.0, 6.2), _sm(body), 0, 0.95, 0);                     // hull
-        _M(g, _box(2.7, 0.6, 6.6), _sm(LP.DARK), 0, 0.32, 0);                  // skirt band
-        _M(g, _box(0.6, 0.7, 6.7), _sm(LP.TIRE), -1.15, 0.35, 0);              // left track
-        _M(g, _box(0.6, 0.7, 6.7), _sm(LP.TIRE), 1.15, 0.35, 0);               // right track
-        _M(g, _box(1.8, 0.8, 2.6), _sm(body), 0, 1.85, -0.4);                  // turret
-        _M(g, _cyl(0.1, 0.1, gunLen, 6), _sm(LP.DARK), 0, 1.95, 0.7 + gunLen / 2 - 0.4, Math.PI / 2, 0, 0); // main gun (+Z)
-        _M(g, _box(0.55, 0.3, 0.55), _sm(LP.DARK), 0, 2.4, -1.25);             // cupola
+        const reg = TANK_MODELS[key];
+        if (reg) {
+            g.add(reg.group.clone(true));
+        } else {
+            const body = key === 'heavy' ? LP.CONCRETE : key === 'light' ? LP.LIGHT : LP.METAL;
+            const gunLen = key === 'heavy' ? 4.0 : key === 'medium' ? 3.2 : 2.4;
+            _M(g, _box(2.4, 1.0, 6.2), _sm(body), 0, 0.95, 0);                     // hull
+            _M(g, _box(2.7, 0.6, 6.6), _sm(LP.DARK), 0, 0.32, 0);                  // skirt band
+            _M(g, _box(0.6, 0.7, 6.7), _sm(LP.TIRE), -1.15, 0.35, 0);              // left track
+            _M(g, _box(0.6, 0.7, 6.7), _sm(LP.TIRE), 1.15, 0.35, 0);               // right track
+            _M(g, _box(1.8, 0.8, 2.6), _sm(body), 0, 1.85, -0.4);                  // turret
+            _M(g, _cyl(0.1, 0.1, gunLen, 6), _sm(LP.DARK), 0, 1.95, 0.7 + gunLen / 2 - 0.4, Math.PI / 2, 0, 0); // main gun (+Z)
+            _M(g, _box(0.55, 0.3, 0.55), _sm(LP.DARK), 0, 2.4, -1.25);             // cupola
+        }
     }
     // Owner accents (per-instance materials — disposed with the division)
     _M(g, _cyl(0.05, 0.05, 1.7, 4), _sm(LP.METAL), 0.8, 2.1, -1.5);           // pennant mast
@@ -8377,6 +8396,126 @@ const _tkV1 = new THREE.Vector3();
 const _tkV2 = new THREE.Vector3();
 const _tkV3 = new THREE.Vector3();
 const _tkV4 = new THREE.Vector3();
+const _tkV5 = new THREE.Vector3();   // TASK-405: dust/rear positions
+const _tkV6 = new THREE.Vector3();
+
+// ── TASK-405 deep-pass module state ─────────────────────────────────
+let tankWrecks = [];    // burning wrecks: {mesh, t, lat, lon, id, tex}
+let spgShells = [];     // indirect-fire shells in flight (bezier arcs)
+const TANK_DUST_COL = { 1: 0xb8a878, 2: 0x8a6f52, 3: 0x9a9a92 };   // plains/highland/mountain
+const TANK_ACE_AR = ['', 'محاربة قديمة', 'آس', 'آس الآسات'];
+
+// SPOTTING (indirect fire gate): a target beyond the battery's own sightR
+// is only engaged when a friendly eye sees it — recon drone on station,
+// light scout division in the area, or the shared radar chain (EMP-aware).
+function _spottedBy(owner, lat, lon) {
+    const C = GAME_CONSTANTS;
+    if (_radarCovers(lat, lon, owner)) return true;   // radar structs (missiles agent's helper — EMP-aware)
+    for (const d of drones) {
+        if (d.dead || d.owner !== owner || d.cfg.type !== 'recon') continue;
+        if (haversineDist(lat, lon, d.lat, d.lon) < C.TANK_SPOT_R_KM) return true;
+    }
+    for (const t of tanks) {
+        if (t.dead || t.owner !== owner || t.key !== 'light') continue;
+        if (haversineDist(lat, lon, t.lat, t.lon) < t.cfg.sightR) return true;
+    }
+    return false;
+}
+
+// Indirect shell impact: splash damage around the AIM POINT (target pos at
+// fire time — real artillery beats a moving grid reference, not a tracker).
+function _spgShellImpact(s) {
+    const C = GAME_CONSTANTS;
+    scene.remove(s.mesh);
+    spawnExp(s.lat, s.lon, 5, '#ff8844');
+    if (conquestGrid && conquestGrid.applyDevastation) {
+        conquestGrid.applyDevastation(s.lat, s.lon, 35, 0.25);
+    }
+    if (SFX && SFX.exp) SFX.exp(40, false);
+    // primary: enemy structure closest to the splash
+    let prim = null, pd = C.TANK_SPG_SPLASH_KM;
+    for (const st of structs) {
+        if (st.dead || st.owner === s.owner || st.owner === 'neutral') continue;
+        const d = haversineDist(s.lat, s.lon, st.lat, st.lon);
+        if (d < pd) { pd = d; prim = st; }
+    }
+    if (prim) {
+        prim.hit(s.dmg * s.structMul);
+        if (prim.dead && s.src && !s.src.dead) s.src._creditKill();
+    }
+    // splash: armor + troops in the footprint
+    for (const tk of tanks) {
+        if (tk.dead || tk.owner === s.owner) continue;
+        if (haversineDist(s.lat, s.lon, tk.lat, tk.lon) < 20) tk.hit(s.dmg, s.owner);
+    }
+    for (const tc of troopCohorts) {
+        if (tc.dead || tc.owner === s.owner) continue;
+        const ll = vec3ToLatLon(tc.mesh.position);
+        if (haversineDist(s.lat, s.lon, ll.lat, ll.lon) < 25) {
+            const kill = Math.floor(s.dmg * s.troopMul * 12);
+            tc.troops -= kill;
+            if (tc.troops <= 0 && !tc.dead) {
+                tc.dead = true;
+                scene.remove(tc.mesh);
+                if (tc.mesh.material) tc.mesh.material.dispose();
+            }
+        }
+    }
+}
+
+function _updateSpgShells() {
+    for (let i = spgShells.length - 1; i >= 0; i--) {
+        const s = spgShells[i];
+        s.t += (1 / 60) / s.dur;
+        if (s.t >= 1) {
+            spgShells.splice(i, 1);
+            _spgShellImpact(s);
+            continue;
+        }
+        IndirectFire.at(s.from, s.ctrl, s.to, s.t, s.mesh.position);
+    }
+}
+
+// Burning wrecks: fire + smoke for TANK_WRECK_FRAMES, then shrink-fade.
+function _updateTankWrecks() {
+    for (let i = tankWrecks.length - 1; i >= 0; i--) {
+        const w = tankWrecks[i];
+        w.t--;
+        if (w.t <= 0) {
+            scene.remove(w.mesh);
+            disposeMeshDeep(w.mesh);
+            if (w.tex) w.tex.dispose();
+            tankWrecks.splice(i, 1);
+            continue;
+        }
+        if (frame % 14 === (w.id % 14)) {
+            spawnExp(w.lat + rnd(-0.15, 0.15), w.lon + rnd(-0.15, 0.15), 1.6, '#ff7733');
+        }
+        if (frame % 10 === (w.id % 10)) {
+            _puffAt(latLonToVec3(w.lat, w.lon, EARTH_RADIUS + 6), 0x2b2b30, 3.2,
+                new THREE.Vector3().copy(latLonToVec3(w.lat, w.lon, 1)).normalize().multiplyScalar(0.5), 40);
+        }
+        if (w.t < 90) w.mesh.scale.multiplyScalar(0.94);   // fade-out by shrink
+    }
+}
+
+// One gameFrame line for the whole deep-pass FX/state layer.
+function _tankDeepTick() {
+    _updateTankWrecks();
+    _updateSpgShells();
+}
+
+// Reset helper: purge wrecks + shells (called from the reset paths).
+function _clearTankDeep() {
+    for (const w of tankWrecks) {
+        scene.remove(w.mesh);
+        disposeMeshDeep(w.mesh);
+        if (w.tex) w.tex.dispose();
+    }
+    tankWrecks = [];
+    for (const s of spgShells) scene.remove(s.mesh);
+    spgShells = [];
+}
 
 class Tank {
     // O(1) land probe: conquest grid when ready (mode 1), else the GeoJSON
@@ -8395,6 +8534,7 @@ class Tank {
         this.key = TCFG[key] ? key : 'medium';
         this.cfg = TCFG[this.key];
         this.name = this.cfg.name;
+        this.behavior = TANK_BEHAVIORS[this.key] || TANK_BEHAVIORS.medium;   // TASK-405 per-class knobs
         this.hp = this.cfg.hp; this.maxHp = this.cfg.hp;
         this.dead = false; this.selected = false;
         this.isTank = true;
@@ -8406,17 +8546,27 @@ class Tank {
         this.fireCd = this.cfg.fireRate >> 1;
         this.retargetT = this.id % 30;
         this.shots = 0;
+        // TASK-405 deep-pass state
+        this.kills = 0; this.ace = 0;                 // veterancy (aces)
+        this.entrench = 0;                            // 0..1 dig-in progress
+        this.unsupplied = false; this.supplyGrace = 0;// logistics
+        this._supplyT = (this.id % 90) + 10;          // staggered supply scan
+        this._flakT = (this.id % 90) + 40;            // staggered flak chip scan
+        this._dustT = 0;
+        this._crossing = false; this._crossT = 0;     // river/strait crossing
+        this._traverseCos = Math.cos(C.TANK_TRAVERSE_TOL);
         this._radius = EARTH_RADIUS + C.TANK_ALT;
         this._faceVec = null;
         this._lastDir = null;
         // Division formation: wedge of N vehicles (lead front), sharing one group
+        // (TASK-405: offsets come from the shared FormationLayout util)
         const acc = ownerHexColor(owner);
         this.mesh = new THREE.Group();
         this.members = [];
         for (let i = 0; i < this.cfg.tanks; i++) {
             const m = buildTankModel(this.key, acc);
-            const row = Math.ceil(i / 2), side = i % 2 === 0 ? -1 : 1;
-            m.position.set(i === 0 ? 0 : side * (2.4 + row * 0.35), 0, i === 0 ? 0 : -3.1 * row);
+            const o = FormationLayout.wedge(i, 2.4);
+            m.position.set(o.x, 0, o.z);
             this.mesh.add(m);
             this.members.push(m);
         }
@@ -8432,9 +8582,16 @@ class Tank {
         this.selRing.position.y = 0.4;
         this.selRing.visible = false;
         this.mesh.add(this.selRing);
+        this._buildSandbags();   // TASK-405: entrenchment ring (hidden until dug)
+        this._buildBanner();     // TASK-405: division banner (kills/state)
     }
     get type() { return 'tank_' + this.key; }
     get pos() { return this.mesh.position; }
+    // TASK-405 derived state
+    get aceMul() { return 1 + this.ace * GAME_CONSTANTS.TANK_ACE_DMG; }
+    get armorEff() { return Math.min(0.85, this.cfg.armor + this.ace * GAME_CONSTANTS.TANK_ACE_ARMOR); }
+    get engineDamaged() { return this.hp < this.maxHp * GAME_CONSTANTS.TANK_ENGINE_HP; }
+    get entrenched() { return this.entrench >= 1; }
 
     // Player/bot move order — the division marches there over LAND.
     setMoveTarget(lat, lon) {
@@ -8444,23 +8601,36 @@ class Tank {
 
     // Public damage API (parity with Structure.hit / Warship.hit) — armor
     // flat-reduces everything: shells, missile blasts, bombs.
-    hit(dmg) {
+    // TASK-405: aces thicken armor (capped), entrenchment soaks 50% at full
+    // dig-in, and divisions caught midstream (river crossing) take +25%.
+    hit(dmg, fromOwner) {
         if (this.dead) return;
-        this.hp -= dmg * (1 - this.cfg.armor);
+        const C = GAME_CONSTANTS;
+        let d = dmg;
+        if (this._crossing) d *= C.TANK_RIVER_VULN_MUL;
+        if (this.entrench > 0) d *= 1 - C.TANK_ENTRENCH_ARMOR * this.entrench;
+        this.hp -= d * (1 - this.armorEff);
         this._syncMembers();
         if (this.hp <= 0) this._destroy();
     }
 
     _destroy() {
+        if (this.dead) return;
         this.dead = true;
+        this.selected = false;
         spawnExp(this.lat, this.lon, 6, '#ff7733');
         _spawnCrater(this.lat, this.lon, GAME_CONSTANTS.TANK_WRECK_DEV_R);   // burning wreck scar
         if (conquestGrid && conquestGrid.applyDevastation) {
             conquestGrid.applyDevastation(this.lat, this.lon, GAME_CONSTANTS.TANK_WRECK_DEV_R, 0.8);
         }
         if (this.selRing && this.selRing.material) this.selRing.material.dispose();
-        scene.remove(this.mesh);
-        disposeMeshDeep(this.mesh);
+        this.mesh.remove(this.selRing);
+        if (this.banner) this.banner.visible = false;
+        if (this.sandbags) this.sandbags.visible = false;
+        // TASK-405: the hulls stay on the field as a BURNING WRECK (fire +
+        // smoke, shrink-fade) instead of vanishing — see _updateTankWrecks.
+        tankWrecks.push({ mesh: this.mesh, t: GAME_CONSTANTS.TANK_WRECK_FRAMES,
+            lat: this.lat, lon: this.lon, id: this.id, tex: this._bannerTex || null });
         if (this.owner === 'player') logEvent(`💥 دُمرت ${this.name} لدينا!`, 'err');
         else if (this.owner === myRole) logEvent(`💥 دُمرت فرقة حليفة!`, 'err');
         else logEvent(`💥 أُبيدت فرقة مدرعة معادية ${_ownerName(this.owner)}!`, 'info');
@@ -8478,34 +8648,51 @@ class Tank {
     }
 
     // ── targeting (every 30 frames, staggered) ──
+    // TASK-405: data-driven priority per behavior — artillery hunts
+    // STRUCTURES first (siege role), armor hunts TANKS first (duels).
     _retarget() {
-        const R = this.cfg.engageR;
-        let best = null, bestD = Infinity;
-        // Priority 1: enemy armor (tank duels decide breakthroughs)
-        for (const t of tanks) {
-            if (t.dead || t.owner === this.owner) continue;
-            const d = haversineDist(this.lat, this.lon, t.lat, t.lon);
-            if (d < bestD) { bestD = d; best = { kind: 'tank', obj: t }; }
-        }
-        if (!best || bestD > R) {
-            best = null; bestD = R;
-            // Priority 2: enemy structures (armor shreds buildings)
-            for (const s of structs) {
-                if (s.dead || s.owner === this.owner || s.owner === 'neutral') continue;
-                const d = haversineDist(this.lat, this.lon, s.lat, s.lon);
-                if (d < bestD) { bestD = d; best = { kind: 'struct', obj: s }; }
+        const C = GAME_CONSTANTS;
+        const arty = !!this.behavior.indirect;
+        const order = arty ? ['struct', 'tank', 'cohort'] : ['tank', 'struct', 'cohort'];
+        this.target = null;
+        for (const kind of order) {
+            let best = null, bestD = Infinity;
+            if (kind === 'tank') {
+                for (const t of tanks) {
+                    if (t.dead || t.owner === this.owner) continue;
+                    const d = haversineDist(this.lat, this.lon, t.lat, t.lon);
+                    if (d < bestD) { bestD = d; best = t; }
+                }
+            } else if (kind === 'struct') {
+                for (const s of structs) {
+                    if (s.dead || s.owner === this.owner || s.owner === 'neutral') continue;
+                    const d = haversineDist(this.lat, this.lon, s.lat, s.lon);
+                    if (d < bestD) { bestD = d; best = s; }
+                }
+            } else {
+                for (const tc of troopCohorts) {
+                    if (tc.dead || tc.owner === this.owner) continue;
+                    const ll = vec3ToLatLon(tc.mesh.position);
+                    const d = haversineDist(this.lat, this.lon, ll.lat, ll.lon);
+                    if (d < bestD) { bestD = d; best = tc; }
+                }
             }
-        }
-        if (!best) {
-            // Priority 3: enemy troop cohorts in the open
-            for (const tc of troopCohorts) {
-                if (tc.dead || tc.owner === this.owner) continue;
-                const ll = vec3ToLatLon(tc.mesh.position);
-                const d = haversineDist(this.lat, this.lon, ll.lat, ll.lon);
-                if (d < bestD) { bestD = d; best = { kind: 'cohort', obj: tc }; }
+            if (!best || bestD > this.cfg.engageR) continue;
+            // ARTILLERY GATES: howitzers can't depress inside the dead zone,
+            // and beyond the battery's own sightR the target must be SPOTTED
+            // (recon drone / light scout division / radar chain).
+            if (arty) {
+                if (bestD < C.TANK_SPG_DEADZONE_KM) continue;
+                let p;
+                if (kind === 'cohort') {
+                    const ll = vec3ToLatLon(best.mesh.position);
+                    p = { lat: ll.lat, lon: ll.lon };
+                } else p = { lat: best.lat, lon: best.lon };
+                if (bestD > this.cfg.sightR && !_spottedBy(this.owner, p.lat, p.lon)) continue;
             }
+            this.target = { kind, obj: best };
+            break;
         }
-        this.target = best;
     }
     _validateTarget() {
         const t = this.target;
@@ -8520,16 +8707,31 @@ class Tank {
         return { lat: o.lat, lon: o.lon };
     }
 
-    // ── gunnery: flat direct-fire tracer (tank engagement) ──
+    // ── gunnery ──
+    // Direct fire: flat tracer, damage on the pull of the trigger.
+    // Indirect fire (SPG): the shell arcs to the AIM POINT and splashes on
+    // impact — the target may have moved; that's artillery.
     _fire(t, tp) {
-        const dmg = this.cfg.gunDmg;
+        const C = GAME_CONSTANTS;
+        const dmg = this.cfg.gunDmg * this.aceMul;   // aces shoot harder
+        this.fireCd = this.cfg.fireRate * (this.unsupplied ? C.TANK_SUPPLY_RELOAD_MUL : 1);
+        this.shots++;
+        if (this.behavior.indirect) { this._fireArc(t, tp, dmg); return; }
         const muzzle = this.mesh.position.clone().addScaledVector(this.mesh.position.clone().normalize(), 4);
         _tracer(muzzle, latLonToVec3(tp.lat, tp.lon, EARTH_RADIUS + 2), 0xffcc55);
-        spawnExp(this.lat, this.lon, 1.2, '#ffee99');   // muzzle flash
-        this.fireCd = this.cfg.fireRate;
-        this.shots++;
+        spawnExp(this.lat, this.lon, 1.4, '#ffee99');   // muzzle flash
+        // TASK-405 polish: muzzle blast ring + ejected shell casing
+        _puffAt(muzzle, 0xffd27a, 2.2, null, 10);
+        const nrm = this.mesh.position.clone().normalize();
+        const side = new THREE.Vector3().crossVectors(this._faceVec || nrm, nrm).normalize();
+        _puffAt(muzzle.clone().addScaledVector(side, 2.5).addScaledVector(nrm, 2), 0xd8c34a, 0.8,
+            side.multiplyScalar(0.5).addScaledVector(nrm, 0.7), 22);   // casing pops out
+        this._applyDirect(t, dmg);
+        if (SFX && SFX.gun) SFX.gun();
+    }
+    _applyDirect(t, dmg) {
         if (t.kind === 'tank') {
-            t.obj.hit(dmg);
+            t.obj.hit(dmg, this.owner);
         } else if (t.kind === 'cohort') {
             const kill = Math.floor(dmg * this.cfg.troopMul * 12);
             t.obj.troops -= kill;
@@ -8541,14 +8743,61 @@ class Tank {
         } else {
             t.obj.hit(dmg * this.cfg.structMul);
         }
+        if (t.obj.dead) this._creditKill();   // aces are EARNED, not awarded
+    }
+    _fireArc(t, tp, dmg) {
+        const C = GAME_CONSTANTS;
+        const from = this.mesh.position.clone();
+        const to = latLonToVec3(tp.lat, tp.lon, this._radius);
+        const ctrl = IndirectFire.ctrl(from, to, C.TANK_SPG_ARC_H);
+        const mesh = new THREE.Mesh(_sph(1.5, 8, 6), getSharedMat(0xffaa44));
+        mesh.position.copy(from);
+        scene.add(mesh);
+        const dist = from.distanceTo(to);
+        spgShells.push({ mesh, from, ctrl, to, t: 0,
+            dur: Math.max(0.5, Math.min(2.2, dist / 400)),
+            lat: tp.lat, lon: tp.lon, dmg,
+            structMul: this.cfg.structMul, troopMul: this.cfg.troopMul,
+            owner: this.owner, src: this });
+        spawnExp(this.lat, this.lon, 2.6, '#ffcc66');   // big muzzle flash
+        _puffAt(from, 0xb8a878, 3.5, null, 20);         // dust kicked off the battery position
         if (SFX && SFX.gun) SFX.gun();
+    }
+    _creditKill() {
+        if (this.dead) return;
+        this.kills++;
+        const was = this.ace;
+        this._recalcAce();
+        if (this.ace > was && this.owner === 'player') {
+            logEvent(`🎖 ${this.name} ترقّت: ${TANK_ACE_AR[this.ace]}! (قتلى ${this.kills})`, 'info');
+        }
+    }
+    _recalcAce() {
+        const K = GAME_CONSTANTS.TANK_ACE_KILLS;
+        let lv = 0;
+        for (let i = 0; i < K.length; i++) if (this.kills >= K[i]) lv = i + 1;
+        this.ace = Math.min(3, lv);
     }
 
     // ── movement: tangent-plane step with coast avoidance ──
     _stepToward(tLat, tLon, km) {
         if (this._tryStep(tLat, tLon, km, 0)) return true;
+        if (this._crossing) return false;   // midstream: bow stays on the objective
         for (const a of [0.7, -0.7, 1.4, -1.4, 2.1, -2.1]) {
             if (this._tryStep(tLat, tLon, km, a)) return true;   // follow the coastline
+        }
+        return false;
+    }
+    // Far-bank probe: is the water ahead a RIVER/STRAIT (land resumes within
+    // TANK_RIVER_PROBE_KM along the march axis) or an ocean? Enables real
+    // bridgehead play — armor wades narrow water at assault speed.
+    _probeFarBank(nrm, dir) {
+        const C = GAME_CONSTANTS;
+        const step = 6 / 6371, maxA = C.TANK_RIVER_PROBE_KM / 6371;
+        for (let a = step; a <= maxA; a += step) {
+            const p = _tkV5.copy(nrm).multiplyScalar(Math.cos(a)).addScaledVector(dir, Math.sin(a));
+            const ll = vec3ToLatLon(p);
+            if (Tank.LAND_OK(ll.lat, ll.lon)) return true;
         }
         return false;
     }
@@ -8562,7 +8811,24 @@ class Tank {
         const arc = km / 6371;   // km → radians on the unit sphere
         const next = _tkV4.copy(n).multiplyScalar(Math.cos(arc)).addScaledVector(d, Math.sin(arc));
         const ll = vec3ToLatLon(next);
-        if (!Tank.LAND_OK(ll.lat, ll.lon)) return false;
+        if (!Tank.LAND_OK(ll.lat, ll.lon)) {
+            // RIVER CROSSING (TASK-405): water is crossable only when the far
+            // bank is close. Entry requires the direct line (no sidesteps);
+            // once crossing, keep wading toward the objective.
+            if (!this._crossing) {
+                if (ang !== 0) return false;
+                if (!this._probeFarBank(n, d)) return false;
+                this._crossing = true;
+                this._crossT = 0;
+            }
+        } else if (this._crossing) {
+            this._crossing = false;   // reached the far bank
+            this._crossT = 0;
+        }
+        if (this._crossing && ++this._crossT > 260) {   // widened water guard: give up midstream
+            this._crossing = false;
+            return false;
+        }
         this.lat = ll.lat; this.lon = ll.lon;
         this.mesh.position.copy(next.clone().multiplyScalar(this._radius));
         this._lastDir = d.clone();
@@ -8573,7 +8839,16 @@ class Tank {
         const C = GAME_CONSTANTS;
         const d = haversineDist(this.lat, this.lon, this.tgtLat, this.tgtLon);
         if (d <= 40) { this.mode = 'hold'; return; }   // arrived — hold ground, keep scanning
-        if (this._stepToward(this.tgtLat, this.tgtLon, Math.min(this.cfg.speed, d))) {
+        // TASK-405 speed budget: terrain grade × river wade × supply state ×
+        // engine damage (halved below 35% hp — a crawling division reads hurt).
+        let km = this.cfg.speed;
+        if (this._crossing) km *= C.TANK_RIVER_SPEED_MUL;
+        if (this.unsupplied) km *= C.TANK_SUPPLY_SPEED_MUL;
+        if (this.engineDamaged) km *= C.TANK_ENGINE_SPEED_MUL;
+        if (conquestGrid && conquestGrid._maskReady) {
+            km *= C.TANK_TERRAIN_SPEED[conquestGrid.terrainAtCell(conquestGrid.latLonToCell(this.lat, this.lon))] || 1;
+        }
+        if (this._stepToward(this.tgtLat, this.tgtLon, Math.min(km, d))) {
             this.mode = 'advance';
             // SPEARHEAD: divisions advancing through non-owned land claim a
             // corridor behind them — armor opens the way for the army.
@@ -8583,15 +8858,47 @@ class Tank {
                     paintCircleOnLandDirect(this.lat, this.lon, C.TANK_CORRIDOR_R_KM, this.owner);
                 }
             }
+            // Dust trail colored by the ground being crossed (TASK-405 polish)
+            if (++this._dustT >= C.TANK_DUST_EVERY) {
+                this._dustT = 0;
+                this._spawnDust();
+            }
         } else {
             this.mode = 'hold';   // boxed in by water — hold
         }
     }
+    _spawnDust() {
+        if (!this._faceVec) return;
+        const nrm = _tkV6.copy(this.mesh.position).normalize();
+        const back = _tkV5.copy(this.mesh.position).addScaledVector(this._faceVec, -7).addScaledVector(nrm, 2.5);
+        let col = 0xa89a80;
+        if (conquestGrid && conquestGrid._maskReady) {
+            const tc = conquestGrid.terrainAtCell(conquestGrid.latLonToCell(this.lat, this.lon));
+            col = TANK_DUST_COL[tc] || col;
+        }
+        _puffAt(back, col, 2.0 * (this.behavior.dust || 1),
+            new THREE.Vector3().copy(nrm).multiplyScalar(0.35), 34);
+    }
 
-    _face(tp) {
+    // Tangent direction toward a point (scratch _tkV4 — use immediately).
+    _dirToward(tp) {
         const n = _tkV3.copy(this.mesh.position).normalize();
         const tv = _tkV4.copy(latLonToVec3(tp.lat, tp.lon, 1)).normalize();
-        this._faceVec = tv.addScaledVector(n, -tv.dot(n)).normalize().clone();
+        const d = tv.addScaledVector(n, -tv.dot(n));
+        if (d.lengthSq() < 1e-9) return null;
+        return d.normalize();
+    }
+    // TURRET/HULL TRAVERSAL (TASK-405): the division swings toward its task
+    // at behavior.traverse rad/frame — a Tiger slews slowly and deliberately,
+    // scouts whip around. The gun only fires once on target (within TOL).
+    _rotateFaceToward(des, maxRad) {
+        const c = Math.max(-1, Math.min(1, this._faceVec.dot(des)));
+        const ang = Math.acos(c);
+        if (ang <= maxRad || ang < 1e-4) { this._faceVec.copy(des); return; }
+        const axis = _tkV1.copy(this._faceVec).cross(des);
+        if (axis.lengthSq() < 1e-9) return;   // antiparallel — next frame's target fixes it
+        axis.normalize();
+        this._faceVec.applyAxisAngle(axis, maxRad).normalize();
     }
     _orient() {
         const nrm = _tkV1.copy(this.mesh.position).normalize();
@@ -8605,29 +8912,185 @@ class Tank {
         }
     }
 
+    // ── logistics (TASK-405): supply line to the nearest hub ──
+    // In reach of a friendly city/factory/port/base = supplied (range ×2 on
+    // own territory — the road net). Out of reach: 10s grace, then attrition
+    // + slow crawl + slow reloads. A fully ENTRENCHED friendly division
+    // projects supply 400km — that's the BRIDGEHEAD: dig in across the river
+    // and the spearhead keeps itself fed.
+    _supplyCheck() {
+        const C = GAME_CONSTANTS;
+        const own = getPixelOwner(this.lat, this.lon) === this.owner;
+        const R = C.TANK_SUPPLY_R_KM * (own ? C.TANK_SUPPLY_OWN_MUL : 1);
+        let ok = false;
+        for (const s of structs) {
+            if (s.dead || s.owner !== this.owner || !C.TANK_SUPPLY_HUBS.includes(s.type)) continue;
+            if (haversineDist(this.lat, this.lon, s.lat, s.lon) < R) { ok = true; break; }
+        }
+        if (!ok) {
+            for (const o of tanks) {
+                if (o === this || o.dead || o.owner !== this.owner || o.entrench < 1) continue;
+                if (haversineDist(this.lat, this.lon, o.lat, o.lon) < C.TANK_BRIDGEHEAD_KM) { ok = true; break; }
+            }
+        }
+        if (ok) {
+            if (this.unsupplied && this.owner === 'player') logEvent(`✅ ${this.name} عادت إلى الإمداد`, 'info');
+            this.unsupplied = false;
+            this.supplyGrace = 0;
+        } else if (++this.supplyGrace > C.TANK_SUPPLY_GRACE_F) {
+            if (!this.unsupplied && this.owner === 'player') {
+                logEvent(`⛔ ${this.name} انقطعت عن الإمداد — تبدأ بالاستنزاف! (${Math.round(R)}كم من أقرب مدينة)`, 'err');
+            }
+            this.unsupplied = true;
+        }
+    }
+
+    // ── structure defensive fire vs tanks (AUDIT item, decided) ──
+    // FLAK is dual-purpose (the 88 was THE AT gun): enemy flak batteries chip
+    // armor inside 90km. EMP'd flak is silent (synergy with the missiles
+    // agent's EMP). Implemented tank-side — Structure.update untouched.
+    _flakTick() {
+        const C = GAME_CONSTANTS;
+        let best = null, bestD = C.TANK_FLAK_AT_RANGE;
+        for (const s of structs) {
+            if (s.dead || s.owner === this.owner || s.owner === 'neutral' || s.type !== 'flak') continue;
+            if ((s.empT || 0) > 0) continue;   // EMP'd guns are dark
+            const d = haversineDist(this.lat, this.lon, s.lat, s.lon);
+            if (d < bestD) { bestD = d; best = s; }
+        }
+        if (best) {
+            _tracer(best.pos, this.mesh.position, 0xffe066);
+            spawnExp(best.lat, best.lon, 1.6, '#ffe066');
+            this.hit(C.TANK_FLAK_AT_DMG, best.owner);
+        }
+    }
+
+    // ── entrenchment visual: sandbag ring (grows in as they dig) ──
+    _buildSandbags() {
+        this.sandbagMat = new THREE.MeshPhongMaterial({ color: 0xb5a279, flatShading: true, transparent: true, opacity: 0 });
+        this.sandbags = new THREE.Group();
+        for (const p of FormationLayout.sandbags(12, 8.5)) {
+            const m = new THREE.Mesh(_box(2.6, 0.9, 1.4), this.sandbagMat);
+            m.position.set(p.x, 0.45, p.z);
+            m.rotation.y = Math.atan2(p.x, p.z);
+            this.sandbags.add(m);
+        }
+        this.sandbags.visible = false;
+        this.mesh.add(this.sandbags);
+    }
+
+    // ── division banner: kill tally + ace rank + state glyphs ──
+    _buildBanner() {
+        const cv = document.createElement('canvas');
+        cv.width = 256; cv.height = 96;
+        this._bannerCv = cv;
+        this._bannerTex = new THREE.CanvasTexture(cv);
+        const mat = new THREE.SpriteMaterial({ map: this._bannerTex, transparent: true, depthTest: true });
+        this.banner = new THREE.Sprite(mat);
+        this.banner.position.set(0, 15, 0);
+        this.banner.scale.set(34, 12.75, 1);
+        this.banner.visible = false;
+        this.mesh.add(this.banner);
+        this._bannerKey = '';
+    }
+    _refreshBanner() {
+        const key = [this.kills, this.ace, this.unsupplied ? 1 : 0, this.entrench >= 1 ? 1 : 0, this.selected ? 1 : 0].join('|');
+        if (key === this._bannerKey) return;
+        this._bannerKey = key;
+        const show = this.selected || this.kills > 0 || this.unsupplied || this.entrench >= 1;
+        this.banner.visible = show;
+        if (!show) return;
+        const ctx = this._bannerCv.getContext('2d');
+        ctx.clearRect(0, 0, 256, 96);
+        ctx.fillStyle = 'rgba(8,10,12,0.62)';
+        ctx.fillRect(14, 20, 228, 56);
+        const acc = ownerHexColor(this.owner);
+        ctx.strokeStyle = '#' + acc.toString(16).padStart(6, '0');
+        ctx.lineWidth = 3;
+        ctx.strokeRect(14, 20, 228, 56);
+        ctx.font = 'bold 34px sans-serif';
+        ctx.textBaseline = 'middle';
+        let x = 30;
+        const glyphs = [];
+        if (this.entrench >= 1) glyphs.push('🛡️');
+        if (this.unsupplied) glyphs.push('⛔');
+        if (this.kills > 0) glyphs.push('🎖️');
+        for (const g of glyphs) { ctx.fillText(g, x, 48); x += 42; }
+        if (this.kills > 0) { ctx.fillStyle = '#ffffff'; ctx.font = 'bold 38px sans-serif'; ctx.fillText(String(this.kills), x, 50); x += 60; }
+        if (this.ace > 0) {
+            ctx.font = 'bold 30px sans-serif';
+            ctx.fillStyle = '#ffd257';
+            ctx.fillText('★'.repeat(this.ace), x, 50);
+        }
+        this._bannerTex.needsUpdate = true;
+    }
+
+    _refreshVfx() {
+        if (this.sandbags) {
+            const on = this.entrench > 0.05;
+            this.sandbags.visible = on;
+            if (on) this.sandbagMat.opacity = 0.3 + 0.7 * this.entrench;
+        }
+        // engine-damage smoke: a hurt division trails dark smoke (polish)
+        if (this.engineDamaged && frame % 15 === (this.id % 15)) {
+            const nrm = _tkV6.copy(this.mesh.position).normalize();
+            _puffAt(_tkV5.copy(this.mesh.position).addScaledVector(nrm, 3), 0x2b2b30, 1.8,
+                new THREE.Vector3().copy(nrm).multiplyScalar(0.5), 30);
+        }
+        this._refreshBanner();
+    }
+
     // ── main tick (60fps logic) ──
     update() {
         if (this.dead) return;
         const C = GAME_CONSTANTS;
         if (this.selRing) this.selRing.visible = !!this.selected;
         if (this.fireCd > 0) this.fireCd--;
+        // staggered scans (OPTIMIZE: each division offsets by id so 12
+        // divisions never scan on the same frame)
         if (--this.retargetT <= 0) { this.retargetT = 30; this._retarget(); }
         else this._validateTarget();
+        if (--this._supplyT <= 0) { this._supplyT = 90; this._supplyCheck(); }
+        if (--this._flakT <= 0) { this._flakT = 90; this._flakTick(); }
+        // supply attrition: cut divisions bleed until they reach a hub
+        if (this.unsupplied) {
+            this.hp -= this.maxHp * C.TANK_SUPPLY_HP_PER_F;
+            this._syncMembers();
+            if (this.hp <= 0) { this._destroy(); return; }
+        }
         const t = this.target;
         const tp = t ? this._posOf(t) : null;
-        if (tp && haversineDist(this.lat, this.lon, tp.lat, tp.lon) <= this.cfg.gunRange) {
+        const dTgt = tp ? haversineDist(this.lat, this.lon, tp.lat, tp.lon) : Infinity;
+        const canShoot = !!tp && dTgt <= this.cfg.gunRange &&
+            (!this.behavior.indirect || dTgt >= C.TANK_SPG_DEADZONE_KM);
+        // ── turret/hull traversal: swing toward the task, fire only when on ──
+        let desired = null, tgtDir = null;
+        if (tp) { tgtDir = this._dirToward(tp); desired = tgtDir; }
+        else if (this._lastDir) desired = this._lastDir;
+        if (desired) {
+            if (!this._faceVec) this._faceVec = desired.clone();
+            else this._rotateFaceToward(desired, this.behavior.traverse);
+        }
+        if (canShoot) {
             this.mode = 'combat';
-            this._face(tp);
-            if (this.fireCd <= 0) this._fire(t, tp);
+            if (tgtDir && this._faceVec.dot(tgtDir) >= this._traverseCos && this.fireCd <= 0) {
+                this._fire(t, tp);
+            }
             // Tank battles paint devastation — pounded ground falls faster
             if ((frame + this.id) % 90 === 0 && conquestGrid && conquestGrid.applyDevastation) {
                 conquestGrid.applyDevastation(this.lat, this.lon, C.TANK_BATTLE_DEV_R, 0.2);
             }
         } else {
-            if (tp) this._faceVec = null;   // out of gun range: re-face the march axis
             this._advance();
         }
+        // ── entrenchment: quiet divisions holding ground dig in (20s to full) ──
+        if (this.mode === 'hold' && !tp && !this._crossing) {
+            this.entrench = Math.min(1, this.entrench + 1 / C.TANK_ENTRENCH_FRAMES);
+        } else if (this.entrench > 0 && this.mode !== 'hold') {
+            this.entrench = Math.max(0, this.entrench - 3 / C.TANK_ENTRENCH_FRAMES);
+        }
         this._orient();
+        this._refreshVfx();
     }
 }
 
