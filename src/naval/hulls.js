@@ -461,7 +461,7 @@ export function assignFormation(ctx, owner, dstLat, dstLon, ships) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-//  NAVAL MINES (TASK-402) — deployable minefields (J key, $ per field).
+//  NAVAL MINES (TASK-402) — deployable minefields (L key, $ per field).
 //  A field is a small zone of moored contact mines: after a short arming
 //  delay it detonates on the first enemy HULL / invasion transport /
 //  trade ship that enters the radius. Each field carries MINE_CHARGES

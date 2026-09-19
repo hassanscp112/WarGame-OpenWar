@@ -5473,7 +5473,7 @@ let tradeShips=[], trains=[], troopCohorts=[], transportShips=[], warships=[];
 // hulls (meshes owned by the animator until they reach the seabed).
 let torpedoes = [], mineFields = [], navalSinking = [];
 let fleetStanceIdx = 0;        // K cycles GAME_CONSTANTS.FLEET_STANCES (free/line/wedge)
-let mineMode = false;          // J arms mine-laying (click water to deploy a field)
+let mineMode = false;          // L arms mine-laying (click water to deploy a field)
 let tanks=[];   // TASK-302: armored divisions (mobile land units)
 let eBuiltPorts = 0;
 function _enemyPortCost() { return Math.floor(GAME_CONSTANTS.PORT_BASE_COST * Math.pow(1.5, eBuiltPorts)); }
@@ -10846,9 +10846,10 @@ function _setDroneMode(on) {
 window.__setDroneMode = _setDroneMode;
 
 // ══════════════════════════════════════════════════════════════════
-// NAVAL MINE MODE [J] (TASK-402) — click water to deploy a minefield
+// NAVAL MINE MODE [L] (TASK-402) — click water to deploy a minefield
 // ($MINE_COST, cap MINE_CAP active fields). Mirrors to the peer as
-// 'naval_mine'. Exclusive with missile/drone modes.
+// 'naval_mine'. Exclusive with missile/drone modes. (Key L — J is the ECM
+// station on main since TASK-403.)
 // ══════════════════════════════════════════════════════════════════
 function _setMineMode(on) {
     if (on && window.startSpawnPhase) return;
@@ -10863,7 +10864,7 @@ function _setMineMode(on) {
     if (on) {
         const C = GAME_CONSTANTS;
         const active = mineFields.filter(f => !f.dead && f.owner === myRole).length;
-        logEvent(`💣 وضع الألغام البحرية — انقر نقطة مائية لنشر حقل ($${C.MINE_COST}، ${active}/${C.MINE_CAP} نشط) [J]`, 'info');
+        logEvent(`💣 وضع الألغام البحرية — انقر نقطة مائية لنشر حقل ($${C.MINE_COST}، ${active}/${C.MINE_CAP} نشط) [L]`, 'info');
     }
 }
 window.__setMineMode = _setMineMode;
@@ -11416,8 +11417,10 @@ window.addEventListener('keydown', e => {
         return;
     }
 
-    // J: NAVAL MINE MODE (TASK-402) — click water to deploy a minefield
-    if (e.code === 'KeyJ' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.repeat) {
+    // L: NAVAL MINE MODE (TASK-402) — click water to deploy a minefield.
+    // (was J in development — J is the ECM station on main since TASK-403's
+    // merge, so mines ride L to keep both features one-key-simple.)
+    if (e.code === 'KeyL' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.repeat) {
         if (window.gameMode !== 'mode1' || window.startSpawnPhase) return;
         _setMineMode(!mineMode);
         return;
@@ -15405,7 +15408,7 @@ const HOTBAR_SLOTS = [
     { key: '9', type: 'iron_dome',  icon: '🟢', label: 'قبة',    tip: 'اعتراض الزخات' },
     { key: '0', type: 'nuke_plant', icon: '☢️', label: 'مفاعل',  tip: 'دخل ضخم متأخر' },
     { key: 'V', type: 'warship',    icon: '🛳️', label: 'أسطول',  tip: 'V للتبديل: مدمرة/فرقاطة/غواصة/طراد/درون/حاملة/إنزال — انقر ماءً للنشر' },
-    { key: 'J', type: 'mine',       icon: '💣', label: 'ألغام',  tip: 'وضع الألغام البحرية [J] — انقر ماءً لنشر حقل ألغام يفجّر سفن العدو وناقلات إنزاله' },
+    { key: 'L', type: 'mine',       icon: '💣', label: 'ألغام',  tip: 'وضع الألغام البحرية [L] — انقر ماءً لنشر حقل ألغام يفجّر سفن العدو وناقلات إنزاله' },
     { key: 'N', type: 'drone',     icon: '🛸', label: 'درون',   tip: 'وضع الدرونات — أنقر الخريطة لنشر أسراب/استطلاع/صائدة صواريخ' },
     { key: 'H', type: 'tank',      icon: '🚜', label: 'مدرعات',  tip: 'H للتبديل: استطلاع/قتال/اختراق — انقر أرضاً لنشر الفرقة من أقرب مصنع حربي' },
 ];
@@ -15492,7 +15495,7 @@ window.__hotbarKey = function (key) {
         _setDroneMode(!droneMode);
         return;
     }
-    // TASK-402: mine slot is a MODE too — J toggles the deploy cursor
+    // TASK-402: mine slot is a MODE too — L toggles the deploy cursor
     if (slot.type === 'mine') {
         if (window.gameMode !== 'mode1') return;
         _setMineMode(!mineMode);

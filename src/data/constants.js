@@ -350,7 +350,7 @@ export const GAME_CONSTANTS = {
   NAVAL_SHELL_VS_ARMOR: 0.6,        // shore-bombardment shells vs tank divisions (pre-armor)
   NAVAL_SHELL_STRUCT_MUL: 0.8,      // shore-bombardment shells vs structures
   FORMATION_SPACING_KM: 70,         // slot spacing for line/wedge stances
-  // Naval mines (deployable zones — J key)
+  // Naval mines (deployable zones — L key; J is the ECM station since TASK-403)
   MINE_COST: 200, MINE_CAP: 6, MINE_RADIUS_KM: 55, MINE_DMG: 380,
   MINE_ARM_FRAMES: 180,             // 3s arming delay (no friendly-fire on deploy)
   MINE_CHARGES: 3,                  // hulls consumed before the field is spent
