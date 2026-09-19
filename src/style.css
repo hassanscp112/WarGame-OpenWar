@@ -236,6 +236,47 @@ html, body {
 }
 #missileModeHud .mhint b { color: #e8f0f8; }
 
+/* ═══════════════ DRONE LAUNCH MODE HUD [N] (TASK-204) ═══════════════ */
+#droneModeHud {
+    position: absolute; top: 64px; left: 50%; transform: translateX(-50%);
+    z-index: 22; display: none;
+    background: rgba(10, 15, 26, 0.88);
+    border: 1px solid rgba(0, 255, 204, 0.45);
+    border-radius: 10px; padding: 7px 10px;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 8px 26px rgba(0, 0, 0, 0.55);
+    font-family: inherit; color: var(--text);
+    max-width: min(92vw, 780px);
+}
+#droneModeHud .mtitle {
+    font-size: 12px; font-weight: 700; letter-spacing: .3px;
+    color: #7dffe2; text-align: center; margin-bottom: 5px;
+}
+#droneModeHud .mrow {
+    display: flex; flex-wrap: wrap; gap: 4px; justify-content: center;
+    margin-bottom: 5px;
+}
+#droneModeHud .mchip {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border); border-radius: 5px;
+    padding: 3px 7px; font-size: 10px; font-weight: 600;
+    cursor: pointer; transition: all .12s; user-select: none;
+    white-space: nowrap;
+}
+#droneModeHud .mchip span { color: var(--gold); margin-right: 3px; }
+#droneModeHud .mchip:hover { border-color: #00ffcc; background: rgba(0, 255, 204, 0.12); }
+#droneModeHud .mchip.act {
+    background: rgba(0, 255, 204, 0.18);
+    border-color: #00ffcc;
+    box-shadow: 0 0 8px rgba(0, 255, 204, 0.35);
+}
+#droneModeHud .mchip.poor { opacity: 0.45; }
+#droneModeHud .mchip.poor span { color: var(--red); }
+#droneModeHud .mhint {
+    font-size: 9.5px; color: #9fb3c8; text-align: center; line-height: 1.5;
+}
+#droneModeHud .mhint b { color: #e8f0f8; }
+
 /* ═══════════════ ATTACK RATIO BAR ═══════════════ */
 #troopPctOverlay {
     position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);

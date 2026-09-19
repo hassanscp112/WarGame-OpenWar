@@ -1,41 +1,57 @@
 export const MCFG={
  /* SCUD-B: صاروخ باليستي سوفيتي بطيء بدقة ضعيفة جداً - حقيقي */
- scud:       {name:'سكود SCUD-B',      cost:90,  spd:3.8, acc:.06, grav:.10, drag:.002, dmg:70,  rad:80,  col:'#88ff44',trl:'#ccff99',arc:340,type:'ballistic',
-               samEvade:.05, civsEvade:.03, piercing:false, spinTrail:true},
+ scud:       {name:'سكود SCUD-B',      cost:80,  spd:3.8, acc:.06, grav:.10, drag:.002, dmg:60,  rad:80,  col:'#88ff44',trl:'#ccff99',arc:340,type:'ballistic',
+               samEvade:.05, civsEvade:.03, piercing:false, spinTrail:true, suppress:1, devMul:1.0},
  /* SRBM: أسرع وأدق من السكود بمسار باليستي عالٍ */
- ballistic:  {name:'باليستي SRBM',     cost:130, spd:5.5, acc:.14, grav:.075,drag:.001, dmg:95,  rad:82,  col:'#4488ff',trl:'#aaccff',arc:420,type:'ballistic',
-               samEvade:.12, civsEvade:.05, piercing:false, spinTrail:false},
+ ballistic:  {name:'باليستي SRBM',     cost:130, spd:5.5, acc:.14, grav:.075,drag:.001, dmg:110, rad:82,  col:'#4488ff',trl:'#aaccff',arc:420,type:'ballistic',
+               samEvade:.12, civsEvade:.05, piercing:false, spinTrail:false, devMul:1.0},
  /* BGM-109C: طيران منخفض بطيء لكن دقيق - يتحاشى الرادار */
- cruise:     {name:'كروز BGM-109C',    cost:190, spd:4.8, acc:.35, grav:.015,drag:.004, dmg:90,  rad:60,  col:'#ff9900',trl:'#ffcc77',arc:45, type:'cruise',
-               samEvade:.28, civsEvade:.22, piercing:false, hugsGround:true},
+ cruise:     {name:'كروز BGM-109C',    cost:190, spd:4.8, acc:.35, grav:.015,drag:.004, dmg:100, rad:60,  col:'#ff9900',trl:'#ffcc77',arc:45, type:'cruise',
+               samEvade:.28, civsEvade:.22, piercing:false, hugsGround:true, devMul:0.8},
  /* CBU-97: انتشار عنقودي واسع - دقة منخفضة لكن تغطية كبيرة */
  cluster:    {name:'عنقودي CBU-97',    cost:240, spd:5.2, acc:.15, grav:.065,drag:.002, dmg:45,  rad:200, col:'#ffaa00',trl:'#ffdd88',arc:280,type:'cluster',
-               samEvade:.08, civsEvade:.04, piercing:false, scatterCount:10},
+               samEvade:.08, civsEvade:.04, piercing:false, scatterCount:10, troopMul:3.2, devMul:1.3},
  /* EMP AGM-84H: يشل الإلكترونيات - لا يدمر مادياً */
  emp:        {name:'EMP AGM-86B',      cost:300, spd:4.5, acc:.25, grav:.025,drag:.003, dmg:8,   rad:260, col:'#00ffcc',trl:'#99ffee',arc:180,type:'emp',
-               samEvade:.20, civsEvade:.18, piercing:false, empRadius:320},
+               samEvade:.20, civsEvade:.18, piercing:false, empRadius:320, empTime:600, devMul:0.4},
  /* BGM-109A Tomahawk: أكثر دقة وأسرع من الكروز العادي */
- tomahawk:   {name:'توماهوك BGM-109A', cost:350, spd:5.8, acc:.40, grav:.012,drag:.0045,dmg:120, rad:65,  col:'#00ddff',trl:'#88eeff',arc:38, type:'cruise',
-               samEvade:.35, civsEvade:.30, piercing:false, hugsGround:true},
+ tomahawk:   {name:'توماهوك BGM-109A', cost:350, spd:5.8, acc:.52, grav:.012,drag:.0045,dmg:150, rad:65,  col:'#00ddff',trl:'#88eeff',arc:38, type:'cruise',
+               samEvade:.35, civsEvade:.30, piercing:false, hugsGround:true, devMul:0.8},
  /* FAE/Thermobaric: بطيء لكن انفجار هائل بموجة ضغط */
- thermobaric:{name:'ثيرموباريك TOS-1', cost:420, spd:3.5, acc:.12, grav:.085,drag:.0012,dmg:240, rad:185, col:'#ff2200',trl:'#ff8866',arc:320,type:'thermobaric',
-               samEvade:.04, civsEvade:.03, piercing:false, pressureWave:true},
+ thermobaric:{name:'ثيرموباريك TOS-1', cost:420, spd:3.5, acc:.12, grav:.085,drag:.0012,dmg:280, rad:185, col:'#ff2200',trl:'#ff8866',arc:320,type:'thermobaric',
+               samEvade:.04, civsEvade:.03, piercing:false, pressureWave:true, troopMul:1.5, devMul:1.8},
  /* JASSM-ER: شبحي يراوغ الدفاعات - طيران منخفض */
- stealth_m:  {name:'شبحي JASSM-ER',   cost:480, spd:5.5, acc:.38, grav:.016,drag:.003, dmg:160, rad:65,  col:'#445566',trl:'#556677',arc:48, type:'stealth',
-               samEvade:.62, civsEvade:.55, piercing:false, hugsGround:true, stealthRCS:true},
+ stealth_m:  {name:'شبحي JASSM-ER',   cost:480, spd:5.5, acc:.38, grav:.016,drag:.003, dmg:190, rad:65,  col:'#445566',trl:'#556677',arc:48, type:'stealth',
+               samEvade:.62, civsEvade:.55, piercing:false, hugsGround:true, stealthRCS:true, devMul:0.8},
  /* GBU-28: خارق للتحصينات سريع وثقيل */
- bunker_bust:{name:'خارق GBU-28',      cost:560, spd:9.5, acc:.42, grav:.04, drag:.002, dmg:380, rad:48,  col:'#cc4400',trl:'#ff9955',arc:260,type:'ballistic',
-               samEvade:.15, civsEvade:.08, piercing:true, pierceDmg:2.2},
+ bunker_bust:{name:'خارق GBU-28',      cost:560, spd:9.5, acc:.42, grav:.04, drag:.002, dmg:420, rad:48,  col:'#cc4400',trl:'#ff9955',arc:260,type:'ballistic',
+               samEvade:.15, civsEvade:.08, piercing:true, pierceDmg:2.6, devMul:0.7},
  /* Zircon/HGV: فرط صوتي حقيقي - سرعة هائلة لا يمكن اعتراضه */
- hyper:      {name:'فرط صوتي 3M22',    cost:650, spd:22,  acc:.55, grav:.005,drag:.00015,dmg:200,rad:110, col:'#ff22aa',trl:'#ff99ee',arc:200,type:'hyper',
-               samEvade:.88, civsEvade:.82, piercing:true, plasmaSheath:true, shockwave:true},
+ hyper:      {name:'فرط صوتي 3M22',    cost:650, spd:22,  acc:.55, grav:.005,drag:.00015,dmg:220,rad:110, col:'#ff22aa',trl:'#ff99ee',arc:200,type:'hyper',
+               samEvade:.88, civsEvade:.82, piercing:true, plasmaSheath:true, shockwave:true, devMul:1.1},
  /* ICBM R-36: عابر قاري ضخم - مسار بالستي عالٍ جداً */
- icbm:       {name:'ICBM R-36M',       cost:1000,spd:12,  acc:.32, grav:.05, drag:.0003,dmg:500, rad:260, col:'#ff8800',trl:'#ffcc88',arc:650,type:'ballistic',
-               samEvade:.55, civsEvade:.45, piercing:false, mirv:false, reentryFlash:true},
+ icbm:       {name:'ICBM R-36M',       cost:1000,spd:12,  acc:.32, grav:.05, drag:.0003,dmg:560, rad:260, col:'#ff8800',trl:'#ffcc88',arc:650,type:'ballistic',
+               samEvade:.55, civsEvade:.45, piercing:false, mirv:false, reentryFlash:true, devMul:1.2},
  /* نووي تكتيكي W80: تدمير شامل + EMP */
- nuke_tac:   {name:'نووي تكتيكي W80',  cost:2000,spd:5.5, acc:.15, grav:.032,drag:.001, dmg:700, rad:360, col:'#ffffff',trl:'#aaffaa',arc:440,type:'nuke',
-               samEvade:.72, civsEvade:.65, piercing:true, empRadius:500, nuclearBlast:true},
+ nuke_tac:   {name:'نووي تكتيكي W80',  cost:2000,spd:5.5, acc:.15, grav:.032,drag:.001, dmg:750, rad:360, col:'#ffffff',trl:'#aaffaa',arc:440,type:'nuke',
+               samEvade:.72, civsEvade:.65, piercing:true, empRadius:500, empTime:420, nuclearBlast:true, devMul:2.0},
 };
+/* ── WARHEAD ROLE TABLE (TASK-204 balance audit — 2026-09-19) ──
+ * BEFORE → AFTER (cost / dmg / key identity change):
+ *  scud        90/70  → 80/60   +suppress:1 (hit structs get reload shock) — pure terror
+ *  ballistic   130/95 → 130/110 best dmg/$ — the workhorse
+ *  cruise      190/90 → 190/100 precise low-flyer, modest buff
+ *  cluster     240/45 → 240/45  +troopMul:3.2 (DEVASTATES troop cohorts) +devMul 1.3
+ *  emp         300/8  → 300/8   +empTime:600 — now ALSO kills defense scans + radar chains
+ *  tomahawk    350/120→ 350/150 acc .40→.52 — the precision tool
+ *  thermo      420/240→ 420/280 devMul 1.8 = LONGEST devastation paint +troopMul 1.5
+ *  stealth_m   480/160→ 480/190 radar-invisible + .62 evade — penetrator
+ *  bunker      560/380→ 560/420 pierceDmg 2.2→2.6 — anti-turtle king
+ *  hyper       650/200→ 650/220 uninterceptable by design
+ *  icbm        1000/500→1000/560 MIRV ×3 @55% — global saturation
+ *  nuke_tac    2000/700→2000/750 devMul 2.0 — game-ender + deep EMP
+ * samEvade (was DEAD) is now the evade stat: ONE flare/chaff dodge vs the
+ * FIRST interceptor of each flight (consumed on roll, win or lose). */
 
 export const MTAGS={
  scud:       ['دقة ضعيفة جداً 1-3كم','مسار باليستي','رخيص وسريع الإطلاق','راداره بسهولة يكشفه'],
@@ -65,15 +81,31 @@ export const PCFG={
  f22: {name:'F-22 Raptor', hp:120,spd:9, fuel:1100,aaAmmo:10,agAmmo:2, gunAmmo:480, aamCount:4, flares:8, turnRate:.20, gunCaliber:1.2,allAspect:true, canards:false,cost:1100, col:'#aaddff',role:'air', trainTime: 500},
 };
 export const DCFG={
- nano:    {name:'نانو سرب×10', hp:8,  spd:6,   fuel:400,  dmg:25,  rad:20, cost:80,  col:'#ff44ff',type:'swarm'},
- swarm:   {name:'سرب صغير',    hp:15, spd:5.5, fuel:500,  dmg:50,  rad:38, cost:130, col:'#ff88ff',type:'swarm'},
- kamikaze:{name:'انتحارية',    hp:20, spd:4.5, fuel:800,  dmg:95,  rad:58, cost:190, col:'#ff55ff',type:'kamikaze'},
- recon:   {name:'استطلاع',     hp:25, spd:3.5, fuel:1200, dmg:0,   rad:0,  cost:220, col:'#cc77ff',type:'recon'},
- loiter:  {name:'كامنة HAROP', hp:35, spd:3,   fuel:1800, dmg:110, rad:62, cost:320, col:'#ffcc44',type:'loiter'},
- jammer:  {name:'تشويش EW',    hp:30, spd:3.2, fuel:1400, dmg:0,   rad:0,  cost:380, col:'#44ffdd',type:'jammer'},
- armed:   {name:'MQ-9 Reaper', hp:50, spd:4,   fuel:1600, dmg:75,  rad:45, cost:440, col:'#88ddff',type:'armed'},
- heavy:   {name:'ثقيلة UCAV',  hp:55, spd:3.5, fuel:1000, dmg:160, rad:78, cost:540, col:'#ffaa44',type:'kamikaze'},
+ /* ── DRONE TYPES (TASK-204 — each is a TOOL, not a damage number) ──
+ * patrolR: orbit radius around home point (km)
+ * engageR: enemy acquisition radius (km) — 0 = non-combat
+ * troopMul: damage multiplier vs troop cohorts (1 = same as structures)
+ * squad: how many airframes per purchase
+ * charges: interceptor reload cycles (intercept type only) */
+ nano:    {name:'نانو سرب',     hp:8,  spd:6,   fuel:400,  dmg:25,  rad:20, cost:80,  col:'#ff44ff',type:'swarm',    patrolR:60,  engageR:160, troopMul:2.5, squad:3, devMul:0.5},
+ swarm:   {name:'سرب صغير',    hp:15, spd:5.5, fuel:500,  dmg:50,  rad:38, cost:130, col:'#ff88ff',type:'swarm',    patrolR:70,  engageR:200, troopMul:2.5, squad:2, devMul:0.6},
+ kamikaze:{name:'انتحارية',    hp:20, spd:4.5, fuel:800,  dmg:95,  rad:58, cost:190, col:'#ff55ff',type:'kamikaze', patrolR:0,   engageR:260, troopMul:1.5, squad:1, devMul:0.8},
+ recon:   {name:'استطلاع',     hp:25, spd:3.5, fuel:1200, dmg:0,   rad:0,  cost:220, col:'#cc77ff',type:'recon',    patrolR:120, engageR:0,   troopMul:0,   squad:1},
+ loiter:  {name:'كامنة HAROP', hp:35, spd:3,   fuel:1800, dmg:110, rad:62, cost:320, col:'#ffcc44',type:'loiter',   patrolR:110, engageR:340, troopMul:1.2, squad:1, devMul:0.9},
+ jammer:  {name:'تشويش EW',    hp:30, spd:3.2, fuel:1400, dmg:0,   rad:0,  cost:380, col:'#44ffdd',type:'jammer',   patrolR:100, engageR:300, troopMul:0,   squad:1},
+ armed:   {name:'MQ-9 Reaper', hp:50, spd:4,   fuel:1600, dmg:75,  rad:45, cost:440, col:'#88ddff',type:'armed',    patrolR:130, engageR:380, troopMul:1.5, squad:1, devMul:0.7},
+ heavy:   {name:'ثقيلة UCAV',  hp:55, spd:3.5, fuel:1000, dmg:160, rad:78, cost:540, col:'#ffaa44',type:'kamikaze', patrolR:0,   engageR:300, troopMul:2.0, squad:1, devMul:1.1},
+ intercept:{name:'صائد صواريخ', hp:30, spd:8, fuel:1500, dmg:0,  rad:30, cost:360, col:'#88ffcc',type:'intercept',patrolR:90,  engageR:350, troopMul:0,   squad:1, charges:4},
 };
+/* DRONE ROLES:
+ *  nano/swarm — cheap swarm harassment (×3/×2 per buy), anti-troop
+ *  kamikaze  — one-way precision strike, beelines the nearest enemy
+ *  recon     — mobile radar: its orbit extends friendly SAM lock range
+ *  loiter    — HAROP: patrols, then dives on the best target in radius
+ *  jammer    — EW: enemy defenses inside its orbit can't scan or reload
+ *  armed    — Reaper: sustained strikes, re-engages from patrol
+ *  heavy    — flying-wing UCAV: heavy one-way hit
+ *  intercept — PATRIOT-drone: orbits and fires interceptors at incoming missiles */
 
 export const GAME_CONSTANTS = {
   RESOURCE_TICK: 0.2,
@@ -85,6 +117,27 @@ export const GAME_CONSTANTS = {
   MISSILE_SPEED_KM_S: 45,
   // SAM interceptor speed in km/s — must out-run attackers (≈500km/s) to catch them.
   SAM_INTERCEPT_SPEED_KM_S: 900,
+  // ── TASK-204: Missiles & Drones ──
+  // Radar chain: a friendly radar (or recon drone) covering an incoming
+  // missile's position extends SAM lock range by this multiplier.
+  RADAR_CHAIN_MULT: 2.2,
+  // Recon drones act as mobile radar with this coverage radius (km).
+  DRONE_RECON_COVER: 400,
+  // Jammer drones disable enemy defense scans within this radius (km).
+  DRONE_JAM_RADIUS: 300,
+  // Max active drones per owner.
+  DRONE_CAP: 16,
+  // Drone speed = cfg.spd × this, in km/tick (×60 = km/s). kamikaze 4.5 →
+  // 135 km/s — fast enough to cross a subcontinent, slow enough to watch.
+  DRONE_SPEED_KM_T: 30,
+  // Interceptor-drone battery: ticks between shots + charges per sorty.
+  DRONE_INTERCEPT_RELOAD: 210,
+  // Subsurface launch: if an owned PORT is this factor closer to the target
+  // than the best launcher, the missile pops up from the sea near it.
+  SUB_LAUNCH_ADVANTAGE: 0.8,
+  // Impact craters fade over this many frames (20s @ 60fps).
+  CRATER_LIFE_FRAMES: 1200,
+  CRATER_MAX: 24,
   // Plane speed = cfg.spd × MULTIPLIER in km/FRAME (×60 = km/s).
   // Was 0.005 (fighter 1.65 km/s — slower than conquest frontier!).
   // Now fighter ≈ 50 km/s, F-22 ≈ 81 — planes cross continents in ~1 min.
