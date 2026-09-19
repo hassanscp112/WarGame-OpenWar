@@ -153,26 +153,26 @@ export const TCFG={
  * gunDmg : per shot vs enemy armor (structures × structMul, troops × troopMul×12)
  * armor  : flat damage reduction fraction on everything incoming
  * engageR: target acquisition radius (km) — gunRange is the firing envelope */
- light:  {name:'فرقة استطلاع',  key:'light',  icon:'🛻', cost:300, cap:6, hp:360,
+ light:  {name:'فرقة استطلاع',  icon:'🛻', cost:300, cap:6, hp:360,
           speed:1.9, gunDmg:34,  gunRange:110, fireRate:150, engageR:340, sightR:520,
-          armor:0.15, structMul:0.8, troopMul:2.2, tanks:5, scale:0.9, lenM:4.5,
-          tip:'ليختتراكتور — سريعة رخيصة تكشف الطرق وتستولي على الممرات وتأكل المشاة'},
- medium: {name:'فرقة قتال',    key:'medium', icon:'🚙', cost:450, cap:5, hp:640,
+          armor:0.15, structMul:0.8, troopMul:2.2, tanks:5, scale:0.9,
+          tip:'ليختتراكتور — سريعة رخيصة تكشف الطرق وتستولي على الممرات وتأكل المشاة'},   // hull len lives in TANK_FBX_MANIFEST (main.js)
+ medium: {name:'فرقة قتال',    icon:'🚙', cost:450, cap:5, hp:640,
           speed:1.4, gunDmg:60,  gunRange:150, fireRate:190, engageR:400, sightR:460,
-          armor:0.30, structMul:1.4, troopMul:1.4, tanks:4, scale:1.0, lenM:5.9,
+          armor:0.30, structMul:1.4, troopMul:1.4, tanks:4, scale:1.0,
           tip:'Pz-III — العمود الفقري: متوازنة تسحق المباني وتصلح للجبهات كلها'},
- heavy:  {name:'فرقة اختراق',  key:'heavy',  icon:'🐘', cost:700, cap:3, hp:1100,
+ heavy:  {name:'فرقة اختراق',   icon:'🐘', cost:700, cap:3, hp:1100,
           speed:1.0, gunDmg:105, gunRange:180, fireRate:240, engageR:430, sightR:420,
-          armor:0.50, structMul:2.0, troopMul:1.0, tanks:3, scale:1.1, lenM:6.3,
+          armor:0.50, structMul:2.0, troopMul:1.0, tanks:3, scale:1.1,
           tip:'Tiger — بطيئة ومدرعة بشدة: تحطم التحصينات وتشق جبهة العدو وحدها'},
  /* TASK-405: self-propelled artillery — INDIRECT FIRE: can only engage
   * targets spotted by a recon drone, a light scout division, a friendly
   * radar, or its own short sightR. Standoff siege: holds position and
   * bombards (structMul 2.6 shreds buildings) but armor 0.15 melts if
   * anything closes inside its dead zone. */
- spg:    {name:'فرقة مدفعية',  key:'spg',    icon:'🎇', cost:550, cap:4, hp:420,
+ spg:    {name:'فرقة مدفعية',  icon:'🎇', cost:550, cap:4, hp:420,
           speed:1.1, gunDmg:85,  gunRange:420, fireRate:300, engageR:520, sightR:300,
-          armor:0.15, structMul:2.6, troopMul:2.0, tanks:3, scale:1.0, lenM:5.5,
+          armor:0.15, structMul:2.6, troopMul:2.0, tanks:3, scale:1.0,
           tip:'Wespe — مدفعية ذاتية الحركة: تقصف من خارج مدى رؤيتها لكن تحتاج كشفاً (درون استطلاع أو فرقة استطلاع أو رادار)'},
 };
 
