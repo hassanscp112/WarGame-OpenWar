@@ -227,6 +227,7 @@ export const GAME_CONSTANTS = {
   AIR_KILL_XP_PLANE: 60,          // XP for an air-to-air kill
   AIR_KILL_XP_STRUCT: 25,         // XP for a structure destroyed by strike
   AIR_KILL_XP_TANK: 40,           // XP for an armored division killed
+  AIR_KILL_XP_DRONE: 30,          // XP for an enemy drone shot down
   AIR_STRIKE_XP: 5,               // XP per completed weapon release (experience)
   AIR_SQ_MAX: 4,                  // squadron size cap (group 3-4 planes)
   AIR_SQ_ECHELON_LAT: 0.35,       // wingmen trail spacing behind the leader (deg)

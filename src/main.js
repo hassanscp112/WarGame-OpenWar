@@ -1,6 +1,7 @@
 import { MCFG, MTAGS, PCFG, DCFG, TCFG, GAME_CONSTANTS, WORLD_CITIES, SDEFS, ITEM_ICONS, TECH_TREE, BOT_COUNTRIES, BOTS_MAX } from './data/constants.js';
 import { ConquestGrid, ConquestAttack, CONQUEST_CFG, registerOwner, clearRegisteredOwners, setBiomeFlatMode, setBiomeBandColor, getBiomeBandColor, getBiomeBands, attackLogic, attackTilesPerTickCtx } from './core/conquest.js';
 import { initNewUI, uiToast } from './ui.js';
+import { AirCombat, AIR_VET_NAMES } from './air/aircombat.js';
 window.GEO_DATA_ROADS = [];
 
 // ═══ CONQUEST SYSTEM (Mode 1 — OpenFront-style territory conquest) ═══
@@ -214,7 +215,21 @@ const SFX = {
   osc.connect(gn); gn.connect(this.master); osc.start(); osc.stop(this.ctx.currentTime+.15);
  },
  gun(){ this.init(); this.playNoiseLayer(0.25, 0.15, 3000, 800, 500, 200); },
- flare(){ this.init(); this.playNoiseLayer(0.6, 0.1, 4000, 2000, 1000, 800); }
+ flare(){ this.init(); this.playNoiseLayer(0.6, 0.1, 4000, 2000, 1000, 800); },
+ // TASK-401: RWR lock tone — sharp double-beep when an enemy SAM acquires us
+ rwr(){
+  this.init();
+  if(!this.ctx||this.muted)return;
+  for(let i=0;i<2;i++){
+   const osc=this.ctx.createOscillator(), gn=this.ctx.createGain();
+   osc.type='square'; osc.frequency.value=1150;
+   const t0=this.ctx.currentTime+i*0.13;
+   gn.gain.setValueAtTime(0,t0);
+   gn.gain.linearRampToValueAtTime(0.045,t0+0.01);
+   gn.gain.exponentialRampToValueAtTime(0.001,t0+0.09);
+   osc.connect(gn); gn.connect(this.master); osc.start(t0); osc.stop(t0+0.1);
+  }
+ }
 };
 
 
@@ -7037,7 +7052,8 @@ const _parkV6 = new THREE.Vector3();
 //  array (declared since forever, never populated).
 // ═══════════════════════════════════════════════════════════════════
 // Live air-combat counters (probe/debug readout — window.__ffaProbe.airStats)
-window.__airStats = { aamFired: 0, aamHits: 0, gunBursts: 0, flaresUsed: 0, planesDowned: 0, strikeRuns: 0, samAtPlanes: 0, flakHits: 0 };
+window.__airStats = { aamFired: 0, aamHits: 0, gunBursts: 0, flaresUsed: 0, planesDowned: 0, strikeRuns: 0, samAtPlanes: 0, flakHits: 0,
+    burnerPuffs: 0, smokePuffs: 0, fuelTransferred: 0, armShots: 0, armHits: 0, seadKills: 0, seadSuppressions: 0, samLockMisses: 0, droneKills: 0 };
 
 // Detection envelope of an aircraft from a given observer's side. Stealth
 // (B-2) is invisible to auto-targeting beyond very close range; Su-57/F-22
@@ -7173,6 +7189,55 @@ class AAM {
         if (this.mesh.material) _recycleMat(this.mesh.material);
     }
 }
+
+// ═══ TASK-401: AIRW — world bridge for the AirCombat module (src/air/) ═══
+// The module never imports the game; it reads everything through this
+// context object (getters keep the live module bindings fresh).
+const AIRW = {
+    get C() { return GAME_CONSTANTS; },
+    get frame() { return frame; },
+    get planes() { return planes; },
+    get structs() { return structs; },
+    get tanks() { return tanks; },
+    get drones() { return drones; },
+    get aamMissiles() { return aamMissiles; },
+    get myRole() { return myRole; },
+    get isOnline() { return isOnline; },
+    get scene() { return scene; },
+    get conquestGrid() { return conquestGrid; },
+    get EARTH_RADIUS() { return EARTH_RADIUS; },
+    get SFX() { return SFX; },
+    get AAM() { return AAM; },
+    get airStats() { return window.__airStats; },
+    logEvent,
+    haversineDist,
+    rnd,
+    vec3ToLatLon,
+    airDetectRange: (o, t) => airDetectRange(o, t),
+    isBehind: _isBehind,
+    gunTracer: _spawnGunTracer,
+    tankBlast: _tankBlast,
+    puffAt: _puffAt,
+    createTrail: createTrailMesh,
+    getFxMat: _getFxMat,
+    recycleMat: _recycleMat,
+    armGeo: () => {
+        if (!GEO_CACHE['armBody']) {
+            const g = new THREE.CylinderGeometry(0.26, 0.26, 3.6, 5);
+            g.rotateX(Math.PI / 2);   // Y-axis → +Z nose (lookAt flies it)
+            GEO_CACHE['armBody'] = g;
+        }
+        return GEO_CACHE['armBody'];
+    },
+    killMarkGeo: () => (GEO_CACHE['killMark'] || (GEO_CACHE['killMark'] = new THREE.BoxGeometry(1, 1, 1))),
+    wreckGeo: () => (GEO_CACHE['airWreck'] || (GEO_CACHE['airWreck'] = new THREE.BoxGeometry(2.4, 0.6, 1.1))),
+};
+
+// movement scratch (audit #22 — zero per-frame Vector3 allocs in Plane.update)
+const _mv1 = new THREE.Vector3();
+const _mv2 = new THREE.Vector3();
+const _mv3 = new THREE.Vector3();
+const _mv4 = new THREE.Vector3();
 
 class Plane {
     constructor(lat, lon, cfg, owner, baseOverride) {

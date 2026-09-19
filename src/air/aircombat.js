@@ -23,6 +23,7 @@ const _pv5 = new THREE.Vector3();
 const _pv6 = new THREE.Vector3();
 
 let _sqSeq = 0;   // squadron id sequence
+const _wrecks = [];   // TASK-401: falling wreckage entities (capped, compacted in tickWrecks)
 
 // Veterancy tier names (Arabic UI): Rookie / Trained / Veteran / Ace
 export const AIR_VET_NAMES = ['مبتدئ', 'مدرَّب', 'محارب قديم', 'بطل جوي'];
@@ -41,10 +42,16 @@ export const AirCombat = {
     vetDmgMul(p) {
         return 1 + (p.vetLevel || 0) * W_C(p).AIR_VET_DMG_PER_LVL;
     },
+    // Distinguish a drone target (DCFG has patrolR) from a manned aircraft
+    // (PCFG doesn't) — used for kill credit without instanceof coupling.
+    killKind(t) {
+        return (t && t.cfg && t.cfg.patrolR !== undefined) ? 'drone' : 'plane';
+    },
     awardKill(p, kind, W) {
         if (!p || p.dead) return;
         const C = W.C;
         const xp = kind === 'plane' ? C.AIR_KILL_XP_PLANE
+            : kind === 'drone' ? C.AIR_KILL_XP_DRONE
             : kind === 'tank' ? C.AIR_KILL_TANK : C.AIR_KILL_XP_STRUCT;
         p.kills++;
         p.xp += xp;
@@ -101,6 +108,11 @@ export const AirCombat = {
                 q.squadOff = { dl: -C.AIR_SQ_ECHELON_LAT * i, dn: C.AIR_SQ_ECHELON_LON * i };
             }
         });
+        // planes beyond the squadron cap go independent (no stale squad refs)
+        for (let i = C.AIR_SQ_MAX; i < all.length; i++) {
+            const q = all[i];
+            q.squad = null; q.squadLead = null; q.squadOff = null;
+        }
         if (leader.owner === W.myRole) W.logEvent(`🎖 تشكيل سرب #${id} (${members.length} طائرات) — القائد: ${leader.cfg.name}`, 'info');
         return { id, leader, members };
     },
@@ -224,6 +236,18 @@ export const AirCombat = {
             if (d < bestD) { bestD = d; best = q; }
         }
         p.airTgt = best;
+        // TASK-401/403 coordination: fighters also hunt enemy DRONES — slow,
+        // low-value air threats cleared with a gun burst or a cheap AAM.
+        // (The missiles agent owns the ground-defense acquisition side.)
+        if (!p.airTgt && (p.aaAmmo > 0 || p.gunAmmo > 0)) {
+            let db = null, dbD = 240;
+            for (const d of W.drones) {
+                if (d.dead || d.owner === p.owner) continue;
+                const dd = W.haversineDist(p.lat, p.lon, d.lat, d.lon);
+                if (dd < dbD) { dbD = dd; db = d; }
+            }
+            p.airTgt = db;
+        }
     },
 
     dogfightWeapons(p, W) {
@@ -253,7 +277,7 @@ export const AirCombat = {
                     const burst = Math.min(35, p.gunAmmo);
                     p.gunAmmo -= burst;
                     t.hit(burst * C.AIR_GUN_BURST_DMG * p.cfg.gunCaliber * align / 10 * this.vetDmgMul(p), p.owner);
-                    if (t.dead) this.awardKill(p, 'plane', W);
+                    if (t.dead) this.awardKill(p, this.killKind(t), W);
                     W.airStats.gunBursts++;
                     W.gunTracer(p.pos, t.pos);
                     if (W.SFX && W.SFX.gun) W.SFX.gun();
@@ -453,7 +477,9 @@ export const AirCombat = {
             p._botScramble();
             return;
         }
-        // holding orbit above the ramp (scratch vectors — zero allocs)
+        // holding orbit above the ramp (scratch vectors — zero allocs).
+        // TASK-401 doctrine altitudes: helis hold LOW, AWACS/tankers HIGH.
+        const alt = p.cfg.alt || 50;
         const bPos = _pv1.copy(base.pos).normalize();
         const angle = (W.frame + (p.id * 100)) * 0.03;
         const right = _pv2.set(0, 1, 0).cross(bPos);
@@ -461,7 +487,7 @@ export const AirCombat = {
         right.normalize();
         const up = _pv3.copy(bPos).cross(right).normalize();
         const cosA = Math.cos(angle) * 3, sinA = Math.sin(angle) * 3;
-        p.pos.copy(bPos).multiplyScalar(W.EARTH_RADIUS + 50.0);
+        p.pos.copy(bPos).multiplyScalar(W.EARTH_RADIUS + alt);
         p.pos.add(_pv4.copy(right).multiplyScalar(cosA));
         p.pos.add(_pv5.copy(up).multiplyScalar(sinA));
         p.mesh.position.copy(p.pos);
@@ -470,7 +496,7 @@ export const AirCombat = {
         // ahead point for lookAt orientation
         const aheadAngle = angle + 0.1;
         const cosA2 = Math.cos(aheadAngle) * 3, sinA2 = Math.sin(aheadAngle) * 3;
-        _pv6.copy(bPos).multiplyScalar(W.EARTH_RADIUS + 50.0);
+        _pv6.copy(bPos).multiplyScalar(W.EARTH_RADIUS + alt);
         _pv6.add(_pv4.copy(right).multiplyScalar(cosA2));
         _pv6.add(_pv5.copy(up).multiplyScalar(sinA2));
         p.mesh.lookAt(_pv6);
@@ -488,34 +514,111 @@ export const AirCombat = {
         const fwd = _v1.copy(p.pos).sub(p.prevPos || p.pos);
         const moving = fwd.lengthSq() > 1e-9;
         if (moving) fwd.normalize();
-        // ── afterburner: engaged in a dogfight ──
-        if (p.airTgt && !p.airTgt.dead && f % 2 === 0) {
+        // ── afterburner: engaged in a dogfight (staggered per plane) ──
+        if (p.airTgt && !p.airTgt.dead && (f + p.id) % 2 === 0) {
             _v2.copy(p.pos);
             if (moving) _v2.addScaledVector(fwd, -2.4);
-            W.puffAt(_v2, f % 4 === 0 ? 0xffaaff : 0xff8844, W.rnd(0.9, 1.5), null, 9);
+            W.puffAt(_v2, (f + p.id) % 4 === 0 ? 0xffaaff : 0xff8844, W.rnd(0.9, 1.5), null, 9);
             W.airStats.burnerPuffs++;
         }
         // ── wingtip contrails: hard maneuvering near the target/waypoint ──
         const dTurn = W.haversineDist(p.lat, p.lon, p.tlat, p.tlon);
-        if (moving && dTurn < 250 && f % 3 === 0) {
+        if (moving && dTurn < 250 && (f + p.id) % 3 === 0) {
             _v3.copy(p.pos).normalize();                       // radial up
             _v4.crossVectors(_v3, fwd).normalize();            // right wing
             W.puffAt(_v2.copy(p.pos).addScaledVector(_v4, 2.2), 0xffffff, 0.7, null, 14);
             W.puffAt(_v2.copy(p.pos).addScaledVector(_v4, -2.2), 0xffffff, 0.7, null, 14);
         }
         // ── damage smoke: hp < 40% ──
-        if (p.hp < p.cfg.hp * 0.4 && f % 3 === 1) {
+        if (p.hp < p.cfg.hp * 0.4 && (f + p.id) % 3 === 1) {
             _v2.copy(p.pos);
             if (moving) _v2.addScaledVector(fwd, -1.8);
-            W.puffAt(_v2, f % 6 === 1 ? 0x141414 : 0x2a2a30, W.rnd(1.0, 1.8), null, 40);
+            W.puffAt(_v2, (f + p.id) % 6 === 1 ? 0x141414 : 0x2a2a30, W.rnd(1.0, 1.8), null, 40);
             W.airStats.smokePuffs++;
         }
     },
+
+    // ═══ WRECKS (POLISH: crash explosion + wreckage timer) ═══════
+    // A downed aircraft sheds a tumbling, burning hulk that falls to the
+    // ground (impact boom) or burns out after AIR_WRECK_LIFE frames.
+    spawnWreck(p, W) {
+        if (_wrecks.length >= 24) return;   // particle-budget cap
+        const fwd = _v1.copy(p.pos).sub(p.prevPos || p.pos);
+        if (fwd.lengthSq() < 1e-9) fwd.set(0.1, 0.2, 0.05);
+        const v = fwd.clone().multiplyScalar(0.8);   // one alloc per shootdown — fine
+        v.x += W.rnd(-0.3, 0.3); v.y += W.rnd(-0.05, 0.25); v.z += W.rnd(-0.3, 0.3);
+        _wrecks.push(new AirWreck(p.pos, v, W));
+    },
+    tickWrecks(W) {
+        let w = 0;
+        for (let r = 0; r < _wrecks.length; r++) {
+            const k = _wrecks[r];
+            k.update();
+            if (!k.dead) { if (w !== r) _wrecks[w] = k; w++; }
+        }
+        _wrecks.length = w;
+    },
+    clearWrecks() {
+        for (const k of _wrecks) {
+            k.W.scene.remove(k.mesh);
+            if (k.mesh.material) k.W.recycleMat(k.mesh.material);
+        }
+        _wrecks.length = 0;
+    },
+    wreckCount: () => _wrecks.length,
 };
 
 // tiny indirection so vetDmgMul works without threading C everywhere
 function W_C(p) { return p && p._airC ? p._airC : (p && p.cfg ? GAME_C_FALLBACK : { AIR_VET_DMG_PER_LVL: 0.08 }); }
 const GAME_C_FALLBACK = { AIR_VET_DMG_PER_LVL: 0.08 };
+
+// ═══════════════════════════════════════════════════════════════════
+//  AIR WRECK — tumbling burning hulk of a downed aircraft. Falls under
+//  gravity toward the globe, trails black smoke + fire puffs, detonates a
+//  small boom on ground impact, and always burns out within AIR_WRECK_LIFE.
+// ═══════════════════════════════════════════════════════════════════
+export class AirWreck {
+    constructor(pos, vel, W) {
+        this.W = W;
+        this.pos = pos.clone();
+        this.vel = vel;
+        this.life = W.C.AIR_WRECK_LIFE;
+        this.dead = false;
+        this.mesh = new THREE.Mesh(W.wreckGeo(), W.getFxMat(0x1c1c20, 1.0));
+        this.mesh.position.copy(this.pos);
+        this.mesh.rotation.set(W.rnd(0, 3), W.rnd(0, 3), W.rnd(0, 3));
+        W.scene.add(this.mesh);
+    }
+    update() {
+        const W = this.W;
+        if (this.dead) return;
+        this.life--;
+        if (this.life <= 0) { this._end(); return; }
+        // gravity toward the globe + drag
+        _v1.copy(this.pos).normalize();
+        this.vel.addScaledVector(_v1, 0.35).multiplyScalar(0.985);
+        this.pos.add(this.vel);
+        // ground impact → crash explosion
+        if (this.pos.length() < W.EARTH_RADIUS + 2) {
+            const ll = W.vec3ToLatLon(this.pos);
+            W.spawnExp(ll.lat, ll.lon, 4, '#ff9944');
+            if (W.SFX && W.SFX.exp) W.SFX.exp(35);
+            this._end();
+            return;
+        }
+        this.mesh.position.copy(this.pos);
+        this.mesh.rotation.x += 0.22; this.mesh.rotation.z += 0.15;
+        // black smoke + engine fire
+        if (this.life % 4 === 0) W.puffAt(this.pos, this.life % 8 === 0 ? 0x141414 : 0x2a2a30, W.rnd(0.8, 1.4), null, 30);
+        if (this.life % 10 === 0) W.puffAt(this.pos, 0xff7733, W.rnd(0.4, 0.8), null, 6);
+    }
+    _end() {
+        const W = this.W;
+        this.dead = true;
+        W.scene.remove(this.mesh);
+        if (this.mesh.material) W.recycleMat(this.mesh.material);
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════
 //  ARM SHOT — anti-radiation missile tracer (SEAD).
