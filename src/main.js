@@ -6688,6 +6688,9 @@ const MPHASE = { BOOST: 0, COAST: 1, REENTRY: 2, CRUISE: 3 };
 // TASK-503: shared tangent scratch for Missile.update (used and consumed
 // synchronously by mesh.lookAt — never retained).
 const _mTan = new THREE.Vector3();
+// TASK-503 OPTIMIZE: shared {lat,lon} scratch for the per-tick position
+// conversion in Missile.update (consumed immediately into this.lat/lon).
+const _msLL = { lat: 0, lon: 0 };
 
 // ── TASK-403 REFACTOR: WARHEAD BEHAVIOR TABLE ──
 // One onImpact(ctx) per SPECIALIST warhead; everything else (scud, ballistic,
@@ -7047,11 +7050,6 @@ class Structure {
     }
 }
 
-// TASK-503 OPTIMIZE: shared lookAt-tangent scratch for Missile.update —
-// written and consumed synchronously inside one update (lookAt), never
-// retained, so one module-level vector serves every missile.
-const _msTanV = new THREE.Vector3();
-
 class Missile {
     constructor(slat, slon, tlat, tlon, cfg, owner, isSAM=false, launchStyle='silo') {
         this.id = ++_id; this.cfg = cfg || MCFG['ballistic']; this.owner = owner; this.isSAM = isSAM;
@@ -7070,13 +7068,6 @@ class Missile {
         this.startVec = latLonToVec3(slat, slon);
         this.targetVec = latLonToVec3(tlat, tlon);
         this.dist = this.startVec.distanceTo(this.targetVec);
-        // TASK-503 OPTIMIZE: persistent update scratches — update() used to
-        // clone 2 Vector3s per missile per frame (curVec + tangentVec) and
-        // call vec3ToLatLon twice (2 object allocs). curVec is RETAINED as
-        // this.pos so it must be per-instance; the lookAt tangent shares the
-        // module-level _msTanV; the {lat,lon} lands in this._ll.
-        this._curV = new THREE.Vector3();
-        this._ll = { lat: 0, lon: 0 };
         // Speed in km/SECOND — flight time scales with distance so short-range
         // shots land in ~1-4s and intercontinental in ~10s (was a FIXED 20-30s
         // regardless of range: slower than land conquest, now much faster).
@@ -7277,7 +7268,7 @@ class Missile {
             : Math.sin(this.progress * Math.PI) * maxArc;
         curVec.multiplyScalar(EARTH_RADIUS + h);
 
-        const ll = vec3ToLatLon(curVec);
+        const ll = vec3ToLatLon(curVec, _msLL);
         this.lat = ll.lat;
         this.lon = ll.lon;
 
@@ -8353,13 +8344,18 @@ window.__polishToggle = function (on) {
 // rolling rAF fps. console: visualTest() — game must be running.
 window.visualTest = function () {
     const res = {};
+    // TASK-503: pump the polish tick directly — RAF-starved hosts (hidden
+    // embedded-browser pages) never run loop(), which used to false-FAIL
+    // shimCompiled/shimTexBound even though the layer is healthy.
+    for (let i = 0; i < 5; i++) _polishRenderTick(16);
     res.clouds = !!(_polishClouds && _polishClouds.parent);
     res.cloudTex = !!(_polishClouds && _polishClouds.material.map);
     res.sun = !!(_polishSun && _polishSun.parent && _polishSun.children.length === 2);
     res.shimmer = !!(_polishShimmer && _polishShimmer.parent);
     res.shimTexBound = !!(_polishShimmer && _polishShimmer.material.uniforms.map.value && _polishShimmer.material.uniforms.map.value !== _shimSeedTex);
     // live tick: uTime advancing proves _polishRenderTick drives the shader
-    // (compile failures surface as THREE console errors — checked in-browser)
+    // (compile failures surface as THREE console errors — checked in-browser;
+    // the pump at the top of this probe guarantees a tick ran).
     res.shimCompiled = !!(_polishShimmer && _polishShimmer.material.uniforms.uTime.value > 0);
     // explosion FX: big blast → fireball + flash + ring present (polish is
     // wired INSIDE spawnExp — this checks the real call path), then expiry
@@ -8783,6 +8779,11 @@ class Drone {
         this.charges = this.cfg.charges || 0;
         this.pos = latLonToVec3(lat, lon, EARTH_RADIUS + DRONE_ALT);
         this.prevPos = this.pos.clone();
+        // TASK-503 OPTIMIZE: per-drone {lat,lon} scratches — _posOf() and the
+        // nudge math used to allocate a fresh object per call (per tick per
+        // drone at swarm scale). Filled + consumed synchronously.
+        this._po = { lat: 0, lon: 0 };
+        this._ll = { lat: 0, lon: 0 };
         this.mesh = buildDroneModel(this.key, owner);
         this._rotors = [];
         this.mesh.traverse(o => { if (o.name === 'rotor') this._rotors.push(o); });
@@ -8829,13 +8830,17 @@ class Drone {
         }
         return (best && bestD <= (this.cfg.engageR || 0)) ? best : null;
     }
+    // TASK-503 OPTIMIZE: fills the per-drone scratch (zero alloc). Callers
+    // consume lat/lon before any nested _posOf/_nudge call — verified per
+    // call site (_acquire loop, _tickCombat, _strike, _detonate).
     _posOf(t) {
         const o = t.obj;
         if (!o || o.dead) return null;
-        if (t.kind === 'struct') return { lat: o.lat, lon: o.lon };
-        if (t.kind === 'warship') return { lat: o.curLat !== undefined ? o.curLat : (o.lat || 0), lon: o.curLon !== undefined ? o.curLon : (o.lon || 0) };
-        if (t.kind === 'tank') return { lat: o.lat, lon: o.lon };   // TASK-302
-        if (t.kind === 'cohort' && o.mesh) { const ll = vec3ToLatLon(o.mesh.position); return { lat: ll.lat, lon: ll.lon }; }
+        const p = this._po;
+        if (t.kind === 'struct') { p.lat = o.lat; p.lon = o.lon; return p; }
+        if (t.kind === 'warship') { p.lat = o.curLat !== undefined ? o.curLat : (o.lat || 0); p.lon = o.curLon !== undefined ? o.curLon : (o.lon || 0); return p; }
+        if (t.kind === 'tank') { p.lat = o.lat; p.lon = o.lon; return p; }   // TASK-302
+        if (t.kind === 'cohort' && o.mesh) { vec3ToLatLon(o.mesh.position, p); return p; }
         return null;
     }
     // Great-circle nudge: move km toward (tLat,tLon); true when arrived
@@ -8848,7 +8853,7 @@ class Drone {
         const a = latLonToVec3(this.lat, this.lon, 1, _droneV1).normalize();
         const b = latLonToVec3(tLat, tLon, 1, _droneV2).normalize();
         a.lerp(b, f).normalize();
-        const ll = vec3ToLatLon(a);
+        const ll = vec3ToLatLon(a, this._ll);   // TASK-503: scratch out — zero alloc
         this.lat = ll.lat; this.lon = ll.lon;
         return false;
     }
@@ -8863,13 +8868,17 @@ class Drone {
         this._nudgeToward(this.homeLat + dLat, this.homeLon + dLon, km);
     }
     _tickCombat() {
-        if (--this.scanT <= 0 || !this.target || !this._posOf(this.target)) {
+        // TASK-503 OPTIMIZE: one _posOf per tick (was two: liveness check +
+        // fetch) — also hardens the acquire→read gap (a target dying between
+        // _acquire() and the read used to null-deref on t.lat).
+        let t = this.target ? this._posOf(this.target) : null;
+        if (--this.scanT <= 0 || !t) {
             this.scanT = 20;
             this.target = this._acquire();
+            t = this.target ? this._posOf(this.target) : null;
         }
-        if (!this.target) { this._tickPatrol(this.speed); return; }
+        if (!t) { this._tickPatrol(this.speed); return; }
         this.mode = 'engage';
-        const t = this._posOf(this.target);
         const d = haversineDist(this.lat, this.lon, t.lat, t.lon);
         if (this.key === 'armed') {
             // MQ-9: standoff orbit around the target + repeated precision hits
