@@ -356,37 +356,73 @@ export const GAME_CONSTANTS = {
   WARSHIP_HEAL_RATE: 4,             // HP/sec repaired near own port
   WARSHIP_HEAL_RANGE_KM: 400,       // 'near own port' distance
   // ── Navy hull classes (TASK-202 — the destroyer generalizes into a fleet).
-  //    destroyer = legacy WARSHIP_* stats; the rest branch on these fields:
+  //    TASK-402 adds: aaRange/aaCd/aaDmg (fleet AA vs planes/drones), sonarRange
+  //    (ASW detection of submerged submarines), and the submarine hull itself
+  //    (torpedo* stats, submerged flag). Branch keys unchanged:
   //    shellDmg>0 → gun platform | missileReload → VLS striker | airWing →
   //    carrier | swarmCap → drone bay | invadePct → troop transport.
   HULL_CLASSES: {
     destroyer: { key:'destroyer', name:'مدمرة',        icon:'🛳️', cost:800,  cap:4, hp:1000, speed:140, scale:1.5,
-                 shellDmg:250, shellRange:300, fireRate:120, targetRange:700 },
+                 shellDmg:250, shellRange:300, fireRate:120, targetRange:700,
+                 aaRange:320, aaCd:110, aaDmg:55, sonarRange:170 },
     escort:    { key:'escort',    name:'فرقاطة مرافقة', icon:'🚤', cost:650,  cap:4, hp:750,  speed:150, scale:1.15,
                  shellDmg:120, shellRange:250, fireRate:180, targetRange:650, pdRange:170, pdCd:95,
+                 aaRange:260, aaCd:90, aaDmg:40, sonarRange:260,
                  tip:'مرافقة — تقترن بسفينة القيادة وتعترض الصواريخ المعادية' },
+    submarine: { key:'submarine', name:'غواصة',         icon:'🦈', cost:900,  cap:2, hp:600,  speed:85,  scale:1.05,
+                 shellDmg:0, targetRange:600, submerged:true,
+                 torpedoDmg:340, torpedoCd:200, torpedoSpeed:1.75,
+                 tip:'مخفية تحت الماء — تكتشفها السونار والمروحيات فقط · طوربيدات ضد السفن' },
     missile:   { key:'missile',   name:'طراد صواريخ',  icon:'🚀', cost:1600, cap:2, hp:1100, speed:120, scale:1.5,
                  shellDmg:0, targetRange:950, missileReload:240,
+                 aaRange:300, aaCd:130, aaDmg:45,
                  tip:'منصة إطلاق متحركة — يطلق الصاروخ المختار (R) على الأهداف البحرية' },
     drone:     { key:'drone',     name:'حاملة درون',   icon:'🛩️', cost:1200, cap:2, hp:950,  speed:125, scale:1.4,
                  shellDmg:0, targetRange:0, swarmCap:8, droneCd:200,
+                 aaRange:280, aaCd:120, aaDmg:40,
                  tip:'تطلق أسراب درون (نانو/سرب/انتحارية) ترافق الأسطول وتنقض على الأعداء' },
     carrier:   { key:'carrier',   name:'حاملة طائرات', icon:'🛫', cost:2600, cap:1, hp:1600, speed:110, scale:2.1,
                  shellDmg:0, targetRange:0, airWing:5, planeCd:420, ciwsRange:65, ciwsCd:80, standoffKm:420,
+                 aaRange:350, aaCd:100, aaDmg:60,
                  tip:'سفينة القيادة — سرب جوي خاص + CIWS دفاعي + تبقى بعيداً عن المدفعية' },
     transport: { key:'transport', name:'ناقلة إنزال',  icon:'🚢', cost:500,  cap:3, hp:700,  speed:100, scale:1.7,
                  shellDmg:0, targetRange:0, invadePct:0.4,
+                 aaRange:200, aaCd:160, aaDmg:30,
                  tip:'تحمل قواتاً — حددها وانقر ساحل العدو لإنزالها (تُعاد تعبئتها في مينائك)' },
   },
   // ── Drone swarms (TASK-202 fleet params — the Drone class itself is TASK-204's) ──
   DRONE_ENGAGE_RANGE_KM: 750,       // drones aggro enemy hulls/drones inside this radius of the bay
   // TASK-403: was a DEAD constant while the class hardcoded 12 — now WIRED
-  // (kamikaze detonation distance, km).
+  // (kamikaze detonation distance, km). (TASK-402 note: submarine hull +
+  // fleet AA + mines + formations live in the TASK-402 block below.)
   DRONE_HIT_RANGE_KM: 12,           // kamikaze detonation distance
   DRONE_ALT: 32,                    // flight altitude (world units above the sphere)
   // ── Fleet behavior ──
   ESCORT_LEASH_KM: 240,             // escorts shadow their capital inside this radius
   NAVAL_MISSILE_DMG_MUL: 2.0,       // missile blasts hit ships at ×2 (anti-ship precision)
+  // ── TASK-402: Navy deep pass ──
+  // Fleet AA (audit #6): barrage hit chance vs aircraft = BASE − SPEED×(spd−2.5)
+  FLEET_AA_CHANCE_BASE: 0.75,
+  FLEET_AA_CHANCE_SPEED: 0.06,      // lost per km/frame of target speed above 2.5
+  FLEET_AA_CHANCE_MIN: 0.15,
+  FLEET_AA_DRONE_CHANCE: 0.85,      // drones loiter slow — flak shreds them
+  SONAR_HELICOPTER_KM: 260,         // helis reveal submerged subs inside this radius
+  AIR_STRIKE_SHIP_MUL: 1.8,         // TASK-402 audit #6: aircraft ordnance vs hulls (bombs on decks hit hard)
+  SUB_DETECT_FRAMES: 300,           // sonar contact persistence (~5s)
+  SUB_REVEAL_FRAMES: 480,           // flaming-datum reveal after firing torpedoes (~8s)
+  SHORE_BOMBARD_RANGE_KM: 260,      // gun hulls auto-shell enemy coastal structures inside this
+  NAVAL_SHELL_VS_ARMOR: 0.6,        // shore-bombardment shells vs tank divisions (pre-armor)
+  NAVAL_SHELL_STRUCT_MUL: 0.8,      // shore-bombardment shells vs structures
+  FORMATION_SPACING_KM: 70,         // slot spacing for line/wedge stances
+  // Naval mines (deployable zones — Z key; J is the ECM station (TASK-403)
+  // and L the trade-lane toggle (TASK-404) on main)
+  MINE_COST: 200, MINE_CAP: 6, MINE_RADIUS_KM: 55, MINE_DMG: 380,
+  MINE_ARM_FRAMES: 180,             // 3s arming delay (no friendly-fire on deploy)
+  MINE_CHARGES: 3,                  // hulls consumed before the field is spent
+  MINE_LIFE_FRAMES: 7200,           // fields fade after ~2min
+  SINK_ANIM_FRAMES: 180,            // list + submerge sinking animation (3s)
+  // Fleet formation stances (P cycles): free / line / wedge
+  FLEET_STANCES: ['free', 'line', 'wedge'],
   // ── TASK-302: Land units / tank divisions ──
   TANK_CAP_TOTAL: 12,               // hard cap per owner across all divisions
   TANK_CORRIDOR_R_KM: 22,           // spearhead paint radius while advancing (mode 1)

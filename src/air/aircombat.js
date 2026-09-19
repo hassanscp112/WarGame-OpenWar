@@ -326,6 +326,18 @@ export const AirCombat = {
                 if (_cas) d *= 0.55;
                 if (d < bestD) { bestD = d; best = t; }
             }
+            // TASK-402 (audit #6 plane-side): enemy HULLS are strike targets
+            // too — wrapped so live position/dead stay current for the pass
+            // steering. Submerged & unlocated subs are invisible from air.
+            if (W.warships && W.shipTarget) {
+                for (const w of W.warships) {
+                    if (w.dead || w.owner === p.owner) continue;
+                    if (w.hull && w.hull.submerged && !w.detected) continue;
+                    let d = W.haversineDist(p.tlat, p.tlon, w.curLat, w.curLon);
+                    if (_cas) d *= 0.75;   // CAS loadouts hit ships hardest after armor
+                    if (d < bestD) { bestD = d; best = W.shipTarget(w); }
+                }
+            }
             p.gndTgt = best;
             if (!best) { p.mode = 'patrol'; return; }   // nothing to strike here
         }
@@ -374,6 +386,7 @@ export const AirCombat = {
             }
         }
         W.tankBlast(aim.lat, aim.lon, R, 90 * mul, p.owner);   // armor under the stick
+        if (W.navalBlast) W.navalBlast(aim.lat, aim.lon, R, 90 * mul, p.owner);   // TASK-402 audit #6: hulls under the stick
         for (let i = 0; i < 6; i++) {
             W.spawnExp(aim.lat + W.rnd(-0.2, 0.2), aim.lon + W.rnd(-0.25, 0.25), W.rnd(3, 6), '#ffaa44');
         }
@@ -446,6 +459,7 @@ export const AirCombat = {
                 }
             }
             W.tankBlast(t.lat, t.lon, 26, 16 * mul, p.owner);
+            if (W.navalBlast) W.navalBlast(t.lat, t.lon, 26, 16 * mul, p.owner);   // TASK-402 audit #6: sweeping fire vs hulls
             W.spawnExp(t.lat + W.rnd(-0.08, 0.08), t.lon + W.rnd(-0.1, 0.1), 2.5, '#ffaa55');
             if (W.SFX && W.SFX.gun) W.SFX.gun();
             if (W.conquestGrid && W.conquestGrid.applyDevastation) W.conquestGrid.applyDevastation(t.lat, t.lon, 15, 0.4);
