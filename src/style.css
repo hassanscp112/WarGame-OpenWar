@@ -633,6 +633,10 @@ html, body {
 #econDebt { color: #ff8f6b; font-size: 10px; font-weight: 800; margin-inline-start: 5px;
     white-space: nowrap; text-shadow: 0 0 6px rgba(255, 80, 40, .5); }
 
+/* 🚩 TASK-506 morale badge inside the troops stat (recent-loss ratio → ±15%) */
+#moraleBadge { font-size: 10px; font-weight: 800; margin-inline-start: 5px;
+    white-space: nowrap; cursor: help; }
+
 /* 🎚️ TASK-408 sound mixer panel */
 #sfxMix { position: fixed; z-index: 65; width: 232px; padding: 10px 12px;
     background: rgba(14, 16, 22, .94); border: 1px solid #2c3a4a; border-radius: 10px;

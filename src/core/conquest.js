@@ -25,6 +25,22 @@ export const CONQUEST_CFG = {
   // (8-connected). 1 = full dilation (any water neighbour). 2 = gentler.
   WATER_DILATION_MIN_NEIGHBORS: 1,
 
+  // ── TASK-506: geo-referenced COAST REPAIR ──
+  // The OpenFront terrain binary (IoU 76% vs GeoJSON) OVER-WATERS some
+  // coasts — e.g. Kent/SE England is drawn ~25km too far east and Spain's
+  // Costa del Sol ~78km too far north, which keeps Dover/Gibraltar past
+  // the armor wade threshold even with geo-gated dilation. The repair
+  // restores land the GeoJSON country polygons claim, under two gates:
+  //   1. no binary LAND within COAST_REPAIR_MIN_INLAND cells → thin
+  //      features (rivers hugging their banks) are never filled;
+  //   2. a geo=0 (outside-polygon) cell within COAST_REPAIR_MAX_GEO_EDGE
+  //      cells → only the coastal band is restored; inland seas/lakes
+  //      (Great Lakes ≈41 cells from any polygon edge, Nile delta ≈14)
+  //      stay water. Calibrated live: Kent sits at edge-distance 3-5,
+  //      the Thames-mouth chunk at 5, everything worth keeping ≥ 14.
+  COAST_REPAIR_MIN_INLAND: 3,
+  COAST_REPAIR_MAX_GEO_EDGE: 12,
+
   // ── Owner codes ──
   WATER: 0,
   NEUTRAL: 1,
@@ -44,7 +60,16 @@ export const CONQUEST_CFG = {
   // take. decays slowly so saturation fades after ~3-4 minutes of peace.
   DEVASTATION_MAX: 1.0,          // full weakness cap
   DEVASTATION_PER_HIT: 0.55,     // applied at blast center
-  DEVASTATION_DECAY_PER_TICK: 0.00012,  // ~1/5000 per tick ≈ fades in ~3.5 min
+  // TASK-506: per-DECAY-CALL step. decayDevastation() visits every live
+  // devastation cell each call (~30 calls/s from the render loop), so a full
+  // blast (0.55) heals in 0.55/0.00012/30 ≈ 150s ≈ 2.5min of peace. (The old
+  // rotating-cursor implementation swept the whole 25.9M-cell grid at 48k
+  // cells/s — each cell was visited once per ~9 MINUTES, making decay
+  // effectively never happen.)
+  DEVASTATION_DECAY_PER_TICK: 0.00012,
+  // Safety cap on the live-devastation set (cells with dev>0). Each blast
+  // paints ~100-300 cells; even a sustained total war stays well under this.
+  DEVASTATION_SET_CAP: 200000,
   DEVASTATION_DEF_MULT: 0.35,    // at full devastation, terrain magnitude ×0.35
   DEVASTATION_SPEED_MULT: 1.8,   // at full devastation, conquest speed ×1.8
   // ── TASK-406: devastation VISUAL layer (scorch reads on the globe) ──
@@ -315,9 +340,18 @@ export class ConquestGrid {
     this._dirty = true;                  // full repaint needed
     this._dirtyCells = new Set();        // incremental: cell indices changed
     this._borderCells = new Set();       // cells currently drawn as territory borders
+    // TASK-506 OPTIMIZE: scratch buffers reused across incremental flushes
+    // (the flush path runs on every conquest tick — the old code allocated a
+    // fresh Set + Array per call; classic churn at 10 ticks/s × N attacks).
+    this._recheckScratch = new Set();
+    this._nbScratch = new Int32Array(4);
     this._countsOther = new Map();        // bot owner code → owned cell count (O(1) countCells)
     this._devastation = new Float32Array(cfg.GRID_W * cfg.GRID_H);  // TASK-102 blast-weakening layer
-    this._devCursor = 0;                  // rotating decay cursor
+    this._devCursor = 0;                  // rotating decay cursor (legacy, kept for API compat)
+    // TASK-506: live-devastation set — decay iterates ONLY these cells
+    // (blasts are sparse; the old full-grid rotating sweep never revisited a
+    // cell often enough for the decay constant to matter).
+    this._devSet = new Set();
 
     // TASK-406: devastation VISUAL layer — a second canvas painted with a
     // scorched tint whose alpha follows the logical devastation value and
@@ -341,6 +375,12 @@ export class ConquestGrid {
     // only lets INTERIOR water (rivers/lakes/canals) push banks outward —
     // ocean/strait water never dilates, so coastlines keep their true width.
     this._geoLand = null;
+    // TASK-506: how the LAST dilation ran — 'none' | 'blanket' | 'geo'.
+    // A blanket dilation (GeoJSON arrived after grid init) can be safely
+    // REDONE geo-gated by a late setGeoLandRef call — but only while no
+    // cell is owned yet (pre-spawn); once territory exists the mask is
+    // frozen (a rebuild would wipe every player/bot cell).
+    this._dilateState = 'none';
 
     // TASK-406: frontline heat — cells involved in recent ownership flips
     // (the active frontline glows; ages out after HEAT_AGE_MS).
@@ -573,7 +613,10 @@ export class ConquestGrid {
 
   // ── land mask FROM the terrain byte (bit7 = isLand). Replaces GeoJSON rasterization. ──
   // Now the conquerable land is EXACTLY the visible land — one grid, perfectly synced.
-  buildLandMaskFromTerrain() {
+  // rebuildTerrain=false skips buildTerrainHeuristic (26M-cell recompute) when the
+  // caller KNOWS this.terrain[] is already valid for this terrainByte (e.g. the
+  // TASK-506 geoLand late-load re-apply — identical inputs, identical output).
+  buildLandMaskFromTerrain(rebuildTerrain = true) {
     const cfg = this.cfg;
     this._counts.neutral = 0;
     const tb = this.terrainByte, owner = this.owner;
@@ -585,7 +628,7 @@ export class ConquestGrid {
         owner[cell] = cfg.WATER;
       }
     }
-    this.buildTerrainHeuristic();
+    if (rebuildTerrain) this.buildTerrainHeuristic();
     this._dirty = true;
   }
 
@@ -637,14 +680,124 @@ export class ConquestGrid {
     let n = 0;
     for (let i = 0; i < owner.length; i++) if (owner[i] === NEUTRAL) n++;
     this._counts.neutral = n;
+    this._dilateState = geo ? 'geo' : 'blanket';
     this._dirty = true;
   }
 
   // ── TASK-406 follow-up: GeoJSON inside-polygon reference for dilateWater. ──
   // u8: Uint8Array(W*H), 1 = cell center inside a country polygon. Passing
   // null/undefined clears it (dilation returns to blanket mode).
+  //
+  // TASK-506 LATE-LOAD RE-APPLY: if the grid was dilated BLANKET (GeoJSON
+  // had not arrived within initConquestGrid's bounded wait) and this is the
+  // FIRST valid ref, the mask is rebuilt geo-gated — but ONLY while zero
+  // cells are owned (pre-spawn). Rebuilding re-runs buildLandMaskFromTerrain
+  // + dilateWater + the biome repaint; everything downstream (overlay full
+  // repaint via _dirty, frontier rebuild, coarse water mask via the caller)
+  // picks the corrected coasts up on the next frame. Once any side owns
+  // territory the fallback is FINAL and precisely documented: blanket coasts
+  // (~5.5km erosion, wide straits) stay for the whole game — a mid-game
+  // rebuild would wipe ownership, so it must never fire.
+  // Returns true when a re-apply actually happened (caller may rebuild
+  // derived caches); false otherwise.
   setGeoLandRef(u8) {
-    this._geoLand = (u8 && u8.length === this.cfg.GRID_W * this.cfg.GRID_H) ? u8 : null;
+    const valid = (u8 && u8.length === this.cfg.GRID_W * this.cfg.GRID_H) ? u8 : null;
+    const isFirstRef = valid && !this._geoLand;
+    this._geoLand = valid;
+    if (!isFirstRef || this._dilateState !== 'blanket') return false;
+    const owned =
+      (this._counts.player || 0) + (this._counts.enemy || 0) +
+      (this._countsOther ? Array.from(this._countsOther.values()).reduce((a, b) => a + b, 0) : 0);
+    if (owned > 0) {
+      // Game already underway on a blanket mask — document precisely and keep it.
+      console.warn('[CONQUEST] geoLand ref arrived AFTER spawn on a blanket-dilated mask — ' +
+        'keeping blanket coasts for this game (a rebuild would wipe territory). ' +
+        'Next game initializes geo-gated if GeoJSON loads in time.');
+      return false;
+    }
+    // Safe pre-spawn re-apply: terrain → mask → coast repair → geo-gated
+    // dilation → biome repaint (terrain heuristic already valid — same
+    // terrainByte, skip the 26M-cell recompute).
+    this.buildLandMaskFromTerrain(false);
+    this.repairCoastFromGeoRef();
+    this.dilateWater(this.cfg.WATER_DILATION_RINGS, this.cfg.WATER_DILATION_MIN_NEIGHBORS);
+    this.paintBiomeBase();
+    console.log('[CONQUEST] geoLand late-load: mask re-applied geo-gated (coasts/straits restored to true width)');
+    return true;
+  }
+
+  // ── TASK-506: geo-referenced COAST REPAIR (see cfg.COAST_REPAIR_* docs) ──
+  // Restores land the terrain binary over-waters INSIDE country polygons
+  // (missing Kent peninsula, Spain's south coast), leaving rivers (hug
+  // binary land), lakes (deep inside polygons) and the ocean untouched.
+  // Returns the number of cells repaired (0 when no geo ref is set).
+  // Call AFTER the land mask is built and the geo ref is set, BEFORE
+  // dilateWater/paintBiomeBase (repaired cells get tb=0xC0 → sand shore).
+  repairCoastFromGeoRef() {
+    if (!this._geoLand) return 0;
+    const cfg = this.cfg;
+    const W = cfg.GRID_W, H = cfg.GRID_H, WATER = cfg.WATER, NEUTRAL = cfg.NEUTRAL;
+    const geo = this._geoLand, owner = this.owner, tb = this.terrainByte;
+    const MIN_IN = cfg.COAST_REPAIR_MIN_INLAND, MAX_EDGE = cfg.COAST_REPAIR_MAX_GEO_EDGE;
+    const isLandT = (r, c) => (tb[r * W + (((c % W) + W) % W)] & 0x80) !== 0;
+    const isGeoOut = (r, c) => { const cc = ((c % W) + W) % W; return !geo[r * W + cc]; };
+    // Phase 1 — collect candidates (read-only: writes mid-scan would turn
+    // repaired cells into "binary land" and suppress their neighbours —
+    // the first version left a comb pattern of un-repaired stripes).
+    // Two defect classes share the coastal-band gate:
+    //   class 1 — thick missing chunks (Kent): no binary land within MIN_IN
+    //             cells → not a river bank / shore hugging land;
+    //   class 2 — plain-OCEAN bytes (bit5, no land/shore flags) inside the
+    //             polygon (Spain's south coast band): the binary drew open
+    //             ocean where the polygon says land. River mouths carry the
+    //             shoreline flag (0xC0-0xC2) and are never touched.
+    const cand = [];
+    for (let row = 0; row < H; row++) {
+      for (let col = 0; col < W; col++) {
+        const cell = row * W + col;
+        if (owner[cell] !== WATER || !geo[cell]) continue;   // only polygon-interior water
+        const tbv = tb[cell];
+        const plainOcean = (tbv & 0x80) === 0 && (tbv & 0x40) === 0 && (tbv & 0x20) !== 0;
+        if (!plainOcean) {
+          // gate 1: no binary land within MIN_IN cells (Chebyshev) → not a river bank
+          let nearLand = false;
+          for (let dy = -MIN_IN; dy <= MIN_IN && !nearLand; dy++) {
+            const nr = row + dy;
+            if (nr < 0 || nr >= H) continue;
+            for (let dx = -MIN_IN; dx <= MIN_IN; dx++) {
+              if (isLandT(nr, col + dx)) { nearLand = true; break; }
+            }
+          }
+          if (nearLand) continue;
+        }
+        // gate 2: a geo=0 (outside-polygon) cell within MAX_EDGE rings → coastal band
+        let coastal = false;
+        for (let rr = 1; rr <= MAX_EDGE && !coastal; rr++) {
+          for (let dy = -rr; dy <= rr && !coastal; dy++) {
+            const nr = row + dy;
+            if (nr < 0 || nr >= H) continue;
+            for (let dx = -rr; dx <= rr; dx++) {
+              if (Math.max(Math.abs(dy), Math.abs(dx)) !== rr) continue;   // ring cells only
+              if (isGeoOut(nr, col + dx)) { coastal = true; break; }
+            }
+          }
+        }
+        if (!coastal) continue;   // inland sea / lake — keep as water
+        cand.push(cell);
+      }
+    }
+    // Phase 2 — apply all writes after the scan.
+    for (const cell of cand) {
+      owner[cell] = NEUTRAL;
+      tb[cell] = 0xC0;          // land + shoreline → paints as sand
+    }
+    if (cand.length > 0) {
+      let n = 0;
+      for (let i = 0; i < owner.length; i++) if (owner[i] === NEUTRAL) n++;
+      this._counts.neutral = n;
+      this._dirty = true;
+    }
+    return cand.length;
   }
 
   // ── Paint the biome base canvas tile-by-tile from terrainByte[] via ofTerrainColor(). ──
@@ -905,8 +1058,18 @@ export class ConquestGrid {
     if (old === newCode) return false;
     if (old === cfg.WATER) return false;          // can't conquer ocean
     this.owner[cell] = newCode;
-    // Occupation resets devastation (the new owner garrisons + repairs).
-    if (this._devastation) this._devastation[cell] = 0;
+    // Occupation resets devastation (the new owner garrisons + repairs) —
+    // BOTH the logical value and the visual scorch pixel (TASK-506: the old
+    // code zeroed the value but never touched the bucket/dirty set, so a
+    // captured land kept its scorch overlay forever).
+    if (this._devastation && this._devastation[cell] > 0) {
+      this._devastation[cell] = 0;
+      this._devSet.delete(cell);
+      if (this._devBuckets[cell] !== 0) {
+        this._devBuckets[cell] = 0;
+        this._devDirty.add(cell);
+      }
+    }
     // adjust counts (ALL owners — bots live in _countsOther for O(1) reads)
     if (old === cfg.PLAYER) this._counts.player--;
     else if (old === cfg.ENEMY) this._counts.enemy--;
@@ -1040,6 +1203,7 @@ export class ConquestGrid {
         const add = hit * fall;
         const cur = this._devastation[cell];
         const nv = cur + add > maxD ? maxD : cur + add;
+        if (nv > 0 && this._devSet.size < cfg.DEVASTATION_SET_CAP) this._devSet.add(cell);
         this._devastation[cell] = nv;
         // TASK-406: track the visual bucket — repaint only when it changes
         const nb = Math.min(cfg.DEV_VIS_LEVELS - 1, Math.round(nv * (cfg.DEV_VIS_LEVELS - 1)));
@@ -1055,32 +1219,35 @@ export class ConquestGrid {
     return this._devastation ? this._devastation[cell] : 0;
   }
 
-  // Slow decay — call once per tick batch from the game loop.
-  decayDevastation(nCells = 800) {
-    if (!this._devastation) return;
+  // TASK-506: decay — iterates ONLY the live-devastation set (cells that
+  // actually carry dev>0), so every devastated cell decays at the full
+  // per-call rate regardless of grid size. nCells remains a per-call budget
+  // cap (defensive only — the set is bounded by DEVASTATION_SET_CAP; entries
+  // beyond the budget decay on a later call). Cells that hit 0 are removed
+  // from the set; bucket changes queue a scorch-pixel repaint.
+  decayDevastation(nCells = 1600) {
+    if (!this._devastation || this._devSet.size === 0) return;
     const d = this._devastation;
     const dec = this.cfg.DEVASTATION_DECAY_PER_TICK;
-    // rotating window: only touches nCells entries per call → O(nCells)
-    this._devCursor = (this._devCursor || 0) % d.length;
-    let idx = this._devCursor;
     const L = this.cfg.DEV_VIS_LEVELS - 1;
-    for (let i = 0; i < nCells; i++) {
+    let budget = Math.min(nCells, this._devSet.size);
+    for (const idx of this._devSet) {
+      if (budget-- <= 0) break;
       const v = d[idx];
-      if (v > 0) {
-        const nv = v <= dec ? 0 : v - dec;
-        d[idx] = nv;
-        // TASK-406: bucket change → scorch pixel repaint (usually stays same → no-op)
-        const nb = nv <= 0 ? 0 : Math.min(L, Math.round(nv * L));
-        if (nb !== this._devBuckets[idx]) {
-          this._devBuckets[idx] = nb;
-          this._devDirty.add(idx);
-        }
+      if (v <= 0) { this._devSet.delete(idx); continue; }   // stale zero (cleared elsewhere)
+      const nv = v <= dec ? 0 : v - dec;
+      d[idx] = nv;
+      if (nv === 0) this._devSet.delete(idx);
+      // bucket change → scorch pixel repaint (usually stays same → no-op)
+      const nb = nv <= 0 ? 0 : Math.min(L, Math.round(nv * L));
+      if (nb !== this._devBuckets[idx]) {
+        this._devBuckets[idx] = nb;
+        this._devDirty.add(idx);
       }
-      idx++;
-      if (idx >= d.length) idx = 0;
     }
-    this._devCursor = idx;
   }
+  // Introspection for probes/tests: how many cells currently carry devastation.
+  devastationCellCount() { return this._devSet.size; }
   seedCircle(lat, lon, radiusKm, ownerStr) {
     const cfg = this.cfg;
     // Snap to nearest land cell if the clicked location falls on water in the grid
@@ -1145,11 +1312,10 @@ export class ConquestGrid {
         data[p + 3] = 0;   // transparent — biome base shows through
       }
     };
-    const clearCell = (cell) => {
-      const p = cell * 4;
-      data[p + 3] = 0;
-    };
-    // ── Territory border: darken owned cells whose neighbor has a different owner ──
+    // ── Territory border: owned cells whose neighbor has a different owner ──
+    // (membership feeds the vector frontier lines + AI frontline targeting;
+    // the canvas itself no longer darkens border pixels — TASK-406 removed the
+    // per-pixel darkening in favour of the crisp vector overlay.)
     const isBorderCell = (cell) => {
       const o = this.owner[cell];
       if (!isOwnedCode(o, cfg)) return false;
@@ -1160,24 +1326,6 @@ export class ConquestGrid {
       if (row > 0 && this.owner[cell - W] !== o) return true;                      // north
       if (row < H - 1 && this.owner[cell + W] !== o) return true;                  // south
       return false;
-    };
-    // Frontier edge: push an owned border cell harder toward its owner color + darken,
-    // so the territory outline reads as a clear green (player) / red (enemy) line over
-    // the photo biome base.
-    const darkenCell = (cell) => {
-      const o = this.owner[cell];
-      const tint = isOwnedCode(o, cfg) ? ownerColor(o, cfg) : null;
-      const p = cell * 4;
-      if (tint) {
-        // 75% owner tint + 25% current, then ×0.70 for contrast
-        data[p]     = ((data[p]     * 0.25 + tint[0] * 0.75) * 0.70) | 0;
-        data[p + 1] = ((data[p + 1] * 0.25 + tint[1] * 0.75) * 0.70) | 0;
-        data[p + 2] = ((data[p + 2] * 0.25 + tint[2] * 0.75) * 0.70) | 0;
-      } else {
-        data[p]     = (data[p]     * 0.30) | 0;
-        data[p + 1] = (data[p + 1] * 0.30) | 0;
-        data[p + 2] = (data[p + 2] * 0.30) | 0;
-      }
     };
 
     let dirtyRect = null; // null = full-canvas copy; otherwise {x,y,w,h}
@@ -1217,16 +1365,17 @@ export class ConquestGrid {
     } else if (this._dirtyCells.size > 0) {
       // ── Incremental: repaint dirty cells, then fix borders for affected cells ──
       // Collect all cells whose border status might have changed: dirty cells + neighbors
-      const recheck = new Set();
-      const nbBuf = [0, 0, 0, 0];
+      const recheck = this._recheckScratch;
+      recheck.clear();
+      const nbBuf = this._nbScratch;
       for (const cell of this._dirtyCells) {
         recheck.add(cell);
         const n = this.neighbors4(cell, nbBuf);
         for (let k = 0; k < n; k++) recheck.add(nbBuf[k]);
       }
-      // Step 1: repaint dirty cells (ownership may have changed)
+      // Step 1: repaint dirty cells (ownership may have changed — paintCell
+      // fully overwrites the pixel for owned cells and clears alpha otherwise)
       for (const cell of this._dirtyCells) {
-        clearCell(cell);
         paintCell(cell);
       }
       // Step 2: restore normal color for all recheck cells (undo prior border darkening)
@@ -1241,8 +1390,7 @@ export class ConquestGrid {
         } else {
           this._borderCells.delete(cell);
         }
-      }
-      // Bounding box of every touched cell → only copy that slice to the canvas.
+      }      // Bounding box of every touched cell → only copy that slice to the canvas.
       // At 7200x3600 a full putImageData (~104MB) every conquest tick would stutter;
       // the dirty rect bounds the copy to just the changed region.
       let minC = W, minR = H, maxC = -1, maxR = -1;
@@ -1692,10 +1840,9 @@ _enqueueTargetCell(attackerCell, targetCell) {
       this.ctx.addTroops(this.target, -wiped);
       if (this.ctx.onLosses && wiped > 0) this.ctx.onLosses(this.target, wiped);   // TASK-406 morale
     }
+    // Elimination logging is owned by ctx.onEliminated (main.js) — it knows bot
+    // names/flags; the old generic log here duplicated every elimination notice.
     if (this.ctx.onEliminated) this.ctx.onEliminated(this.owner, this.target);
-    if (this.ctx.log) {
-      this.ctx.log(`تم القضاء على قوات ${this.target === 'player' ? 'اللاعب' : 'العدو'}!`, 'info');
-    }
   }
 
   _end() {

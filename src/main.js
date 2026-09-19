@@ -41,6 +41,11 @@ function buildConquestCtx() {
         else if (isBotStr(o)) { const b = botByStr(o); if (b) b.troops = Math.max(0, b.troops + d); }
         else eTroops += d;
     },
+    // TASK-506 MORALE: ConquestAttack feeds both sides' losses here; attackLogic
+    // reads getMorale for the ±15% effectiveness swing (conquest.js had the hooks
+    // since TASK-406 but nothing fed them — morale was permanently 1).
+    getMorale: (o) => moraleGet(o),
+    onLosses: (o, n) => moraleAddLosses(o, n),
     // OpenFront PlayerExecution: when a tile flips owner, structures standing on
     // it are CAPTURED by the tile's new owner (level kept). Previously null — a
     // captured enemy port kept spawning enemy trade ships and paying enemy gold forever.
@@ -72,6 +77,96 @@ function buildConquestCtx() {
     log: logEvent,
   };
 }
+
+// ═════════════════════════════════════════════════════════════════════
+//  TASK-506 — MORALE v1 (recent-loss ratio → troop effectiveness ±15%)
+//  conquest.js's attackLogic has consumed ctx.getMorale since TASK-406,
+//  but no provider existed — morale was permanently neutral (×1). This
+//  block feeds it: every combat loss decays into a per-side "recent
+//  losses" pool (half-life 20s); pressure p = L / (L + troops + floor)
+//  maps to morale m:
+//      p ≤ 0.10  → 1.15 … 1.00   (fresh army — momentum bonus)
+//      0.10–0.30 → 1.00 … 0.85   (attrition drag)
+//      p ≥ 0.30  → 0.85 floor    (broken — bleed more, conquer slower)
+//  The swing applies to BOTH attack speed and per-tile losses (see
+//  attackLogic's mA / mD factors) for the player AND every bot equally.
+// ═════════════════════════════════════════════════════════════════════
+const MORALE_CFG = {
+    HALF_LIFE_S: 20,     // recent losses halve every 20 s
+    POOL_FLOOR: 5000,    // keeps tiny armies from insta-breaking on one skirmish
+    P_CALM: 0.10,        // pressure at/below this → morale ≥ 1.0 band
+    P_BROKEN: 0.30,      // pressure at/above this → 0.85 floor
+    MAX: 1.15, MIN: 0.85,
+};
+const moraleState = { loss: {} };   // side → exponentially-decayed recent losses
+
+function moraleAddLosses(side, n) {
+    if (!side || !(n > 0)) return;
+    moraleState.loss[side] = (moraleState.loss[side] || 0) + n;
+}
+
+// 1×/s from the render loop (frame % 60) — decays every side's pool.
+function moraleTick() {
+    const k = Math.pow(0.5, 1 / MORALE_CFG.HALF_LIFE_S);
+    for (const s of Object.keys(moraleState.loss)) {
+        moraleState.loss[s] *= k;
+        if (moraleState.loss[s] < 1) delete moraleState.loss[s];
+    }
+}
+
+// PURE pressure → morale map (probe-replayable without a live game).
+function moraleFromPressure(p) {
+    if (p <= 0) return MORALE_CFG.MAX;
+    if (p <= MORALE_CFG.P_CALM) return 1 + (MORALE_CFG.MAX - 1) * (1 - p / MORALE_CFG.P_CALM);
+    if (p >= MORALE_CFG.P_BROKEN) return MORALE_CFG.MIN;
+    const t = (p - MORALE_CFG.P_CALM) / (MORALE_CFG.P_BROKEN - MORALE_CFG.P_CALM);
+    return 1 - (1 - MORALE_CFG.MIN) * t;
+}
+
+function moraleGet(side) {
+    const L = moraleState.loss[side] || 0;
+    if (L <= 0) return MORALE_CFG.MAX;
+    const T = conquestCtx ? Math.max(0, conquestCtx.getTroops(side)) : 0;
+    return moraleFromPressure(L / (L + T + MORALE_CFG.POOL_FLOOR));
+}
+
+// ── morale badge (player): 🚩 ±N% inside the troops stat, like the econ
+//    debt badge — lazy DOM, dirty-write on displayed-percent change. ──
+let _moraleShown = null;
+function _moraleBadgeUpdate() {
+    let el = document.getElementById('moraleBadge');
+    const inGame = window.gameMode === 'mode1' && conquestCtx && !window.startSpawnPhase;
+    if (!inGame) {
+        if (el) el.style.display = 'none';
+        _moraleShown = null;
+        return;
+    }
+    const m = moraleGet(myRole);
+    const pct = Math.round((m - 1) * 100);
+    if (!el) {
+        const t = document.getElementById('pTroops');
+        const host = (t && t.closest && t.closest('.stat')) || document.body;
+        el = document.createElement('span');
+        el.id = 'moraleBadge';
+        host.appendChild(el);
+    }
+    el.style.display = '';
+    if (_moraleShown === pct) return;   // dirty-flag: write DOM only on change
+    _moraleShown = pct;
+    const cls = m >= 1.08 ? '#7fff9e' : (m >= 0.95 ? '#9db4c8' : (m >= 0.88 ? '#ffb056' : '#ff5a5a'));
+    el.textContent = (pct > 0 ? '🚩+' + pct + '%' : (pct < 0 ? '🚩' + pct + '%' : '🚩±0%'));
+    el.style.color = cls;
+    const L = Math.round(moraleState.loss[myRole] || 0);
+    el.title = `الروح المعنوية: ${pct > 0 ? '+' : ''}${pct}% — تتأثر بالخسائر الأخيرة (خسائر حديثة: ${L.toLocaleString('en')} جندي)`;
+}
+
+function _moraleReset() {
+    moraleState.loss = {};
+    _moraleShown = null;
+    const el = document.getElementById('moraleBadge');
+    if (el) el.style.display = 'none';
+}
+window.__morale = { state: moraleState, cfg: MORALE_CFG, get: moraleGet, add: moraleAddLosses, tick: moraleTick, fromPressure: moraleFromPressure };
 
 // Flip a structure to its captor: clone its material (shared cache materials must
 // not be re-tinted in place) and repaint mesh + selection ring in the new color.
@@ -3946,6 +4041,36 @@ function _awaitGeoJson(ms = 10000) {
     });
 }
 
+// ── TASK-506: geoLand LATE-LOAD watcher ──
+// If grid init had to fall back to blanket water dilation (GeoJSON slower
+// than the bounded 10s wait), poll for the data and hand the FIRST valid
+// ref to setGeoLandRef — which safely re-applies the mask geo-gated while
+// zero cells are owned (pre-spawn) and refuses (documented) once the game
+// is underway. Bounded to 2 minutes; one-shot.
+function _geoLandLateWatch() {
+    const t0 = performance.now();
+    const poll = () => {
+        const f = (window.GEOJSON_DATA && window.GEOJSON_DATA.features) || [];
+        if (f.length) {
+            if (!conquestGrid) return;
+            const ref = _buildGeoLandRef(f);
+            if (!ref) return;
+            if (conquestGrid.setGeoLandRef(ref)) {
+                // Re-apply happened: refresh every derived cache.
+                _coarseWaterMask = null;              // water pathfinding mask
+                const btex = earthMesh && earthMesh.material && earthMesh.material.map;
+                if (btex) btex.needsUpdate = true;    // biome globe texture
+                renderMode1Territory();               // territory overlay full repaint
+                logEvent('🗺️ صُحِّحت الخطوط الساحلية بعد اكتمال تحميل بيانات الخريطة', 'info');
+            }
+            return;   // done either way (applied, or game underway — documented)
+        }
+        if (performance.now() - t0 > 120000) return;  // give up quietly after 2 min
+        setTimeout(poll, 2000);
+    };
+    poll();
+}
+
 // Rasterize the GeoJSON country polygons at full grid res into a 0/1
 // Uint8Array (1 = cell center inside a polygon). Same projection + sampling
 // as the GeoJSON fallback mask path (proven at 7200×3600). The conquest
@@ -4008,6 +4133,16 @@ async function initConquestGrid() {
                 const geoFeats = (feats.length ? feats : await _awaitGeoJson(10000));
                 const geoLand = _buildGeoLandRef(geoFeats);
                 if (geoLand) conquestGrid.setGeoLandRef(geoLand);
+                // TASK-506: geo-referenced coast repair — restore land the
+                // terrain binary over-waters inside country polygons (Kent,
+                // Spain's south coast) so Dover/Gibraltar keep true width.
+                // Rivers/lakes are gated out (see cfg.COAST_REPAIR_*).
+                const repaired = conquestGrid.repairCoastFromGeoRef();
+                // TASK-506: if GeoJSON hadn't arrived in time we dilate
+                // BLANKET now — start the late-load watcher so the first
+                // valid ref re-applies the mask geo-gated (pre-spawn only;
+                // setGeoLandRef documents the fallback once territory exists).
+                if (!geoLand) _geoLandLateWatch();
                 // Option 1: dilate water so thin rivers (1-cell-wide in the
                 // 4108px source) read + navigate at grid res. Thicken by N
                 // rings (rivers only when the geoLand ref is set — see above).
@@ -4020,7 +4155,8 @@ async function initConquestGrid() {
                 console.log('[CONQUEST] terrain binary loaded:',
                     conquestGrid.countCells('neutral'), 'land cells',
                     '| water dilated', CONQUEST_CFG.WATER_DILATION_RINGS,
-                    'ring(s)', geoLand ? '(rivers-only, geo-gated)' : '(blanket — no GeoJSON)');
+                    'ring(s)', geoLand ? '(rivers-only, geo-gated)' : '(blanket — no GeoJSON)',
+                    '| coast repair', geoLand ? repaired + ' cells' : 'skipped (no GeoJSON)');
             } catch (err) {
                 console.warn('[CONQUEST] terrain binary unavailable, using GeoJSON mask:', err.message);
             }
@@ -4193,6 +4329,135 @@ window.renderMode1Territory = renderMode1Territory;
 // ── Vector territory borders ── delegate to the world render layer (TASK-406);
 // identical geometry + owner colors, see src/world/render.js rebuildFrontierLines.
 function rebuildFrontierLines() { WORLD_RENDER.rebuildFrontierLines(); }
+
+// ════════════════════════════════════════════════════════════════════════
+//  TASK-506 — worldQaTest(): one-call summary probe for the world system
+//  (morale, capture-flash pool, geoLand mask state, devastation decay,
+//   dirty-region queue + a perf snapshot). Run in a live mode-1 game.
+// ════════════════════════════════════════════════════════════════════════
+// Debug handle for in-page diagnostics (water-mask sampling, perf work).
+Object.defineProperty(window, '__worldGrid', { get: () => conquestGrid, configurable: true });
+
+window.worldQaTest = function () {
+    const out = { checks: {}, pass: true };    const ok = (name, cond, detail) => {
+        out.checks[name] = cond ? 'PASS' : 'FAIL' + (detail ? ' (' + detail + ')' : '');
+        if (!cond) out.pass = false;
+    };
+    if (!conquestGrid || !conquestCtx) {
+        out.error = 'start a mode-1 game first (grid/ctx missing)';
+        return out;
+    }
+
+    // 1 ── MORALE: pressure curve + live drop + decay recovery
+    {
+        const M = window.__morale;
+        const curveOk = M.fromPressure(0) === 1.15 && M.fromPressure(0.10) === 1 &&
+                        M.fromPressure(0.30) === 0.85 && M.fromPressure(0.5) === 0.85;
+        ok('moraleCurve', curveOk, '0→' + M.fromPressure(0) + ' 0.10→' + M.fromPressure(0.10) + ' 0.30→' + M.fromPressure(0.30));
+        const ctxWired = conquestCtx.getMorale && conquestCtx.onLosses;
+        ok('moraleCtxWired', ctxWired);
+        // live: heavy losses drop the player's morale below baseline, then decay recovers it
+        const side = myRole;
+        const troops = Math.max(1, conquestCtx.getTroops(side));
+        const m0 = M.get(side);
+        M.add(side, troops * 0.8);          // recent losses ≈ 80% of the army
+        const m1 = M.get(side);
+        ok('moraleDrop', m1 <= m0 + 1e-9 && m1 < 1.0, m0.toFixed(3) + '→' + m1.toFixed(3));
+        // decay: enough half-lives to fall under the calm breakpoint (~41 ticks
+        // for 0.8×army → p≤0.10; 120 is comfortably past) → back to fresh band
+        for (let i = 0; i < 120; i++) M.tick();
+        const m2 = M.get(side);
+        ok('moraleDecayRecover', m2 > m1 && m2 >= 1.0, '→' + m2.toFixed(3));
+        M.state.loss[side] = 0;            // restore — probe leaves no residue
+        // integration: attackLogic really consumes morale (losses scale by (2−mA))
+        const cell = conquestGrid.latLonToCell(20, -42);
+        const mkCtx = (m) => ({ getTroops: () => 1e6, addTroops: () => {}, getMorale: () => m });
+        const lossHi = attackLogic(conquestGrid, 50000, 'player', 'neutral', cell, mkCtx(0.85));
+        const lossLo = attackLogic(conquestGrid, 50000, 'player', 'neutral', cell, mkCtx(1.15));
+        ok('moraleAttackLogic', lossHi.attackerTroopLoss > lossLo.attackerTroopLoss,
+            'broken ' + lossHi.attackerTroopLoss.toFixed(0) + ' vs fresh ' + lossLo.attackerTroopLoss.toFixed(0));
+        // badge present + updated (player, in-game)
+        const badge = document.getElementById('moraleBadge');
+        ok('moraleBadge', !!badge && badge.style.display !== 'none' && /🚩/.test(badge.textContent), badge ? badge.textContent : 'missing');
+    }
+
+    // 2 ── CAPTURE-FLASH pool: high-tempo exhaustion check (FINISH item).
+    // 5000 flips >> 512 pool: must wrap the ring cleanly, stay ≤ pool size,
+    // never throw, and leave the newest flashes alive.
+    {
+        const S = WORLD_RENDER.state;
+        try {
+            const N = 5000;
+            for (let i = 0; i < N; i++) WORLD_RENDER.onCellConquered(i % 4096, 'player');
+            // no exception = pass part 1
+            const births = S.flashPoints ? S.flashPoints.geometry.attributes.aBirth.array : null;
+            let alive = 0;
+            if (births) for (let i = 0; i < births.length; i++) if (births[i] > -1e8) alive++;
+            ok('flashPoolNoError', true);
+            ok('flashPoolBounded', alive <= S.FLASH_MAX, alive + ' alive ≤ ' + S.FLASH_MAX);
+            ok('flashPoolWrapped', alive === S.FLASH_MAX, 'ring fully used at cap (' + alive + ')');
+            // sustained no-truncation rate the pool supports (math check):
+            // 512 slots / 48-frame life ≈ 10.7 flips/frame sustained before
+            // oldest flashes start getting overwritten early (graceful by design).
+            out.flashCapacity = { pool: S.FLASH_MAX, lifeFrames: S.FLASH_LIFE_F, sustainedFlipsPerSec: Math.round(S.FLASH_MAX / S.FLASH_LIFE_F * 60) };
+        } catch (e) {
+            ok('flashPoolNoError', false, e.message);
+        }
+    }
+
+    // 3 ── GEOLAND mask state: which dilation mode is live + strait sanity
+    {
+        const g = conquestGrid;
+        out.geoLand = { dilateState: g._dilateState, refSet: !!g._geoLand };
+        ok('geoLandDilated', g._dilateState === 'geo' || g._dilateState === 'blanket', g._dilateState);
+        // Dover strait: armor must be able to cross (water width under the tank probe threshold)
+        if (typeof window.tankRiverProbe === 'function') {
+            const rp = window.tankRiverProbe();      // tanks agent's checker (no args)
+            out.doverStrait = { crossings: rp && rp.crossings, ocean: rp && rp.ocean };
+            ok('doverCrossable', !!(rp && rp.crossings && rp.crossings.dover === true),
+                rp && rp.crossings ? 'dover=' + rp.crossings.dover : 'probe unavailable');
+        }
+    }
+
+    // 4 ── DEVASTATION decay: live set tracked + full heal within bounded visits
+    {
+        const g = conquestGrid;
+        // find a land cell near the Sahara probe (mask-adaptive)
+        const near = g.findNearestLandCell(20, 10, 40) || g.findNearestLandCell(20, -42, 80);
+        if (near) {
+            const { lat, lon } = g.cellToLatLon(near.cell);
+            g.applyDevastation(lat, lon, 80, 1);
+            const live = g.devastationCellCount();
+            let visits = 0;
+            while (g.devastationCellCount() > 0 && visits < 6000) { g.decayDevastation(1600); visits++; }
+            ok('devDecayBounded', g.devastationCellCount() === 0,
+                live + ' cells healed in ' + visits + ' calls (' + (visits / 30).toFixed(1) + 's at 30 calls/s)');
+        } else {
+            out.devDecay = 'no land cell found near probes — skipped';
+        }
+    }
+
+    // 5 ── dirty-region queue semantics (regression guard)
+    {
+        const g = conquestGrid;
+        g.takeOverlayRect();               // drain whatever a recent tick queued
+        ok('queueIdleUndefined', g.takeOverlayRect() === undefined, 'queue must be consume-once idle after drain');
+    }
+
+    // 6 ── perf snapshot
+    {
+        const P = window.__perfState || {};
+        out.perf = {
+            fpsAvg: P.fpsAvg ? Math.round(P.fpsAvg) : null,
+            frames: P.frames || 0,
+            drawCalls: (typeof renderer !== 'undefined' && renderer.info) ? renderer.info.render.calls : null,
+            tTerritory: P.tTerritory != null ? +P.tTerritory.toFixed(3) : null,
+        };
+    }
+
+    console.log('[TASK-506] worldQaTest:', out);
+    return out;
+};
 
 // ════════════════════════════════════════════════════════════════════════
 //  UNIFIED TILE-PAINTED GLOBE
@@ -11464,6 +11729,7 @@ function cleanupTerritory() {
     // capture flashes, frontline heat + drone rings are ALL owned by the world
     // render layer now — one reset call disposes everything (no orphan meshes).
     WORLD_RENDER.reset();
+    _moraleReset();   // TASK-506: clear recent-loss pools + hide the badge
     _disposeLineMesh(borderLinesMesh); borderLinesMesh = null;
     _disposeLineMesh(provinceBorderMesh); provinceBorderMesh = null;
     _disposeLineMesh(cityPointsMesh); cityPointsMesh = null;
@@ -16169,7 +16435,9 @@ function loop(now) {
         _refreshMissileHud();
     }
 
-    // TASK-102: devastation decay (rotating window — O(800)/frame)
+    // TASK-102/506: devastation decay — set-based, visits only live-devastation
+    // cells (blasts are sparse; the old full-grid rotating sweep never decayed
+    // anything in practice). O(live cells)/call, bounded by DEVASTATION_SET_CAP.
     if (conquestGrid && conquestGrid.decayDevastation && frame % 2 === 0) {
         conquestGrid.decayDevastation(1600);
     }
@@ -16178,6 +16446,13 @@ function loop(now) {
     // pulse + drone selection rings (all safe no-ops before their meshes exist).
     WORLD_RENDER.tickVfx(frame);
     WORLD_RENDER.updateDroneRings(drones, frame);
+
+    // TASK-506: morale upkeep — decay pools 1×/s + player badge refresh
+    // (badge writes are dirty-flagged inside; this is the only call site).
+    if (frame % 60 === 0) {
+        moraleTick();
+        _moraleBadgeUpdate();
+    }
 
     _applyKeyboardNavigation();
     _applyKeyboardZoom();
