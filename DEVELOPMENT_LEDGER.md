@@ -39,6 +39,14 @@
     - **Live E2E in browser**: spawn → build launcher (hotbar 4, $180) → R-mode rings+pips → fire volley → HUD "منصات جاهزة 1/1→0/1 · المخزون 6/6→5/6". No console errors; probes leave no leaked entities (`__ffaProbe.droneCheck()` clean).
     - Remaining: audit **#15 drone selection panel** — explicitly coordination with TASK-406 agent or lead, not solo work.
   - **Next**: TASK-407 refactor (lead-led, after 401-406).
+- **TASK-401: Air Force Deep Pass (AirCombat module + main.js integration)**
+  - **Status**: Module extraction + integration COMPLETE (commits `0950a3f` → `770df7c`).
+  - **Architecture**: `src/air/aircombat.js` owns all air doctrine (dogfight, strike, SEAD, squadrons, veterancy, tanking, VFX, wrecks). `main.js` Plane class delegates through the **AIRW bridge** (live getters → module scope; module never imports the game).
+  - **New gameplay**: kill XP → 4 veterancy tiers (dmg/evade/decoy bonuses + tally marks + UI rank row); squadrons form on multi-plane orders (highest-XP leads, echelon offsets, mid-air succession on leader loss); SEAD anti-radiation missiles vs emitting radars (EMP suppression breaks seeker lock); KC-135 tanker + AWACS buddy refueling with RTB resume; doctrine altitudes per role; fighters hunt enemy drones; nap-of-earth helis (AA range ×0.5, SAM lock-miss 50%); RWR lock tone for player crews.
+  - **Fixes riding along**: drones were updated TWICE per tick (dup line, audit #3 regression); AAM pKill went NaN vs drone targets (missing turnRate — never hit); AAMs now credit kills to the shooter (veterancy); wreck gravity sign inverted (flew AWAY from globe).
+  - **Verification**: `scripts/test_aircombat.mjs` — 56/56 Node unit tests (real THREE + constants, mocked world). `npx vite build` clean. Live browser probes on :3001 ALL PASS: airstrike (3 runs → 3 structures destroyed), dogfight (F-22 kills F-16 + promotes to مدرَّب), stealth gating, samVsPlane (15 SAM shots, nap-of-earth lock misses), botWing (auto-scramble), airModelsCheck (11/11 PCFG types construct incl. KC-135), movement (50 km/s measured vs 49.5 expected on the alloc-free path).
+  - **Perf (audit #22)**: Plane.update movement is allocation-free (`_mv1-4` scratch + `latLonToVec3(lat, lon, r, out)` optional out-param; was ~5 Vector3/plane/frame). Bot air wings buy doctrine support: exactly one tanker + one AWACS per rival once 2+ combat planes exist; F-22 unlocks for rich rivals (commit `50fdb2d`).
+  - **Status**: READY FOR MERGE — branch `feature/airforce-system`, HEAD `50fdb2d`.
 - **Task: AI-Context Bootstrap & Development Ledger Setup**
   - **Status**: Compiling `AI_BOOTSTRAP.md` and `DEVELOPMENT_LEDGER.md` in the workspace root.
   - **Progress**: Mapped codebase specifications, math pipelines, class specifications, and tasks.
@@ -71,6 +79,11 @@
 ---
 
 ## 📜 CHRONOLOGICAL VERSION CHANGELOG
+
+### **TASK-401 (feature/airforce-system, 2026-09-19)**
+* **AirCombat module**: ~500-line air-doctrine module extracted from Plane (`src/air/aircombat.js`) — dogfight/strike/SEAD/squadrons/veterancy/tankers/VFX/wrecks behind the AIRW world bridge.
+* **Integration**: Plane.update() delegates parkedTick/dogfightScan/dogfightWeapons/strikeTick/tickRefuel/squadronSteer/vfxTick; down/crash spawn wrecks + leader succession; AAM carries shooter for kill credit; SAM battery fires RWR tone + nap-of-earth lock misses.
+* **Tests**: `scripts/test_aircombat.mjs` (56 assertions, Node + real three) + all live `__ffaProbe` air probes green.
 
 ### **v5.0.0 (Current Release - April 2026)**
 * **Features**: Added optimized geo-data loading subsystem (`public/data/geo_fetcher.js`, `geo_filter.js`, `geo_renderer.js`, `geo_manager.js`).

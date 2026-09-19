@@ -76,18 +76,48 @@ export const MTAGS={
  nuke_tac:   ['انفجار نووي 750','EMP عميق 7 ثوان','يتفادى 72% من الدفاعات','نهاية اللعبة — غالٍ جداً'],
 };
 
-export const PCFG={
- heli: {name:'AH-64 Apache', hp:140,spd:2.8,fuel:900, aaAmmo:4, agAmmo:16, gunAmmo:1200,aamCount:2, flares:10,turnRate:.25, gunCaliber:1, allAspect:false,canards:false,cost:380, col:'#44aa66',role:'heli', trainTime: 180},
- fighter: {name:'F-16 Falcon', hp:90, spd:5.5,fuel:900, aaAmmo:8, agAmmo:0, gunAmmo:500, aamCount:2, flares:6, turnRate:.15, gunCaliber:1, allAspect:false,canards:false,cost:450, col:'#00ff88',role:'air', trainTime: 240},
- bomber: {name:'Su-24 Fencer', hp:120,spd:3.2,fuel:1100,aaAmmo:2, agAmmo:10, gunAmmo:200, aamCount:0, flares:8, turnRate:.07, gunCaliber:.5, allAspect:false,canards:false,cost:500, col:'#ffaa44',role:'ground', trainTime: 300},
- interceptor: {name:'MiG-29 Fulcrum',hp:75, spd:7.5,fuel:700, aaAmmo:12,agAmmo:0, gunAmmo:450, aamCount:3, flares:4, turnRate:.18, gunCaliber:1, allAspect:true, canards:false,cost:570, col:'#88ccff',role:'intercept', trainTime: 240},
- a10: {name:'A-10 Warthog', hp:200,spd:2.5,fuel:1400,aaAmmo:2, agAmmo:30, gunAmmo:1350,aamCount:1, flares:16,turnRate:.08, gunCaliber:4, allAspect:false,canards:false,cost:620, col:'#88bbcc',role:'cas', trainTime: 360},
- gunship: {name:'AC-130 Spectre',hp:150,spd:2.5,fuel:1200,aaAmmo:0, agAmmo:20, gunAmmo:999, aamCount:0, flares:12,turnRate:.05, gunCaliber:3, allAspect:false,canards:false,cost:720, col:'#cc8844',role:'cas', trainTime: 420},
- awacs: {name:'E-3 Sentry', hp:80, spd:3, fuel:2000,aaAmmo:0, agAmmo:0, gunAmmo:0, aamCount:0, flares:6, turnRate:.05, gunCaliber:0, allAspect:false,canards:false,cost:780, col:'#00ffcc',role:'awacs', trainTime: 480},
- su57: {name:'Su-57 Felon', hp:130,spd:8, fuel:1200,aaAmmo:8, agAmmo:4, gunAmmo:500, aamCount:4, flares:8, turnRate:.19, gunCaliber:1.2,allAspect:true, canards:true, cost:920, col:'#aa88ff',role:'air', trainTime: 500},
- stealth: {name:'B-2 Spirit', hp:80,spd:4, fuel:1500,aaAmmo:4, agAmmo:8, gunAmmo:0, aamCount:4, flares:10,turnRate:.09, gunCaliber:0, allAspect:true, canards:false,cost:1000, col:'#667788',role:'stealth', trainTime: 600},
- f22: {name:'F-22 Raptor', hp:120,spd:9, fuel:1100,aaAmmo:10,agAmmo:2, gunAmmo:480, aamCount:4, flares:8, turnRate:.20, gunCaliber:1.2,allAspect:true, canards:false,cost:1100, col:'#aaddff',role:'air', trainTime: 500},
+/* ── TASK-401: PCFG v2 — role defaults + per-type specs ──
+ * Was: 10 near-identical 15-field one-liners (every stat repeated per type;
+ * adding a field meant editing 10 lines and missing one). Now each ROLE
+ * carries the doctrine defaults and each TYPE declares identity + deltas.
+ * Merged at module load — every existing key/value is IDENTICAL to v1
+ * (probe __ffaProbe.airConfigCheck() asserts this against the frozen v1
+ * table). New doctrine fields:
+ *   sead       — can fire anti-radiation missiles at EMITTING radars/SAMs
+ *   napOfEarth — heli doctrine: flies below radar (ground AA range/accuracy −50%)
+ *   alt        — cruise altitude in globe units (heli 26 … AWACS/tanker 64)
+ *   tanker     — air-to-air refueling source (KC-135) */
+const PCFG_ROLE_DEFAULTS = {
+ air:      { aaAmmo:8,  agAmmo:0,  gunAmmo:500,  aamCount:2, flares:8,  turnRate:.15, gunCaliber:1,  allAspect:false, canards:false, sead:true,  napOfEarth:false, alt:50 },
+ intercept:{ aaAmmo:12, agAmmo:0,  gunAmmo:450,  aamCount:3, flares:4,  turnRate:.18, gunCaliber:1,  allAspect:true,  canards:false, sead:false, napOfEarth:false, alt:50 },
+ ground:   { aaAmmo:2,  agAmmo:10, gunAmmo:200,  aamCount:0, flares:8,  turnRate:.07, gunCaliber:.5, allAspect:false, canards:false, sead:false, napOfEarth:false, alt:50 },
+ cas:      { aaAmmo:2,  agAmmo:24, gunAmmo:1200, aamCount:1, flares:14, turnRate:.07, gunCaliber:3,  allAspect:false, canards:false, sead:false, napOfEarth:false, alt:34 },
+ heli:     { aaAmmo:4,  agAmmo:16, gunAmmo:1200, aamCount:2, flares:10, turnRate:.25, gunCaliber:1,  allAspect:false, canards:false, sead:false, napOfEarth:true,  alt:26 },
+ awacs:    { aaAmmo:0,  agAmmo:0,  gunAmmo:0,    aamCount:0, flares:6,  turnRate:.05, gunCaliber:0,  allAspect:false, canards:false, sead:false, napOfEarth:false, alt:64 },
+ stealth:  { aaAmmo:4,  agAmmo:8,  gunAmmo:0,    aamCount:4, flares:10, turnRate:.09, gunCaliber:0,  allAspect:true,  canards:false, sead:false, napOfEarth:false, alt:56 },
+ tanker:   { aaAmmo:0,  agAmmo:0,  gunAmmo:0,    aamCount:0, flares:6,  turnRate:.05, gunCaliber:0,  allAspect:false, canards:false, sead:false, napOfEarth:false, alt:64 },
 };
+const PCFG_SPECS = {
+ heli:        { name:'AH-64 Apache',   hp:140, spd:2.8, fuel:900,  cost:380,  col:'#44aa66', role:'heli',      trainTime:180 },
+ fighter:     { name:'F-16 Falcon',    hp:90,  spd:5.5, fuel:900,  cost:450,  col:'#00ff88', role:'air',       trainTime:240, flares:6 },
+ bomber:      { name:'Su-24 Fencer',   hp:120, spd:3.2, fuel:1100, cost:500,  col:'#ffaa44', role:'ground',    trainTime:300 },
+ interceptor: { name:'MiG-29 Fulcrum', hp:75,  spd:7.5, fuel:700,  cost:570,  col:'#88ccff', role:'intercept', trainTime:240 },
+ a10:         { name:'A-10 Warthog',   hp:200, spd:2.5, fuel:1400, cost:620,  col:'#88bbcc', role:'cas',       trainTime:360, agAmmo:30, gunAmmo:1350, flares:16, turnRate:.08, gunCaliber:4 },
+ gunship:     { name:'AC-130 Spectre', hp:150, spd:2.5, fuel:1200, cost:720,  col:'#cc8844', role:'cas',       trainTime:420, aaAmmo:0, agAmmo:20, gunAmmo:999, aamCount:0, flares:12, turnRate:.05 },
+ awacs:       { name:'E-3 Sentry',     hp:80,  spd:3,   fuel:2000, cost:780,  col:'#00ffcc', role:'awacs',     trainTime:480 },
+ su57:        { name:'Su-57 Felon',    hp:130, spd:8,   fuel:1200, cost:920,  col:'#aa88ff', role:'air',       trainTime:500, agAmmo:4, aamCount:4, turnRate:.19, gunCaliber:1.2, allAspect:true, canards:true },
+ stealth:     { name:'B-2 Spirit',     hp:80,  spd:4,   fuel:1500, cost:1000, col:'#667788', role:'stealth',   trainTime:600 },
+ f22:         { name:'F-22 Raptor',    hp:120, spd:9,   fuel:1100, cost:1100, col:'#aaddff', role:'air',       trainTime:500, aaAmmo:10, agAmmo:2, gunAmmo:480, aamCount:4, turnRate:.20, gunCaliber:1.2, allAspect:true },
+ /* ── NEW (TASK-401): KC-135 — flying gas station. Buddy-refuels every friendly
+  * aircraft inside AIR_TANKER_RANGE (CAPs extend indefinitely; a bingo RTB
+  * cancels once topped past AIR_TANKER_RESUME_PCT). AWACS orbit-refuel at a
+  * slower buddy rate (see AirCombat.tickRefuel). */
+ tanker:      { name:'KC-135 Tanker',  hp:110, spd:3.2, fuel:2400, cost:850,  col:'#88aaff', role:'tanker',    trainTime:420, tanker:true },
+};
+export const PCFG = {};
+for (const _k in PCFG_SPECS) {
+  PCFG[_k] = Object.assign({}, PCFG_ROLE_DEFAULTS[PCFG_SPECS[_k].role] || {}, PCFG_SPECS[_k]);
+}
 export const DCFG={
  /* ── DRONE TYPES (TASK-204 — each is a TOOL, not a damage number) ──
  * patrolR: orbit radius around home point (km)
@@ -217,6 +247,31 @@ export const GAME_CONSTANTS = {
   AIR_SAM_DMG: 65,             // SAM interceptor damage vs aircraft
   AIR_AI_MAX_PLANES: 6,        // air wing size cap per rival bot
   AIR_BOT_SCRAMBLE_FRAMES: 360,// bot parked-plane auto-launch delay (6s)
+  // ── TASK-401 deep pass: veterancy / squadrons / SEAD / tankers / doctrine ──
+  AIR_VET_XP: [0, 60, 150, 300],  // level thresholds → Rookie/Trained/Veteran/Ace
+  AIR_VET_DMG_PER_LVL: 0.08,      // +8% outgoing damage per veterancy level
+  AIR_VET_EVADE_PER_LVL: 0.06,    // −6% incoming damage per level (veterans juke)
+  AIR_VET_DECOY_PER_LVL: 0.04,    // +4pp flare decoy chance per level
+  AIR_KILL_XP_PLANE: 60,          // XP for an air-to-air kill
+  AIR_KILL_XP_STRUCT: 25,         // XP for a structure destroyed by strike
+  AIR_KILL_XP_TANK: 40,           // XP for an armored division killed
+  AIR_KILL_XP_DRONE: 30,          // XP for an enemy drone shot down
+  AIR_STRIKE_XP: 5,               // XP per completed weapon release (experience)
+  AIR_SQ_MAX: 4,                  // squadron size cap (group 3-4 planes)
+  AIR_SQ_ECHELON_LAT: 0.35,       // wingmen trail spacing behind the leader (deg)
+  AIR_SQ_ECHELON_LON: 0.5,        // wingmen echelon step to the right (deg)
+  AIR_SEAD_RANGE: 320,            // km — anti-radiation missile release envelope
+  AIR_SEAD_DMG: 180,              // ARM damage (×2 vs dedicated radar dishes)
+  AIR_SEAD_PK: 0.85,              // ARM probability of hit
+  AIR_SEAD_SUPPRESS: 480,         // frames a surviving emitter stays sensor-blinded (empT)
+  AIR_TANKER_RANGE: 320,          // km — refueling envelope around a tanker/AWACS
+  AIR_TANKER_RATE: 1.1,           // fuel/frame from a dedicated tanker (burn is 0.5)
+  AIR_AWACS_TANK_RATE: 0.55,      // buddy-refuel rate from an AWACS orbit
+  AIR_TANKER_RESUME_PCT: 0.6,     // fuel fraction that resumes the mission after a top-up
+  AIR_HELI_DETECT_MULT: 0.5,      // nap-of-earth: ground-AA engage range vs helis
+  AIR_HELI_SAM_MISS: 0.5,         // nap-of-earth: SAM lock failure chance vs helis
+  AIR_WRECK_LIFE: 170,            // frames a falling wreck persists (~2.8s cap)
+  AIR_RWR_FRAMES: 45,             // radar-warning-receiver lock tone duration
   SAM_INTERCEPT_SPEED: 0.004,   // legacy (unused)
   MAX_PARTICLES: 200,
   // Zone of Control
@@ -560,6 +615,7 @@ export const ITEM_ICONS={
   'su57':'data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2028%2028%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cpolygon%20points%3D%2214%2C2%2024%2C17%2020%2C19%2014%2C17%208%2C19%204%2C17%22%20fill%3D%22%23aa88ff%22%20opacity%3D%22.9%22%2F%3E%3Cpolygon%20points%3D%224%2C17%208%2C19%209%2C22%205%2C20%22%20fill%3D%22%238866cc%22%20opacity%3D%22.7%22%2F%3E%3Cpolygon%20points%3D%2224%2C17%2020%2C19%2019%2C22%2023%2C20%22%20fill%3D%22%238866cc%22%20opacity%3D%22.7%22%2F%3E%3Crect%20x%3D%2213%22%20y%3D%2221%22%20width%3D%222%22%20height%3D%225%22%20fill%3D%22%239977dd%22%20opacity%3D%22.5%22%2F%3E%3C%2Fsvg%3E',
   'stealth':'data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2028%2028%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cpolygon%20points%3D%2214%2C10%2026%2C20%2014%2C18%202%2C20%22%20fill%3D%22%23667788%22%20opacity%3D%22.9%22%2F%3E%3Cpolygon%20points%3D%2214%2C10%2026%2C20%2022%2C22%2014%2C20%206%2C22%202%2C20%22%20fill%3D%22%23445566%22%20opacity%3D%22.7%22%2F%3E%3Cpolygon%20points%3D%222%2C20%206%2C22%2014%2C20%22%20fill%3D%22%23334455%22%20opacity%3D%22.9%22%2F%3E%3C%2Fsvg%3E',
   'f22':'data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2028%2028%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cpolygon%20points%3D%2214%2C2%2025%2C18%2021%2C20%2014%2C18%207%2C20%203%2C18%22%20fill%3D%22%23aaddff%22%20opacity%3D%22.9%22%2F%3E%3Cpolygon%20points%3D%223%2C18%207%2C20%208%2C23%204%2C21%22%20fill%3D%22%2388bbdd%22%20opacity%3D%22.7%22%2F%3E%3Cpolygon%20points%3D%2225%2C18%2021%2C20%2020%2C23%2024%2C21%22%20fill%3D%22%2388bbdd%22%20opacity%3D%22.7%22%2F%3E%3Crect%20x%3D%2212.5%22%20y%3D%2221%22%20width%3D%223%22%20height%3D%225%22%20fill%3D%22%236699bb%22%20opacity%3D%22.6%22%2F%3E%3C%2Fsvg%3E',
+  'tanker':'data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2028%2028%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cellipse%20cx%3D%2214%22%20cy%3D%2214%22%20rx%3D%2210%22%20ry%3D%224%22%20fill%3D%22%2388aaff%22%20opacity%3D%22.85%22%2F%3E%3Cpolygon%20points%3D%2214%2C6%2017%2C14%2014%2C13%2011%2C14%22%20fill%3D%22%2388aaff%22%20opacity%3D%22.9%22%2F%3E%3Cline%20x1%3D%224%22%20y1%3D%2213%22%20x2%3D%229%22%20y2%3D%2213%22%20stroke%3D%22%23ccd9ff%22%20stroke-width%3D%221.5%22%20opacity%3D%22.9%22%2F%3E%3Cline%20x1%3D%2219%22%20y1%3D%2213%22%20x2%3D%2224%22%20y2%3D%2213%22%20stroke%3D%22%23ccd9ff%22%20stroke-width%3D%221.5%22%20opacity%3D%22.9%22%2F%3E%3C%2Fsvg%3E',
   'nano':'data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2028%2028%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Ccircle%20cx%3D%229%22%20cy%3D%229%22%20r%3D%223%22%20fill%3D%22%23ff44ff%22%20opacity%3D%22.8%22%2F%3E%3Ccircle%20cx%3D%2219%22%20cy%3D%229%22%20r%3D%223%22%20fill%3D%22%23ff44ff%22%20opacity%3D%22.8%22%2F%3E%3Ccircle%20cx%3D%229%22%20cy%3D%2219%22%20r%3D%223%22%20fill%3D%22%23ff44ff%22%20opacity%3D%22.8%22%2F%3E%3Ccircle%20cx%3D%2219%22%20cy%3D%2219%22%20r%3D%223%22%20fill%3D%22%23ff44ff%22%20opacity%3D%22.8%22%2F%3E%3Crect%20x%3D%2211%22%20y%3D%2212%22%20width%3D%226%22%20height%3D%224%22%20rx%3D%221%22%20fill%3D%22%23ff88ff%22%20opacity%3D%22.9%22%2F%3E%3Cline%20x1%3D%229%22%20y1%3D%229%22%20x2%3D%2213%22%20y2%3D%2213%22%20stroke%3D%22%23ff44ff%22%20stroke-width%3D%221%22%20opacity%3D%22.5%22%2F%3E%3Cline%20x1%3D%2219%22%20y1%3D%229%22%20x2%3D%2215%22%20y2%3D%2213%22%20stroke%3D%22%23ff44ff%22%20stroke-width%3D%221%22%20opacity%3D%22.5%22%2F%3E%3Cline%20x1%3D%229%22%20y1%3D%2219%22%20x2%3D%2213%22%20y2%3D%2215%22%20stroke%3D%22%23ff44ff%22%20stroke-width%3D%221%22%20opacity%3D%22.5%22%2F%3E%3Cline%20x1%3D%2219%22%20y1%3D%2219%22%20x2%3D%2215%22%20y2%3D%2215%22%20stroke%3D%22%23ff44ff%22%20stroke-width%3D%221%22%20opacity%3D%22.5%22%2F%3E%3C%2Fsvg%3E',
   'swarm':'data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2028%2028%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cpolygon%20points%3D%2214%2C4%2017%2C14%2014%2C13%2011%2C14%22%20fill%3D%22%23ff88ff%22%20opacity%3D%22.9%22%2F%3E%3Cpolygon%20points%3D%224%2C14%2014%2C11%2013%2C14%2014%2C17%22%20fill%3D%22%23ff88ff%22%20opacity%3D%22.7%22%2F%3E%3Cpolygon%20points%3D%2224%2C14%2014%2C11%2015%2C14%2014%2C17%22%20fill%3D%22%23ff88ff%22%20opacity%3D%22.7%22%2F%3E%3Cpolygon%20points%3D%2214%2C24%2017%2C14%2014%2C15%2011%2C14%22%20fill%3D%22%23ff88ff%22%20opacity%3D%22.6%22%2F%3E%3C%2Fsvg%3E',
   'kamikaze':'data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2028%2028%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cpolygon%20points%3D%2214%2C3%2022%2C20%2014%2C16%206%2C20%22%20fill%3D%22%23ff55ff%22%20opacity%3D%22.9%22%2F%3E%3Ccircle%20cx%3D%2214%22%20cy%3D%2222%22%20r%3D%224%22%20fill%3D%22%23ff22cc%22%20opacity%3D%22.7%22%2F%3E%3Cline%20x1%3D%2210%22%20y1%3D%2222%22%20x2%3D%2218%22%20y2%3D%2222%22%20stroke%3D%22%23ff88ff%22%20stroke-width%3D%221.5%22%20opacity%3D%22.8%22%2F%3E%3Cline%20x1%3D%2214%22%20y1%3D%2218%22%20x2%3D%2214%22%20y2%3D%2226%22%20stroke%3D%22%23ff88ff%22%20stroke-width%3D%221.5%22%20opacity%3D%22.8%22%2F%3E%3C%2Fsvg%3E',
