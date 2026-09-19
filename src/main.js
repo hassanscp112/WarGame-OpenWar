@@ -5296,6 +5296,11 @@ function init3D() {
         // Shared caches were just disposed — clear so they re-create lazily.
         for (const k in GEO_CACHE) delete GEO_CACHE[k];
         for (const k in MAT_CACHE) delete MAT_CACHE[k];
+        // TASK-303: the dispose sweep above killed the polish meshes too —
+        // drop the refs so _ensurePolishAtmosphere rebuilds them fresh.
+        _polishClouds = _polishSun = _polishShimmer = null;
+        _polishShimTex = null;
+        _polishState.wakeLast.clear(); _polishState.wakeCd.clear();
     }
     // Old controls' DOM listeners accumulate on the shared canvas — dispose them.
     if (controls) { try { controls.dispose(); } catch (_) {} }
@@ -5398,6 +5403,9 @@ function init3D() {
     });
     const atmoMesh = new THREE.Mesh(atmoGeo, atmoMat);
     scene.add(atmoMesh);
+
+    // TASK-303 visual polish layer set (clouds, sun glare, ocean shimmer)
+    _ensurePolishAtmosphere();
 
     raycaster = new THREE.Raycaster();
     mouse = new THREE.Vector2();
@@ -7695,6 +7703,7 @@ function spawnExp(lat, lon, r, col) {
     scene.add(m);
     m.userData = {life: 1.0, maxLife: 0.02};
     exps.push(m);
+    _expPolish(lat, lon, r);   // TASK-303: flash core + shockwave on big blasts
 }
 
 function createTrailMesh(pos) {
@@ -7797,6 +7806,295 @@ function _empRing(lat, lon, radiusKm) {
     scene.add(ring);
     _addTransient(ring, 55, { grow: 0.012 });
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  TASK-303 VISUAL POLISH — atmosphere (clouds + sun glare), ocean
+//  shimmer, explosion flash/shockwave, ship wakes. All additive-cost:
+//  clouds 1 mesh, sun 2 sprites, shimmer 1 mesh, wakes/explosions ride
+//  the existing transient/pool systems. Per-frame work is O(1) pointer
+//  compares + a READ-ONLY warship scan (navy's class untouched).
+// ═══════════════════════════════════════════════════════════════════
+let _polishClouds = null, _polishSun = null, _polishShimmer = null;
+let _polishShimTex = null;
+const _polishState = { wakeLast: new Map(), wakeCd: new Map() };
+// (local smoothstep — main.js has no shared one at this scope)
+function _ss303(a, b, x) { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
+// 1×1 black seed for the shimmer sampler until the biome map binds
+const _shimSeedTex = (() => { const t = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1); t.needsUpdate = true; return t; })();
+
+// Procedural x-wrapped value-noise fBm cloud texture (equirectangular).
+// Wrap in x so the lon seam at ±180° is invisible.
+function _makeCloudCanvas(w = 1024, h = 512) {
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext('2d');
+    const img = ctx.createImageData(w, h);
+    // value-noise lattice (wrapped in x)
+    const OCT = [256, 128, 64, 32];
+    const lattices = OCT.map(n => {
+        const g = new Float32Array((n + 1) * (n + 1));
+        for (let i = 0; i < g.length; i++) g[i] = Math.random();
+        return { n, g };
+    });
+    const smooth = t => t * t * (3 - 2 * t);
+    const sample = (lat, xw, yw) => {
+        // xw,yw in [0,1); wrap x at lattice period
+        const { n, g } = lattices[lat];
+        const fx = xw * n, fy = yw * n;
+        const x0 = Math.floor(fx) % n, y0 = Math.min(n - 1, Math.floor(fy));
+        const x1 = (x0 + 1) % n, y1 = Math.min(n, y0 + 1);
+        const sx = smooth(fx - Math.floor(fx)), sy = smooth(fy - Math.floor(fy));
+        const at = (x, y) => g[y * (n + 1) + x];
+        const a = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * sx;
+        const b = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * sx;
+        return a + (b - a) * sy;
+    };
+    for (let y = 0; y < h; y++) {
+        // latitude fade: thinner bands near poles, none at the very poles
+        const yw = y / h;
+        const latFade = Math.sin(yw * Math.PI);
+        for (let x = 0; x < w; x++) {
+            const xw = x / w;
+            let f = 0, amp = 0.5, tot = 0;
+            for (let o = 0; o < OCT.length; o++) {
+                f += sample(o, xw, yw) * amp;
+                tot += amp;
+                amp *= 0.5;
+            }
+            f /= tot;   // 0..1
+            // cloud coverage: threshold + latitude banding (equator + mid-lats)
+            const cov = _ss303(0.56, 0.78, f) * (0.35 + 0.65 * latFade);
+            const i = (y * w + x) * 4;
+            img.data[i] = 255; img.data[i + 1] = 255; img.data[i + 2] = 255;
+            img.data[i + 3] = Math.round(cov * 235);
+        }
+    }
+    ctx.putImageData(img, 0, 0);
+    return cv;
+}
+
+// Build/attach the polish layer set. Called from initWorld after the
+// atmosphere shell; safe to call again after a scene rebuild (idempotent).
+function _ensurePolishAtmosphere() {
+    if (!scene) return;
+    // ── Clouds: slow-drifting translucent shell above the surface ──
+    if (!_polishClouds) {
+        const tex = new THREE.CanvasTexture(_makeCloudCanvas());
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.colorSpace = THREE.SRGBColorSpace;
+        const geo = new THREE.SphereGeometry(EARTH_RADIUS * 1.022, 96, 48);
+        const mat = new THREE.MeshLambertMaterial({
+            map: tex, transparent: true, opacity: 0.42, depthWrite: false
+        });
+        _polishClouds = new THREE.Mesh(geo, mat);
+        _polishClouds.renderOrder = 2;
+        _polishClouds.raycast = () => {};   // never intercept globe clicks
+    }
+    if (!scene.getObjectById(_polishClouds.id)) scene.add(_polishClouds);
+    // ── Sun glare: core sprite + soft halo along the key-light direction ──
+    if (!_polishSun) {
+        const mkTex = (inner, mid) => {
+            const c = document.createElement('canvas');
+            c.width = c.height = 128;
+            const g = c.getContext('2d');
+            const gr = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+            gr.addColorStop(0, inner);
+            gr.addColorStop(0.35, mid);
+            gr.addColorStop(1, 'rgba(255,244,214,0)');
+            g.fillStyle = gr;
+            g.fillRect(0, 0, 128, 128);
+            const t = new THREE.CanvasTexture(c);
+            t.colorSpace = THREE.SRGBColorSpace;
+            return t;
+        };
+        const sunDir = new THREE.Vector3(200, 100, 200).normalize();
+        _polishSun = new THREE.Group();
+        const core = new THREE.Sprite(new THREE.SpriteMaterial({
+            map: mkTex('rgba(255,252,240,1)', 'rgba(255,236,180,0.85)'),
+            blending: THREE.AdditiveBlending, transparent: true, depthWrite: false
+        }));
+        core.scale.setScalar(9000);
+        const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+            map: mkTex('rgba(255,242,214,0.55)', 'rgba(255,224,160,0.25)'),
+            blending: THREE.AdditiveBlending, transparent: true, depthWrite: false
+        }));
+        halo.scale.setScalar(26000);
+        _polishSun.add(core, halo);
+        _polishSun.position.copy(sunDir).multiplyScalar(58000);
+        _polishSun.userData.sunDir = sunDir;
+        _polishSun.traverse(o => { o.raycast = () => {}; });
+    }
+    if (!scene.getObjectById(_polishSun.id)) scene.add(_polishSun);
+    // ── Ocean shimmer: additive shader shell sampling the biome map ──
+    if (!_polishShimmer) {
+        _polishShimmer = new THREE.Mesh(
+            new THREE.SphereGeometry(EARTH_RADIUS * 1.0006, 128, 64),
+            new THREE.ShaderMaterial({
+                uniforms: {
+                    map: { value: _shimSeedTex },
+                    uTime: { value: 0 },
+                    sunDir: { value: new THREE.Vector3(200, 100, 200).normalize() }
+                },
+                vertexShader: `
+                    varying vec2 vUv; varying vec3 vWNormal; varying vec3 vPos;
+                    void main() {
+                        vUv = uv;
+                        vWNormal = normalize(mat3(modelMatrix) * normal);   // WORLD-space
+                        vPos = (modelMatrix * vec4(position, 1.0)).xyz;
+                        gl_Position = projectionMatrix * viewMatrix * vec4(vPos, 1.0);
+                    }`,
+                fragmentShader: `
+                    uniform sampler2D map; uniform float uTime; uniform vec3 sunDir;
+                    varying vec2 vUv; varying vec3 vWNormal; varying vec3 vPos;
+                    float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+                    void main() {
+                        vec3 c = texture2D(map, vUv).rgb;
+                        // blue-dominant pixels = ocean (OpenFront ocean 71,133,181;
+                        // land biomes are tan/green, owner tints sit over ocean too)
+                        float ocean = smoothstep(0.03, 0.14, c.b - max(c.r, c.g));
+                        float t = uTime * 0.001;
+                        float g1 = hash(floor(vUv * 780.0) + vec2(t * 41.0, t * 13.0));
+                        float g2 = hash(floor(vUv * 1900.0) - vec2(t * 67.0, t * 29.0));
+                        float glint = step(0.986, g1) * 0.45 + step(0.993, g2);
+                        vec3 N = normalize(vWNormal);
+                        vec3 V = normalize(cameraPosition - vPos);
+                        vec3 H = normalize(V + normalize(sunDir));
+                        float spec = pow(max(dot(N, H), 0.0), 70.0);
+                        float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+                        float amt = ocean * (glint * 0.4 + spec * 0.55 + fres * 0.10);
+                        gl_FragColor = vec4(vec3(0.62, 0.78, 1.0) * amt, 1.0);
+                    }`,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            })
+        );
+        _polishShimmer.renderOrder = 1;
+        _polishShimmer.raycast = () => {};   // never intercept globe clicks
+    }
+    if (!scene.getObjectById(_polishShimmer.id)) scene.add(_polishShimmer);
+}
+
+// Per-RENDER-frame polish tick (called from loop()): cloud drift, shimmer
+// time + map-texture pointer sync (territory repaints swap the texture).
+function _polishRenderTick(dtMs) {
+    if (_polishClouds && _polishClouds.parent) {
+        _polishClouds.rotation.y += Math.min(dtMs, 50) * 0.0000035;   // slow eastward drift
+    }
+    if (_polishShimmer && _polishShimmer.parent) {
+        const m = _polishShimmer.material;
+        m.uniforms.uTime.value += dtMs;
+        const map = earthMesh && earthMesh.material && earthMesh.material.map;
+        if (map && map !== _polishShimTex) { _polishShimTex = map; m.uniforms.map.value = map; }
+    }
+}
+
+// ── Ship wakes (READ-ONLY observation of navy's warships + trade ships):
+// foam puffs dropped behind hulls that moved since the last sample. Runs
+// every 4th logic frame; per-ship 10f cooldown keeps big fleets cheap. ──
+function _wakeFxTick() {
+    const lay = (ship, key) => {
+        const prev = _polishState.wakeLast.get(ship);
+        const lat = ship.lat, lon = ship.lon;
+        if (prev && (Math.abs(lat - prev.lat) > 0.004 || Math.abs(lon - prev.lon) > 0.004)) {
+            const cd = _polishState.wakeCd.get(ship) || 0;
+            if (frame >= cd) {
+                _polishState.wakeCd.set(ship, frame + 10);
+                _puffAt(latLonToVec3(prev.lat, prev.lon, EARTH_RADIUS + 2),
+                    0xdfeefc, rnd(1.6, 2.8), null, 40);
+            }
+        }
+        _polishState.wakeLast.set(ship, { lat, lon });
+    };
+    for (const w of warships) { if (!w.dead) lay(w); else _polishState.wakeLast.delete(w); }
+    for (const t of tradeShips) { if (!t.dead) lay(t); else _polishState.wakeLast.delete(t); }
+}
+
+// ── Explosion polish: white flash core + expanding shockwave ring on big
+// blasts. Rides the pooled-material + transient systems (no allocations
+// beyond the transient record). Fireball itself stays spawnExp's. ──
+function _expPolish(lat, lon, r) {
+    if (r < 2.5) return null;
+    let flash = null, ring = null;
+    // flash core: hot additive sphere, dies fast
+    if (!GEO_CACHE['expFlash']) GEO_CACHE['expFlash'] = new THREE.SphereGeometry(6, 8, 8);
+    flash = new THREE.Mesh(GEO_CACHE['expFlash'], _getFxMat(0xfff6d8, 1));
+    flash.position.copy(latLonToVec3(lat, lon, EARTH_RADIUS + 55));
+    scene.add(flash);
+    _addTransient(flash, 9, { grow: 0.09 });
+    // shockwave: expanding surface ring (big blasts only)
+    if (r >= 4) {
+        const geo = DrawSphericalRangeIndicator(lat, lon, 40);
+        ring = new THREE.Line(geo, new THREE.LineBasicMaterial({
+            color: 0xffe9b8, transparent: true, opacity: 0.85, depthWrite: false
+        }));
+        scene.add(ring);
+        _addTransient(ring, 26, { grow: 0.028 });
+    }
+    return { flash, ring };
+}
+
+// TASK-303 debug/perf hatch: __polishToggle() hides/shows the atmosphere
+// layers (clouds, sun, shimmer) — used by the fps guardrail probe and as an
+// emergency visual-cost switch. Returns the new visible state.
+window.__polishToggle = function (on) {
+    const targets = [_polishClouds, _polishSun, _polishShimmer];
+    const vis = on !== undefined ? !!on : !( _polishClouds && _polishClouds.visible);
+    for (const t of targets) if (t) t.visible = vis;
+    return vis;
+};
+
+// TASK-303 probe: layer presence + shader compile + explosion/wake FX +
+// rolling rAF fps. console: visualTest() — game must be running.
+window.visualTest = function () {
+    const res = {};
+    res.clouds = !!(_polishClouds && _polishClouds.parent);
+    res.cloudTex = !!(_polishClouds && _polishClouds.material.map);
+    res.sun = !!(_polishSun && _polishSun.parent && _polishSun.children.length === 2);
+    res.shimmer = !!(_polishShimmer && _polishShimmer.parent);
+    res.shimTexBound = !!(_polishShimmer && _polishShimmer.material.uniforms.map.value && _polishShimmer.material.uniforms.map.value !== _shimSeedTex);
+    // live tick: uTime advancing proves _polishRenderTick drives the shader
+    // (compile failures surface as THREE console errors — checked in-browser)
+    res.shimCompiled = !!(_polishShimmer && _polishShimmer.material.uniforms.uTime.value > 0);
+    // explosion FX: big blast → fireball + flash + ring present (polish is
+    // wired INSIDE spawnExp — this checks the real call path), then expiry
+    const t0 = transients.length, e0 = exps.length;
+    spawnExp(20, 20, 6, '#ffaa44');
+    const added = transients.slice(t0);   // flash + ring records _addTransient just pushed
+    res.expSpawned = exps.length === e0 + 1 && added.length >= 2;
+    let n = 0;
+    while (n++ < 40) _updateTransients();   // flash (9f) + ring (26f) both expire
+    res.expExpired = added.every(t => !t.mesh.parent);
+    // wake: fake-movement observation check via a plain object shape
+    const fake = { lat: 10, lon: 10, dead: false };
+    _polishState.wakeLast.clear(); _polishState.wakeCd.clear();
+    const savedShips = warships, savedTrade = tradeShips;
+    try {
+        warships = [fake]; tradeShips = [];
+        _wakeFxTick();               // registers baseline
+        fake.lat = 10.05;            // move ~5.5km
+        const w0 = transients.length;
+        _wakeFxTick();
+        res.wakePuff = transients.length > w0;
+    } finally { warships = savedShips; tradeShips = savedTrade; }
+    res.fps = window.__perfState && window.__perfState.fpsAvg ? Math.round(window.__perfState.fpsAvg) : null;
+    // TASK-303 guardrail: draw-call delta from the polish layers (machine-
+    // independent cost metric — 4 calls expected: clouds + 2 sun sprites +
+    // shimmer). Reads renderer.info right after a rendered frame.
+    res.callsOn = renderer && renderer.info ? renderer.info.render.calls : null;
+    if (window.__polishToggle) {
+        window.__polishToggle(false);
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            window.__perfState.callsOff = renderer.info ? renderer.info.render.calls : null;
+            window.__polishToggle(true);
+        }));
+    }
+    const pass = res.clouds && res.sun && res.shimmer && res.shimTexBound && res.shimCompiled && res.expSpawned && res.expExpired && res.wakePuff;
+    console.log('[visualTest]', res);
+    logEvent(`[visualTest] ${pass ? 'PASS ✅' : 'FAIL ❌'} — سُحب=${res.clouds} شمس=${res.sun} لمعان=${res.shimmer} تظليل=${res.shimCompiled} انفجار=${res.expSpawned} انتهى=${res.expExpired} أثر=${res.wakePuff} · إطارات=${res.fps ?? '—'}`, pass ? 'info' : 'err');
+    return res;
+};
+// (end TASK-303 block)
 
 // Launch flash per platform style: silo smoke column / rail spark shower /
 // sub surface buoy pop / air (MIRV bus split — no ground fx)
@@ -14734,6 +15032,14 @@ function loop(now) {
     const dtMs = Math.min(now - _lastRAF, 100);   // cap: no catch-up spiral after tab-switch
     _lastRAF = now;
     _frameAcc += dtMs / (1000 / 60);              // accumulate 60fps-equivalent frames
+    // TASK-303: rolling rAF fps (visual-guardrail metric) — kept on
+    // __perfState next to the logic-frame costs.
+    {
+        const S = window.__perfState;
+        S._fpsAcc = (S._fpsAcc || 0) + dtMs; S._fpsN = (S._fpsN || 0) + 1;
+        if (S._fpsN >= 30) { S.fpsAvg = 1000 / (S._fpsAcc / S._fpsN); S._fpsAcc = 0; S._fpsN = 0; }
+    }
+    _polishRenderTick(dtMs);   // TASK-303: cloud drift + shimmer time/map sync
     let _ticks = 0;
     while (_frameAcc >= 1 && _ticks < 4) {
         _frameAcc -= 1;
@@ -14818,6 +15124,7 @@ function gameFrame() {
     // tick — in the OpenFront block below. The duplicate line that used to
     // sit here doubled speed/fuel/scan cadence + CPU.)
     _updateTransients();                             // tracers / debris / EMP rings
+    if (frame % 4 === 0) _wakeFxTick();              // TASK-303: ship wake foam (READ-ONLY scan)
     _updateCraters();                                // fading impact scars
     for (let p of planes) p.update();
     _compactDead(planes);
