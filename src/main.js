@@ -3624,6 +3624,29 @@ window.__ffaProbe = {
         return { s: +s.toFixed(1), km: +km.toFixed(0), kmS: +(km / s).toFixed(1),
             lonNow: +t.p.lon.toFixed(1), done: Math.abs(t.p.lon - (-20)) < 0.3 };
     },
+    // TASK-401×402 QA: air-vs-ship strike — verifies the lead-ported hull
+    // acquisition in AirCombat.strikeTick + the _shipTarget wrapper end-to-end
+    // (A-10 acquires the hull, precision strike damages it ×AIR_STRIKE_SHIP_MUL).
+    airVsShipTest: () => {
+        const w = new Warship('enemy', { lat: 24, lon: -36 }, { lat: 25, lon: -37 });
+        warships.push(w);
+        w.aaCd = 99999;   // neuter fleet AA — this probe verifies the STRIKE path (AA lethality is navalBattleTest's job)
+        const p = new Plane(24.6, -40.8, PCFG['a10'], myRole);
+        planes.push(p);
+        p.parked = false; p.mode = 'attack'; p.tlat = w.curLat; p.tlon = w.curLon;
+        window.__avsT = { p, w, hp0: w.hp, s0: { ...window.__airStats } };
+        return 'staged: A-10 attack vs enemy warship (AA neutered, hull acquisition path)';
+    },
+    airVsShipResult: () => {
+        const t = window.__avsT; if (!t) return null;
+        return {
+            shipHp: Math.round(t.w.hp), shipDead: !!t.w.dead,
+            gndTgtIsShip: !!(t.p.gndTgt && t.p.gndTgt.isShip),
+            strikeRuns: window.__airStats.strikeRuns - t.s0.strikeRuns,
+            distNow: Math.round(haversineDist(t.p.lat, t.p.lon, t.w.curLat, t.w.curLon)),
+            pass: t.w.hp < t.hp0 || !!t.w.dead
+        };
+    },
     // warship combat test: stage an enemy warship + LONG-route enemy ships
     // crossing the Atlantic patrol zone — then watch warships()/navalState()
     warshipTest: () => {
