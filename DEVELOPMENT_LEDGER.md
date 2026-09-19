@@ -33,6 +33,11 @@
   - **Bug fixed**: `supplyGrace` counted scans (×90f) not frames — cut-off grace was ~15 min instead of the designed 10 s.
   - New probes: `window.tankDeepTest()` (11 checks — spotting gate, indirect fire, standoff, siege, ace, entrench, supply-cut attrition, entrenched bridgehead, river far-bank, flak chip, wreck lifecycle — **PASS**) and `window.tankRiverProbe()` (strait crossing checker, map-editor companion). `tankBattleTest` regression PASS.
   - ⚠️ **Cross-agent flag (world/naval)**: the medium water mask over-waters **SE England** (e.g. 51.4N,1.0E reads water) and the **Gulf of Cádiz** (36.05–36.5N at −5.6E all water) — natural straits (Dover/Gibraltar/Bosphorus/Messina/Bering) are therefore un-crossable to armor; only painted water (Suez canal) crosses. Tank river-crossing LOGIC is verified correct against the mask.
+- **TASK-405 (tanks agent) — WIP3 AI polish + final sweep COMPLETE**:
+  - Rival AI: SPG joins the purchase roll (~15%); frontline re-aim holds standoff guns ~240km behind the contact point (home bearing) instead of marching them into their own 120km dead zone.
+  - Final probe sweep ALL GREEN in one session: `tankBattleTest` PASS · `tankDeepTest` PASS · `tankMarchTest` corridor+arrival ✓.
+  - ⚠️ **Cross-agent flag (conquest/world)**: with Overpass down and 0 cities seeded, FFA bots paint 0 cells + build 0 structs (res drains to research only) — rivals never reach tank/base-building branches. Environment-dependent, pre-existing.
+  - **Status: ready-for-merge** (branch `feature/tanks-system`, HEAD after WIP3 commit).
 
 ### [⏳ BACKLOG & FUTURE IMPROVEMENTS]
 - **1. Region Selection Interface**: Design a sleek, tactical dropdown or map panel in the menu screen to load custom regions (`iraq`, `usa`, etc.) using `GeoDataManager.loadRegion(regionName)`.

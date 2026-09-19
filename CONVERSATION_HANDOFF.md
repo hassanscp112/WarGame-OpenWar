@@ -6,7 +6,46 @@
 
 ---
 
-## 🆕 SESSION 4 (2026-07-05): Ocean-Colour Paint + Tile-Based Brush
+## 🆕 TASK-405 SESSION 5 (2026-09-19, tanks agent, branch `feature/tanks-system`): Tank deep-pass WIP2 — wiring + probes — COMPLETE ✅
+
+### What shipped (commits `8672428` WIP1 protected + WIP2)
+- **`_tankDeepTick()` wired into `gameFrame()`** — SPG arc shells advance + burning wrecks fade
+  (were defined but never ticked — the entire deep-pass FX layer was inert).
+- **`_clearTankDeep()` wired into reset paths** (`tankBattleTest` isolation + probe cleanup).
+- **Selection-panel TASK-405 rows** (`src/main.js` `updateSelectionPanel`): river-crossing mode 🌊,
+  entrench % (خندق), supply state (⛔ مقطوع — استنزاف / ✅ موصول), ace stars + kills, engine damage.
+  Verified rendering live — captured a division mid-river-crossing.
+- **Bug fixed**: `Tank._supplyCheck` grace counted scans (×90f) not frames — cut-off grace was
+  ~15 min instead of the designed 10 s. Now `supplyGrace += 90` per scan.
+- **Rival AI SPG polish**: SPG joins the purchase roll (~15%), and the frontline re-aim now holds
+  standoff guns **~240 km behind the contact point** on the home bearing (inside gunRange 420,
+  clear of dead zone 120) while armor drives at the line.
+- **Probes**: `window.tankDeepTest()` — 11 checks (spotting gate, indirect fire, standoff, siege,
+  ace progression, entrench, supply-cut attrition, entrenched bridgehead, river far-bank,
+  flak chip, wreck lifecycle) — **PASS**. `window.tankRiverProbe()` — strait-crossing checker
+  (map-editor companion). Regression: `tankBattleTest` + `tankMarchTest` PASS.
+
+### ⚠️ Cross-agent flags (verified via `getPixelOwner` sampling)
+1. **Water mask over-waters SE England** (51.4N, 1.0E reads `water`) and the **Gulf of Cádiz**
+   (36.05–36.5N at −5.6E all `water`) → Dover/Gibraltar/Bosphorus/Messina/Bering read as
+   un-crossable to armor. Painted water (Suez) crosses fine. **Tank river logic is correct** —
+   the mask data needs fixing (world/naval agent, likely `build_river_routes.cjs` medium-cell
+   rasterization).
+2. **FFA bots inert without cities**: with Overpass down and 🏙️ 0 cities seeded, bots painted
+   0 cells, built 0 structs in 7.6k frames + 288 direct `aiTick`s (res drains to research only)
+   → rivals never reach the tank/base-building branches. Environment-dependent (conquest agent).
+
+### Probe how-to (mode-1 game running, port 3007)
+```js
+await window.tankDeepTest()   // 11-check deep pass → window.__tankDeepResult
+window.tankRiverProbe()       // raw strait/ocean mask crossings
+await window.tankBattleTest() // classic duel regression
+await window.tankMarchTest()  // corridor painting
+```
+
+---
+
+## SESSION 4 (2026-07-05): Ocean-Colour Paint + Tile-Based Brush
 
 ### G. Painted Water Now Matches Ocean Colour — COMPLETE ✅
 Painted water was an arbitrary blue (`rgba(30,110,210,.82)`) that didn't match

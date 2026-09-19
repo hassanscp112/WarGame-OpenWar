@@ -13520,7 +13520,10 @@ function runAI() {
                     || structs.find(s => !s.dead && s.owner === riv.str && s.type === 'base');
                 if (fac) {
                     const roll = Math.random();
-                    const k = roll < 0.4 ? 'light' : roll < 0.8 ? 'medium' : 'heavy';
+                    // TASK-405: SPGs join the AI mix (~15%) — standoff guns
+                    // rely on the artillery hold-back re-aim below, else
+                    // they'd wade into their own dead zone (120km).
+                    const k = roll < 0.35 ? 'light' : roll < 0.65 ? 'medium' : roll < 0.85 ? 'heavy' : 'spg';
                     const cfg = TCFG[k];
                     if (_resOf(riv) >= cfg.cost + 300) {
                         // muster at the base, fan out to a spread holding point
@@ -13540,8 +13543,20 @@ function runAI() {
                     if (fr) { const ll = conquestGrid.cellToLatLon(fr.srcCell); tgt = ll; break; }
                 }
                 if (tgt) {
+                    // ARTILLERY HOLD-BACK (TASK-405): standoff guns stay ~240km
+                    // behind the contact point on the home bearing — inside
+                    // gunRange(420), clear of the dead zone(120). Armor keeps
+                    // driving at the line.
+                    const home = structs.find(s => !s.dead && s.owner === riv.str && (s.type === 'factory' || s.type === 'base'));
                     for (const t of tanks) {
-                        if (!t.dead && t.owner === riv.str) t.setMoveTarget(tgt.lat + rnd(-0.3, 0.3), tgt.lon + rnd(-0.3, 0.3));
+                        if (t.dead || t.owner !== riv.str) continue;
+                        if (t.behavior && t.behavior.standoff && home) {
+                            const br = Math.atan2(home.lon - tgt.lon, home.lat - tgt.lat);
+                            t.setMoveTarget(tgt.lat + Math.cos(br) * 2.2 + rnd(-0.2, 0.2),
+                                            tgt.lon + Math.sin(br) * 2.2 + rnd(-0.2, 0.2));
+                        } else {
+                            t.setMoveTarget(tgt.lat + rnd(-0.3, 0.3), tgt.lon + rnd(-0.3, 0.3));
+                        }
                     }
                 }
             }
