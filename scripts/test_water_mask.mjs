@@ -138,5 +138,44 @@ console.log('\n[F] Neutral recount');
   ok(grid.countCells('neutral') < before, 'F2 gated dilation still converts some land (river banks)');
 }
 
+// ═══ G: TASK-506 late-load re-apply (GeoJSON arrives after blanket init) ═══
+console.log('\n[G] geoLand late-load — safe re-apply pre-spawn, frozen in-game');
+{
+  // G1 — blanket init, then late ref: mask re-applied geo-gated
+  const { grid, geo } = buildWorld();
+  grid.dilateWater(1, 1);                      // NO ref — blanket (the 10s-timeout path)
+  ok(owner(grid, 90, 139) === WATER, 'G1 pre: blanket dilation eroded the strait shore');
+  ok(grid.setGeoLandRef(geo) === true, 'G1 late setGeoLandRef reports re-apply (no owned cells)');
+  ok(owner(grid, 90, 139) === NEUTRAL, 'G1 strait shore restored to land');
+  ok(owner(grid, 90, 160) === NEUTRAL, 'G1 both strait shores restored');
+  ok(owner(grid, 89, 80) === WATER && owner(grid, 91, 80) === WATER, 'G1 river banks still widened (geo-gated re-dilation ran)');
+  let straitWater = 0;
+  for (let col = 140; col <= 159; col++) if (owner(grid, 90, col) === WATER) straitWater++;
+  ok(straitWater === 20, 'G1 strait back to 20 cells wide');
+  let manual = 0;
+  for (let i = 0; i < grid.owner.length; i++) if (grid.owner[i] === NEUTRAL) manual++;
+  ok(grid.countCells('neutral') === manual, 'G1 counts recounted after re-apply');
+
+  // G2 — game underway (cells owned): re-apply REFUSED, mask frozen
+  const g2 = buildWorld();
+  g2.grid.dilateWater(1, 1);                   // blanket
+  const some = 100 * W + 100;                  // interior LEFT-CONTINENT land cell (row 100 ≠ river row 90)
+  ok(g2.grid.conquerCell(some, 'player') === true, 'G2 setup: player owns one land cell');
+  ok(g2.grid.setGeoLandRef(g2.geo) === false, 'G2 re-apply refused once cells are owned');
+  ok(owner(g2.grid, 90, 139) === WATER, 'G2 blanket coasts kept (documented fallback)');
+
+  // G3 — idempotence: a second ref never triggers another rebuild
+  const g3 = buildWorld();
+  g3.grid.dilateWater(1, 1);
+  ok(g3.grid.setGeoLandRef(g3.geo) === true, 'G3 first late ref re-applies');
+  ok(g3.grid.setGeoLandRef(g3.geo) === false, 'G3 second ref is a plain swap (no rebuild)');
+
+  // G4 — late ref BEFORE any dilation is just a store (init order variant)
+  const g4 = buildWorld();
+  ok(g4.grid.setGeoLandRef(g4.geo) === false, 'G4 ref before dilation only stores (dilateState=none)');
+  g4.grid.dilateWater(1, 1);
+  ok(owner(g4.grid, 90, 139) === NEUTRAL, 'G4 subsequent dilation runs geo-gated');
+}
+
 console.log('\n═══ RESULT: ' + pass + ' passed, ' + fail + ' failed ═══');
 process.exit(fail ? 1 : 0);

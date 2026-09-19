@@ -354,6 +354,12 @@ export class ConquestGrid {
     // only lets INTERIOR water (rivers/lakes/canals) push banks outward —
     // ocean/strait water never dilates, so coastlines keep their true width.
     this._geoLand = null;
+    // TASK-506: how the LAST dilation ran — 'none' | 'blanket' | 'geo'.
+    // A blanket dilation (GeoJSON arrived after grid init) can be safely
+    // REDONE geo-gated by a late setGeoLandRef call — but only while no
+    // cell is owned yet (pre-spawn); once territory exists the mask is
+    // frozen (a rebuild would wipe every player/bot cell).
+    this._dilateState = 'none';
 
     // TASK-406: frontline heat — cells involved in recent ownership flips
     // (the active frontline glows; ages out after HEAT_AGE_MS).
@@ -586,7 +592,10 @@ export class ConquestGrid {
 
   // ── land mask FROM the terrain byte (bit7 = isLand). Replaces GeoJSON rasterization. ──
   // Now the conquerable land is EXACTLY the visible land — one grid, perfectly synced.
-  buildLandMaskFromTerrain() {
+  // rebuildTerrain=false skips buildTerrainHeuristic (26M-cell recompute) when the
+  // caller KNOWS this.terrain[] is already valid for this terrainByte (e.g. the
+  // TASK-506 geoLand late-load re-apply — identical inputs, identical output).
+  buildLandMaskFromTerrain(rebuildTerrain = true) {
     const cfg = this.cfg;
     this._counts.neutral = 0;
     const tb = this.terrainByte, owner = this.owner;
@@ -598,7 +607,7 @@ export class ConquestGrid {
         owner[cell] = cfg.WATER;
       }
     }
-    this.buildTerrainHeuristic();
+    if (rebuildTerrain) this.buildTerrainHeuristic();
     this._dirty = true;
   }
 
@@ -650,14 +659,47 @@ export class ConquestGrid {
     let n = 0;
     for (let i = 0; i < owner.length; i++) if (owner[i] === NEUTRAL) n++;
     this._counts.neutral = n;
+    this._dilateState = geo ? 'geo' : 'blanket';
     this._dirty = true;
   }
 
   // ── TASK-406 follow-up: GeoJSON inside-polygon reference for dilateWater. ──
   // u8: Uint8Array(W*H), 1 = cell center inside a country polygon. Passing
   // null/undefined clears it (dilation returns to blanket mode).
+  //
+  // TASK-506 LATE-LOAD RE-APPLY: if the grid was dilated BLANKET (GeoJSON
+  // had not arrived within initConquestGrid's bounded wait) and this is the
+  // FIRST valid ref, the mask is rebuilt geo-gated — but ONLY while zero
+  // cells are owned (pre-spawn). Rebuilding re-runs buildLandMaskFromTerrain
+  // + dilateWater + the biome repaint; everything downstream (overlay full
+  // repaint via _dirty, frontier rebuild, coarse water mask via the caller)
+  // picks the corrected coasts up on the next frame. Once any side owns
+  // territory the fallback is FINAL and precisely documented: blanket coasts
+  // (~5.5km erosion, wide straits) stay for the whole game — a mid-game
+  // rebuild would wipe ownership, so it must never fire.
+  // Returns true when a re-apply actually happened (caller may rebuild
+  // derived caches); false otherwise.
   setGeoLandRef(u8) {
-    this._geoLand = (u8 && u8.length === this.cfg.GRID_W * this.cfg.GRID_H) ? u8 : null;
+    const valid = (u8 && u8.length === this.cfg.GRID_W * this.cfg.GRID_H) ? u8 : null;
+    const isFirstRef = valid && !this._geoLand;
+    this._geoLand = valid;
+    if (!isFirstRef || this._dilateState !== 'blanket') return false;
+    const owned =
+      (this._counts.player || 0) + (this._counts.enemy || 0) +
+      (this._countsOther ? Array.from(this._countsOther.values()).reduce((a, b) => a + b, 0) : 0);
+    if (owned > 0) {
+      // Game already underway on a blanket mask — document precisely and keep it.
+      console.warn('[CONQUEST] geoLand ref arrived AFTER spawn on a blanket-dilated mask — ' +
+        'keeping blanket coasts for this game (a rebuild would wipe territory). ' +
+        'Next game initializes geo-gated if GeoJSON loads in time.');
+      return false;
+    }
+    // Safe pre-spawn re-apply: terrain → mask → geo-gated dilation → biome repaint.
+    this.buildLandMaskFromTerrain();
+    this.dilateWater(this.cfg.WATER_DILATION_RINGS, this.cfg.WATER_DILATION_MIN_NEIGHBORS);
+    this.paintBiomeBase();
+    console.log('[CONQUEST] geoLand late-load: mask re-applied geo-gated (coasts/straits restored to true width)');
+    return true;
   }
 
   // ── Paint the biome base canvas tile-by-tile from terrainByte[] via ofTerrainColor(). ──

@@ -3817,6 +3817,36 @@ function _awaitGeoJson(ms = 10000) {
     });
 }
 
+// ── TASK-506: geoLand LATE-LOAD watcher ──
+// If grid init had to fall back to blanket water dilation (GeoJSON slower
+// than the bounded 10s wait), poll for the data and hand the FIRST valid
+// ref to setGeoLandRef — which safely re-applies the mask geo-gated while
+// zero cells are owned (pre-spawn) and refuses (documented) once the game
+// is underway. Bounded to 2 minutes; one-shot.
+function _geoLandLateWatch() {
+    const t0 = performance.now();
+    const poll = () => {
+        const f = (window.GEOJSON_DATA && window.GEOJSON_DATA.features) || [];
+        if (f.length) {
+            if (!conquestGrid) return;
+            const ref = _buildGeoLandRef(f);
+            if (!ref) return;
+            if (conquestGrid.setGeoLandRef(ref)) {
+                // Re-apply happened: refresh every derived cache.
+                _coarseWaterMask = null;              // water pathfinding mask
+                const btex = earthMesh && earthMesh.material && earthMesh.material.map;
+                if (btex) btex.needsUpdate = true;    // biome globe texture
+                renderMode1Territory();               // territory overlay full repaint
+                logEvent('🗺️ صُحِّحت الخطوط الساحلية بعد اكتمال تحميل بيانات الخريطة', 'info');
+            }
+            return;   // done either way (applied, or game underway — documented)
+        }
+        if (performance.now() - t0 > 120000) return;  // give up quietly after 2 min
+        setTimeout(poll, 2000);
+    };
+    poll();
+}
+
 // Rasterize the GeoJSON country polygons at full grid res into a 0/1
 // Uint8Array (1 = cell center inside a polygon). Same projection + sampling
 // as the GeoJSON fallback mask path (proven at 7200×3600). The conquest
@@ -3879,6 +3909,11 @@ async function initConquestGrid() {
                 const geoFeats = (feats.length ? feats : await _awaitGeoJson(10000));
                 const geoLand = _buildGeoLandRef(geoFeats);
                 if (geoLand) conquestGrid.setGeoLandRef(geoLand);
+                // TASK-506: if GeoJSON hadn't arrived in time we dilate
+                // BLANKET now — start the late-load watcher so the first
+                // valid ref re-applies the mask geo-gated (pre-spawn only;
+                // setGeoLandRef documents the fallback once territory exists).
+                if (!geoLand) _geoLandLateWatch();
                 // Option 1: dilate water so thin rivers (1-cell-wide in the
                 // 4108px source) read + navigate at grid res. Thicken by N
                 // rings (rivers only when the geoLand ref is set — see above).
