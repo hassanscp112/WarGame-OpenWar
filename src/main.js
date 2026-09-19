@@ -6685,11 +6685,13 @@ const MPHASE = { BOOST: 0, COAST: 1, REENTRY: 2, CRUISE: 3 };
 // cfg.pierceDmg (2.6) instead of a hardcoded 2.2, and nuke_tac raises the
 // mushroom column).
 const WARHEADS = {
-    // CBU-97: 8 bomblets pepper the footprint — wider total coverage
+    // CBU-97: bomblets pepper the footprint — wider total coverage
+    // (scatterCount from MCFG — wired TASK-503, was hardcoded 8)
     cluster: {
         onImpact(ctx) {
             const { m, cfg, dmg, rad, blastR } = ctx;
-            for (let i = 0; i < 8; i++) {
+            const N = cfg.scatterCount || 8;
+            for (let i = 0; i < N; i++) {
                 const bl = m.lat + rnd(-rad / 90, rad / 90), bo = m.lon + rnd(-rad / 90, rad / 90);
                 spawnExp(bl, bo, rad / 22, '#ffaa00');
                 structs.forEach(s => {
@@ -7257,7 +7259,8 @@ class Missile {
         
         if(tp === 'cluster' && this.progress > 0.8 && !this.split) {
             this.split = true;
-            for(let i=0; i<8; i++) spawnExp(this.lat + rnd(-2,2), this.lon + rnd(-2,2), 2, '#ffaa00');
+            const nSplit = this.cfg.scatterCount || 8;   // TASK-503: wired (was hardcoded 8)
+            for(let i=0; i<nSplit; i++) spawnExp(this.lat + rnd(-2,2), this.lon + rnd(-2,2), 2, '#ffaa00');
         }
         
         // Phase contrails: boost = thick bright smoke, coast = thin sparse,
@@ -8029,6 +8032,30 @@ function _empRing(lat, lon, radiusKm) {
 let _polishClouds = null, _polishSun = null, _polishShimmer = null;
 let _polishShimTex = null;
 const _polishState = { wakeLast: new Map(), wakeCd: new Map() };
+// TASK-503: one tuning table for the atmosphere look — cloud density (opacity
+// + coverage window) and shimmer intensity (glint/specular/fresnel weights).
+// Live-tunable from the console (__polishTune({...})) for before/after fps
+// measurement; defaults = the TASK-303 shipped look.
+const _polishTune = {
+    cloudOpacity: 0.42,      // cloud shell material opacity
+    cloudCoverLo: 0.56,      // fBm value-noise threshold: ABOVE this = cloud
+    cloudCoverHi: 0.78,      // ...and full coverage at this (higher = sparser sky)
+    shimGlint: 0.40,         // sparkle glints weight
+    shimSpec: 0.55,          // sun specular streak weight
+    shimFres: 0.10,          // grazing-angle fresnel lift
+};
+window.__polishTune = function (patch) {
+    if (patch) Object.assign(_polishTune, patch);
+    _applyPolishTune();
+    return { ..._polishTune };
+};
+function _applyPolishTune() {
+    if (_polishClouds && _polishClouds.material) _polishClouds.material.opacity = _polishTune.cloudOpacity;
+    if (_polishShimmer && _polishShimmer.material) {
+        const u = _polishShimmer.material.uniforms;
+        if (u.wGlint) { u.wGlint.value = _polishTune.shimGlint; u.wSpec.value = _polishTune.shimSpec; u.wFres.value = _polishTune.shimFres; }
+    }
+}
 // (local smoothstep — main.js has no shared one at this scope)
 function _ss303(a, b, x) { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
 // 1×1 black seed for the shimmer sampler until the biome map binds
@@ -8075,7 +8102,8 @@ function _makeCloudCanvas(w = 1024, h = 512) {
             }
             f /= tot;   // 0..1
             // cloud coverage: threshold + latitude banding (equator + mid-lats)
-            const cov = _ss303(0.56, 0.78, f) * (0.35 + 0.65 * latFade);
+            // TASK-503: coverage window read live from the tuning table.
+            const cov = _ss303(_polishTune.cloudCoverLo, _polishTune.cloudCoverHi, f) * (0.35 + 0.65 * latFade);
             const i = (y * w + x) * 4;
             img.data[i] = 255; img.data[i + 1] = 255; img.data[i + 2] = 255;
             img.data[i + 3] = Math.round(cov * 235);
@@ -8096,7 +8124,7 @@ function _ensurePolishAtmosphere() {
         tex.colorSpace = THREE.SRGBColorSpace;
         const geo = new THREE.SphereGeometry(EARTH_RADIUS * 1.022, 96, 48);
         const mat = new THREE.MeshLambertMaterial({
-            map: tex, transparent: true, opacity: 0.42, depthWrite: false
+            map: tex, transparent: true, opacity: _polishTune.cloudOpacity, depthWrite: false
         });
         _polishClouds = new THREE.Mesh(geo, mat);
         _polishClouds.renderOrder = 2;
@@ -8145,7 +8173,10 @@ function _ensurePolishAtmosphere() {
                 uniforms: {
                     map: { value: _shimSeedTex },
                     uTime: { value: 0 },
-                    sunDir: { value: new THREE.Vector3(200, 100, 200).normalize() }
+                    sunDir: { value: new THREE.Vector3(200, 100, 200).normalize() },
+                    wGlint: { value: _polishTune.shimGlint },
+                    wSpec: { value: _polishTune.shimSpec },
+                    wFres: { value: _polishTune.shimFres }
                 },
                 vertexShader: `
                     varying vec2 vUv; varying vec3 vWNormal; varying vec3 vPos;
@@ -8157,6 +8188,7 @@ function _ensurePolishAtmosphere() {
                     }`,
                 fragmentShader: `
                     uniform sampler2D map; uniform float uTime; uniform vec3 sunDir;
+                    uniform float wGlint; uniform float wSpec; uniform float wFres;
                     varying vec2 vUv; varying vec3 vWNormal; varying vec3 vPos;
                     float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
                     void main() {
@@ -8173,7 +8205,7 @@ function _ensurePolishAtmosphere() {
                         vec3 H = normalize(V + normalize(sunDir));
                         float spec = pow(max(dot(N, H), 0.0), 70.0);
                         float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-                        float amt = ocean * (glint * 0.4 + spec * 0.55 + fres * 0.10);
+                        float amt = ocean * (glint * wGlint + spec * wSpec + fres * wFres);
                         gl_FragColor = vec4(vec3(0.62, 0.78, 1.0) * amt, 1.0);
                     }`,
                 transparent: true,
@@ -8185,6 +8217,32 @@ function _ensurePolishAtmosphere() {
         _polishShimmer.raycast = () => {};   // never intercept globe clicks
     }
     if (!scene.getObjectById(_polishShimmer.id)) scene.add(_polishShimmer);
+    // TASK-503 discoverability: a ☁ button beside 🔊 toggles the atmosphere
+    // layers in-game (same lazy-DOM pattern as the 🎚 mixer); plus a one-time
+    // console hint for the __polishToggle() dev hatch.
+    _ensurePolishToggleButton();
+    if (!_polishState.hinted) {
+        _polishState.hinted = true;
+        console.info('[TASK-303] atmosphere layers live (clouds/sun/shimmer) — toggle in-game with the ☁ button by 🔊, or console: __polishToggle() · tune look: __polishTune()');
+    }
+}
+
+// ☁ topbar button — built once, survives scene rebuilds (DOM, not scene)
+function _ensurePolishToggleButton() {
+    if (document.getElementById('btnPolish')) return;
+    const mute = document.getElementById('btnMute');
+    if (!mute || !mute.parentElement) return;
+    const b = document.createElement('button');
+    b.id = 'btnPolish';
+    b.className = 'iconBtn';
+    b.title = 'طبقات الجو (سحب/شمس/لمعان البحر) — للتبديل السريع';
+    b.textContent = '☁';
+    b.addEventListener('click', ev => {
+        ev.stopPropagation();
+        const vis = window.__polishToggle();
+        logEvent(vis ? '☁ طبقات الجو ظاهرة (سحب + شمس + لمعان)' : '☁ طبقات الجو مخفية — أداء أسرع', 'info');
+    });
+    mute.parentElement.insertBefore(b, mute.nextSibling);
 }
 
 // Per-RENDER-frame polish tick (called from loop()): cloud drift, shimmer
@@ -8290,6 +8348,10 @@ window.visualTest = function () {
         res.wakePuff = transients.length > w0;
     } finally { warships = savedShips; tradeShips = savedTrade; }
     res.fps = window.__perfState && window.__perfState.fpsAvg ? Math.round(window.__perfState.fpsAvg) : null;
+    // TASK-503: current atmosphere tuning + the ☁ toggle state (discoverability)
+    res.tune = { ..._polishTune };
+    res.toggleBtn = !!document.getElementById('btnPolish');
+    res.layersVisible = !!(_polishClouds && _polishClouds.visible);
     // TASK-303 guardrail: draw-call delta from the polish layers (machine-
     // independent cost metric — 4 calls expected: clouds + 2 sun sprites +
     // shimmer). Reads renderer.info right after a rendered frame.
