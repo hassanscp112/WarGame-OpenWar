@@ -350,13 +350,14 @@ export const GAME_CONSTANTS = {
   NAVAL_SHELL_VS_ARMOR: 0.6,        // shore-bombardment shells vs tank divisions (pre-armor)
   NAVAL_SHELL_STRUCT_MUL: 0.8,      // shore-bombardment shells vs structures
   FORMATION_SPACING_KM: 70,         // slot spacing for line/wedge stances
-  // Naval mines (deployable zones — L key; J is the ECM station since TASK-403)
+  // Naval mines (deployable zones — Z key; J is the ECM station (TASK-403)
+  // and L the trade-lane toggle (TASK-404) on main)
   MINE_COST: 200, MINE_CAP: 6, MINE_RADIUS_KM: 55, MINE_DMG: 380,
   MINE_ARM_FRAMES: 180,             // 3s arming delay (no friendly-fire on deploy)
   MINE_CHARGES: 3,                  // hulls consumed before the field is spent
   MINE_LIFE_FRAMES: 7200,           // fields fade after ~2min
   SINK_ANIM_FRAMES: 180,            // list + submerge sinking animation (3s)
-  // Fleet formation stances (K cycles): free / line / wedge
+  // Fleet formation stances (P cycles): free / line / wedge
   FLEET_STANCES: ['free', 'line', 'wedge'],
   // ── TASK-302: Land units / tank divisions ──
   TANK_CAP_TOTAL: 12,               // hard cap per owner across all divisions

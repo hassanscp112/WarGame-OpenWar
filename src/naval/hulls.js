@@ -418,7 +418,7 @@ function invasionFull(s, ctx) {
 //  'line'  : group orders spread the fleet abreast — capitals centered,
 //            screens on the flanks. Arrived hulls HOLD station (no wander).
 //  'wedge' : screening hulls lead the V, capital ships ride the deep center.
-//  Stance cycles on K (main.js); assignFormation runs on group move orders.
+//  Stance cycles on P (main.js); assignFormation runs on group move orders.
 // ══════════════════════════════════════════════════════════════════════
 export function assignFormation(ctx, owner, dstLat, dstLon, ships) {
     const C = GAME_CONSTANTS;
@@ -461,7 +461,7 @@ export function assignFormation(ctx, owner, dstLat, dstLon, ships) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-//  NAVAL MINES (TASK-402) — deployable minefields (L key, $ per field).
+//  NAVAL MINES (TASK-402) — deployable minefields (Z key, $ per field).
 //  A field is a small zone of moored contact mines: after a short arming
 //  delay it detonates on the first enemy HULL / invasion transport /
 //  trade ship that enters the radius. Each field carries MINE_CHARGES
