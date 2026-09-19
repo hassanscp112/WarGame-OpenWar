@@ -262,9 +262,18 @@ function startVsAI() {
 // Inject 3D modules
 const EARTH_RADIUS = 6371;
 
-function latLonToVec3(lat, lon, r = EARTH_RADIUS) {
+function latLonToVec3(lat, lon, r = EARTH_RADIUS, out = null) {
     const phi = (90 - lat) * (Math.PI / 180);
     const theta = (lon + 180) * (Math.PI / 180);
+    // TASK-401 audit #22: optional out-vector — hot paths (Plane.update) pass
+    // a scratch to stay allocation-free; all other callers unchanged.
+    if (out) {
+        return out.set(
+            -(r * Math.sin(phi) * Math.cos(theta)),
+            r * Math.cos(phi),
+            r * Math.sin(phi) * Math.sin(theta)
+        );
+    }
     return new THREE.Vector3(
         -(r * Math.sin(phi) * Math.cos(theta)),
         r * Math.cos(phi),
@@ -7413,13 +7422,15 @@ class Plane {
 
         // TASK-401 doctrine altitudes: helis transit LOW, AWACS/tankers HIGH
         // (PCFG alt; parkedTick uses the same field).
+        // Audit #22: the movement block runs on _mv1-4 scratch vectors —
+        // ZERO Vector3 allocations per plane per frame (was ~5).
         const ALT = this.cfg.alt || 50;
-        let targetVec = latLonToVec3(this.tlat, this.tlon, EARTH_RADIUS + ALT); 
+        const targetVec = latLonToVec3(this.tlat, this.tlon, EARTH_RADIUS + ALT, _mv1);
         let dist = this.pos.distanceTo(targetVec);
 
         if (this.mode === 'return') {
             if (this.baseStruct && !this.baseStruct.dead) {
-                targetVec = latLonToVec3(this.baseStruct.lat, this.baseStruct.lon, EARTH_RADIUS + ALT);
+                latLonToVec3(this.baseStruct.lat, this.baseStruct.lon, EARTH_RADIUS + ALT, targetVec);
                 dist = this.pos.distanceTo(targetVec);
                 if (dist < 2) {
                     this.parked = true;
@@ -7437,20 +7448,22 @@ class Plane {
             return;
         }
 
-        let curNormalized = this.pos.clone().normalize();
-        let targetNormalized = targetVec.clone().normalize();
+        const curNormalized = _mv2.copy(this.pos).normalize();
+        const targetNormalized = _mv3.copy(targetVec).normalize();
         let slerpSpeed = Math.min(1.0, this.speed / Math.max(0.1, dist));
         // TASK-201: turnRate now matters — agile fighters corner inside
         // heavy airframes (only bites when maneuvering near the target).
         slerpSpeed *= (0.55 + this.cfg.turnRate * 1.8);
         
-        let curVec = curNormalized.clone().lerp(targetNormalized, slerpSpeed).normalize().multiplyScalar(EARTH_RADIUS + ALT);
-        this.lat = vec3ToLatLon(curVec).lat; this.lon = vec3ToLatLon(curVec).lon;
+        const curVec = _mv4.copy(curNormalized).lerp(targetNormalized, slerpSpeed).normalize().multiplyScalar(EARTH_RADIUS + ALT);
+        const ll = vec3ToLatLon(curVec);
+        this.lat = ll.lat; this.lon = ll.lon;
         
         this.mesh.position.copy(curVec);
         this.mesh.up.copy(curVec).normalize();
         
-        let aheadVec = curVec.clone().normalize().lerp(targetNormalized, 0.1).normalize().multiplyScalar(EARTH_RADIUS + ALT);
+        // curNormalized (_mv2) is spent — reuse it for the lookAt ahead point
+        const aheadVec = _mv2.copy(curVec).normalize().lerp(targetNormalized, 0.1).normalize().multiplyScalar(EARTH_RADIUS + ALT);
         this.mesh.lookAt(aheadVec);
         
         // OBJ jets nose +X; GLB/proxy already fly +Z
@@ -12873,6 +12886,9 @@ function runAI() {
     // 5. AI Air Force (TASK-201) — rivals with an airport grow a mixed wing.
     //    Weighted buys: cheap fighters early, interceptors/A-10s mid, bombers
     //    + Su-57 when rich. Cap keeps the sky sane.
+    //    TASK-401 doctrine: a wing of ≥2 combat planes earns ONE tanker and
+    //    ONE AWACS (endurance + detection force-multipliers) before more mass;
+    //    rich rivals (2k+ reserve) can afford the F-22.
     if (window.gameMode === 'mode1' && frame % GAME_CONSTANTS.AI_TICK_RATE === 0) {
         const C = GAME_CONSTANTS;
         const MIX = [
@@ -12888,10 +12904,24 @@ function runAI() {
             if (Math.random() > 0.35) continue;   // cadenced by AI_TICK_RATE
             // weighted pick within budget
             const budget = _resOf(riv) - 400;   // keep a reserve for rebuilding
-            let pool = MIX.filter(m => PCFG[m.k].cost <= budget);
-            if (!pool.length) continue;
-            let total = pool.reduce((s, m) => s + m.w, 0), roll = Math.random() * total, pick = pool[0];
-            for (const m of pool) { roll -= m.w; if (roll <= 0) { pick = m; break; } }
+            // TASK-401: support doctrine — exactly one tanker + one AWACS,
+            // bought once the wing has 2+ combat aircraft
+            const hasRole = (role) => planes.some(p => !p.dead && p.owner === riv.str && p.cfg.role === role);
+            const combatPlanes = planes.reduce((n, p) => n + (!p.dead && p.owner === riv.str && !p.parked && p.cfg.role !== 'tanker' && p.cfg.role !== 'awacs' ? 1 : 0), 0);
+            let forced = null;
+            if (combatPlanes >= 2 && !hasRole('tanker') && PCFG['tanker'].cost <= budget) forced = 'tanker';
+            else if (combatPlanes >= 2 && !hasRole('awacs') && PCFG['awacs'].cost <= budget) forced = 'awacs';
+            let pick;
+            if (forced) {
+                pick = { k: forced };
+            } else {
+                let pool = MIX.filter(m => PCFG[m.k].cost <= budget);
+                if (_resOf(riv) > 2000 && PCFG['f22'].cost <= budget) pool = pool.concat([{ k: 'f22', w: 0.5 }]);
+                if (!pool.length) continue;
+                let total = pool.reduce((s, m) => s + m.w, 0), roll = Math.random() * total;
+                pick = pool[0];
+                for (const m of pool) { roll -= m.w; if (roll <= 0) { pick = m; break; } }
+            }
             planes.push(new Plane(apt.lat, apt.lon, PCFG[pick.k], riv.str));
             _spendRes(riv, PCFG[pick.k].cost);
         }
