@@ -7307,7 +7307,13 @@ class Plane {
             this._rtbForFuel = true;   // one-shot: combat scans can flip mode back — don't re-toast each tick
             this.mode = 'return';
             this.airTgt = null;
-            if (this.owner === myRole) logEvent(`⛽ ${this.cfg.name}: وقود منخفض — عودة للقاعدة`, 'info');
+            // Global rate-limit (navy agent's polish note): carrier wings cycle
+            // RTB→refuel→relaunch constantly at sea — a 5-plane wing spams this
+            // toast every cycle. One fuel-toast per 30s fleet-wide.
+            if (this.owner === myRole && frame - (Plane._lastFuelToastF || -9999) > 1800) {
+                Plane._lastFuelToastF = frame;
+                logEvent(`⛽ ${this.cfg.name}: وقود منخفض — عودة للقاعدة`, 'info');
+            }
         }
 
         // AWACS boost refresh (staggered per-plane)
