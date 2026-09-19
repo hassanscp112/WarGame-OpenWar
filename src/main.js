@@ -117,6 +117,10 @@ const TECH_LOCKED_BUILDS = ['iron_dome','ciws','nuke_plant','himars'];
 
 const SFX = {
  ctx: null, muted: false, master: null,
+ // TASK-408: mixer chain = buses → out[user volume] → compressor → destination
+ out: null, buses: null,
+ vol: 1, busVol: { amb: .8, bgm: .55, weapons: 1, ui: .8, alerts: 1 },
+ _evtLog: [], _active: 0, _bed: null, _tension: 0,
  init(){ 
   if(this.ctx) { if(this.ctx.state==='suspended') this.ctx.resume(); return; } 
   const AC = window.AudioContext || window.webkitAudioContext; 
@@ -129,12 +133,27 @@ const SFX = {
    this.master.attack.value = 0.002;
    this.master.release.value = 0.1;
    this.master.connect(this.ctx.destination);
+   // TASK-408: user volume + per-category buses (amb/bgm/weapons/ui/alerts)
+   this.out = this.ctx.createGain(); this.out.gain.value = this.vol; this.out.connect(this.master);
+   this.buses = {};
+   for (const k of ['amb', 'bgm', 'weapons', 'ui', 'alerts']) {
+     const g = this.ctx.createGain(); g.gain.value = this.busVol[k]; g.connect(this.out); this.buses[k] = g;
+   }
+   this._restoreMix();
    if(this.ctx.state==='suspended') this.ctx.resume(); 
   } 
  },
- toggleMute(){ this.muted = !this.muted; document.getElementById('btnMute').textContent = this.muted ? '🔇' : '🔊'; if(!this.muted) this.init(); },
+ // TASK-408: mixer API + node bookkeeping
+ setVolume(v){ this.vol = Math.max(0, Math.min(1, v)); if (this.out) this.out.gain.value = this.vol; this._persist(); },
+ setBus(k, v){ if (!(k in this.busVol)) return; this.busVol[k] = Math.max(0, Math.min(1, v)); if (this.buses && this.buses[k]) this.buses[k].gain.value = this.busVol[k]; this._persist(); },
+ _bus(k){ return (this.buses && this.buses[k]) || this.master; },
+ _track(src){ if (!src) return; this._active++; src.onended = () => { this._active = Math.max(0, this._active - 1); }; },
+ _evt(name){ this._evtLog.push(name + '@' + (this.ctx ? this.ctx.currentTime : 0).toFixed(1) + 's'); if (this._evtLog.length > 40) this._evtLog.shift(); },
+ _persist(){ try { localStorage.setItem('sfxMix', JSON.stringify({ vol: this.vol, busVol: this.busVol })); } catch (e) {} },
+ _restoreMix(){ try { const j = JSON.parse(localStorage.getItem('sfxMix') || 'null'); if (!j) return; if (j.vol != null) this.vol = Math.max(0, Math.min(1, j.vol)); if (j.busVol) for (const k in this.busVol) if (j.busVol[k] != null) this.busVol[k] = Math.max(0, Math.min(1, j.busVol[k])); if (this.out) this.out.gain.value = this.vol; if (this.buses) for (const k in this.buses) this.buses[k].gain.value = this.busVol[k]; } catch (e) {} },
+ toggleMute(){ this.muted = !this.muted; document.getElementById('btnMute').textContent = this.muted ? '🔇' : '🔊'; if(!this.muted) this.init(); this._evt(this.muted ? 'mute' : 'unmute'); if (this.muted) this.bedOff(); },
  
- playNoiseLayer(dur, vol, lpf, lpfEnd, hpf, hpfEnd){
+ playNoiseLayer(dur, vol, lpf, lpfEnd, hpf, hpfEnd, bus='weapons'){
   if(this.muted||!this.ctx)return;
   const bs = this.ctx.sampleRate*dur, buf = this.ctx.createBuffer(1,bs,this.ctx.sampleRate), data = buf.getChannelData(0);
   let lastOut = 0;
@@ -159,8 +178,9 @@ const SFX = {
   gain.gain.exponentialRampToValueAtTime(vol, this.ctx.currentTime+dur*0.05); // fast attack
   gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime+dur);
   
-  noise.connect(lowPass); lowPass.connect(highPass); highPass.connect(gain); gain.connect(this.master); 
+  noise.connect(lowPass); lowPass.connect(highPass); highPass.connect(gain); gain.connect(this._bus(bus)); 
   noise.start(); noise.stop(this.ctx.currentTime+dur);
+  this._track(noise);
  },
 
  launch(type='medium'){
@@ -207,8 +227,9 @@ const SFX = {
   gn.gain.setValueAtTime(0,this.ctx.currentTime);
   gn.gain.linearRampToValueAtTime(beat%4===0?.06:.02,this.ctx.currentTime+.02);
   gn.gain.exponentialRampToValueAtTime(.001,this.ctx.currentTime+(beat%4===0?.2:.1));
-  osc.connect(gn);gn.connect(this.master);
+  osc.connect(gn);gn.connect(this._bus('bgm'));
   osc.start();osc.stop(this.ctx.currentTime+.25);
+  this._track(osc);
  },
  ui(t){ 
   this.init(); 
@@ -218,11 +239,14 @@ const SFX = {
   else if(t==='err') osc.type='square', osc.frequency.value=150, gn.gain.setValueAtTime(0.04,this.ctx.currentTime), gn.gain.exponentialRampToValueAtTime(.001,this.ctx.currentTime+.15);
   else if(t==='build') osc.type='triangle', osc.frequency.value=400, gn.gain.setValueAtTime(0.03,this.ctx.currentTime), gn.gain.exponentialRampToValueAtTime(.001,this.ctx.currentTime+.1);
   else osc.type='sine', osc.frequency.value=600, gn.gain.setValueAtTime(0.02,this.ctx.currentTime), gn.gain.exponentialRampToValueAtTime(.001,this.ctx.currentTime+.05);
-  osc.connect(gn); gn.connect(this.master); osc.start(); osc.stop(this.ctx.currentTime+.15);
+  osc.connect(gn); gn.connect(this._bus('ui')); osc.start(); osc.stop(this.ctx.currentTime+.15);
+  this._track(osc); this._evt('ui:' + t);
  },
- gun(){ this.init(); this.playNoiseLayer(0.25, 0.15, 3000, 800, 500, 200); },
- flare(){ this.init(); this.playNoiseLayer(0.6, 0.1, 4000, 2000, 1000, 800); },
+ gun(){ this.init(); this.playNoiseLayer(0.25, 0.15, 3000, 800, 500, 200); this._evt('gun'); },
+ flare(){ this.init(); this.playNoiseLayer(0.6, 0.1, 4000, 2000, 1000, 800); this._evt('flare'); },
  // TASK-401: RWR lock tone — sharp double-beep when an enemy SAM acquires us
+ // (TASK-408 merge note: routed through the alerts bus + tracked so the
+ //  mixer governs it — was this.master, which bypasses the volume slider)
  rwr(){
   this.init();
   if(!this.ctx||this.muted)return;
@@ -233,8 +257,98 @@ const SFX = {
    gn.gain.setValueAtTime(0,t0);
    gn.gain.linearRampToValueAtTime(0.045,t0+0.01);
    gn.gain.exponentialRampToValueAtTime(0.001,t0+0.09);
-   osc.connect(gn); gn.connect(this.master); osc.start(t0); osc.stop(t0+0.1);
+   osc.connect(gn); gn.connect(this._bus('alerts')); osc.start(t0); osc.stop(t0+0.1);
+   this._track(osc);
   }
+  this._evt('rwr');
+ },
+
+ // ══ TASK-408: new layers ══════════════════════════════════════════
+ // Ambient bed: looping brown-noise pad + breathing LFO; tension (0..1)
+ // opens the filter and lifts the level — the war mood driver.
+ bedOn(){
+  this.init();
+  if (!this.ctx || this.muted || this._bed) return;
+  const c = this.ctx, bs = c.sampleRate * 3, buf = c.createBuffer(1, bs, c.sampleRate), d = buf.getChannelData(0);
+  let last = 0;
+  for (let i = 0; i < bs; i++) { const w = Math.random() * 2 - 1; last = (last + .02 * w) / 1.02; d[i] = last * 3.5; }
+  const src = c.createBufferSource(); src.buffer = buf; src.loop = true;
+  const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 220; lp.Q.value = .6;
+  const g = c.createGain(); g.gain.setValueAtTime(.0001, c.currentTime); g.gain.linearRampToValueAtTime(.05, c.currentTime + 3);
+  const lfo = c.createOscillator(), lg = c.createGain(); lfo.frequency.value = .06; lg.gain.value = 60;
+  lfo.connect(lg); lg.connect(lp.frequency);
+  src.connect(lp); lp.connect(g); g.connect(this._bus('amb'));
+  src.start(); lfo.start();
+  this._bed = { src, lp, g, lfo };
+  this._evt('bedOn');
+ },
+ bedOff(){
+  const b = this._bed; if (!b) return;
+  try {
+   const t = this.ctx.currentTime;
+   b.g.gain.cancelScheduledValues(t); b.g.gain.setValueAtTime(Math.max(.0001, b.g.gain.value), t);
+   b.g.gain.linearRampToValueAtTime(.0001, t + .8);
+   b.src.stop(t + .9); b.lfo.stop(t + .9);
+  } catch (e) {}
+  this._bed = null; this._tension = 0; this._evt('bedOff');
+ },
+ bedTension(v){
+  this._tension = v;
+  const b = this._bed; if (!b || !this.ctx) return;
+  const t = this.ctx.currentTime;
+  b.lp.frequency.cancelScheduledValues(t); b.lp.frequency.linearRampToValueAtTime(220 + 340 * v, t + 2.5);
+  b.g.gain.cancelScheduledValues(t); b.g.gain.linearRampToValueAtTime(.05 + .07 * v, t + 2.5);
+ },
+ // War-tension stinger: dissonant swell on the first aggression involving the player
+ stinger(){
+  this.init(); if (!this.ctx || this.muted) return;
+  const t = this.ctx.currentTime;
+  [110, 116.54, 164.81].forEach(f => {
+   const o = this.ctx.createOscillator(), g = this.ctx.createGain(), lp = this.ctx.createBiquadFilter();
+   o.type = 'sawtooth'; o.frequency.value = f; lp.type = 'lowpass'; lp.frequency.value = 900;
+   g.gain.setValueAtTime(.0001, t); g.gain.linearRampToValueAtTime(.12, t + 1.1); g.gain.exponentialRampToValueAtTime(.001, t + 2.6);
+   o.connect(lp); lp.connect(g); g.connect(this._bus('alerts'));
+   o.start(t); o.stop(t + 2.7); this._track(o);
+  });
+  this.playNoiseLayer(2.4, .28, 300, 60, 25, 15, 'alerts');
+  this._evt('stinger');
+ },
+ // Intercept sonar ping (with a soft echo)
+ ping(){
+  this.init(); if (!this.ctx || this.muted) return;
+  const t = this.ctx.currentTime;
+  const mk = (dt, v) => {
+   const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+   o.type = 'sine'; o.frequency.setValueAtTime(1250, t + dt); o.frequency.exponentialRampToValueAtTime(880, t + dt + .35);
+   g.gain.setValueAtTime(v, t + dt); g.gain.exponentialRampToValueAtTime(.001, t + dt + .5);
+   o.connect(g); g.connect(this._bus('alerts')); o.start(t + dt); o.stop(t + dt + .55); this._track(o);
+  };
+  mk(0, .18); mk(.16, .07);
+  this._evt('ping');
+ },
+ // Milestone fanfare: bright major arpeggio
+ fanfare(){
+  this.init(); if (!this.ctx || this.muted) return;
+  const t = this.ctx.currentTime;
+  [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => {
+   const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+   o.type = 'triangle'; o.frequency.value = f;
+   const st = t + i * .11;
+   g.gain.setValueAtTime(.0001, st); g.gain.linearRampToValueAtTime(.16, st + .02); g.gain.exponentialRampToValueAtTime(.001, st + .5);
+   o.connect(g); g.connect(this._bus('alerts')); o.start(st); o.stop(st + .55); this._track(o);
+  });
+  this._evt('fanfare');
+ },
+ // Naval gun bass: deep sine drop + muzzle crack
+ navalBass(){
+  this.init(); if (!this.ctx || this.muted) return;
+  const t = this.ctx.currentTime;
+  const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+  o.type = 'sine'; o.frequency.setValueAtTime(60, t); o.frequency.exponentialRampToValueAtTime(26, t + .4);
+  g.gain.setValueAtTime(.55, t); g.gain.exponentialRampToValueAtTime(.001, t + .55);
+  o.connect(g); g.connect(this._bus('weapons')); o.start(t); o.stop(t + .6); this._track(o);
+  this.playNoiseLayer(.3, .22, 900, 120, 60, 40, 'weapons');
+  this._evt('navalBass');
  }
 };
 
@@ -13036,6 +13150,7 @@ function econResetState() {
     window.__fuelBreakdown = null;
     _econScan = { frame: -1, sideData: {} };
     econTeardownForMenu();   // TASK-404: drop lanes/intel/medal visuals
+    _sfxSt.stung = false; _sfxSt.shells = null; _sfxSt.threats = null;   // TASK-408: re-arm the stinger for the new game
 }
 
 function troopsOf(side) {
@@ -13790,6 +13905,7 @@ function econSparkDraw(cv) {
 
 // ── MILESTONE MEDALS: fly-in toast (TASK-404 polish) ─────────────────
 function econMilestoneToast(m, bonus) {
+    try { SFX.fanfare(); } catch (e) {}   // TASK-408: milestone fanfare
     let host = document.getElementById('econMedals');
     if (!host) { host = document.createElement('div'); host.id = 'econMedals'; document.body.appendChild(host); }
     const el = document.createElement('div');
@@ -13980,6 +14096,128 @@ window.__econProbe = {
     warTick: () => econWarTick(),                  // rebuild the war/blockade cache NOW
     lanes: () => ({ on: tradeLanesOn, arcs: tradeLaneGroup ? tradeLaneGroup.children.length : 0 }),
     marketOpen: (v) => toggleMarketPanel(v),
+};
+
+// ════════════════════════════════════════════════════════════════
+// TASK-408 — SOUND DRIVER 🎚️
+//   Per-frame observation (READ-ONLY on other agents' arrays — no
+//   edits to Missile/Warship/Plane classes needed):
+//   · bgmStep  — the previously-dead 16-step beat sequencer, wired on a
+//                9-frame step cadence while a game runs
+//   · bed      — ambient drone + war-tension filter (tension feeds from
+//                MY econState war data)
+//   · stinger  — first war dir involving the player (attack or defense)
+//   · ping     — hostile missile died mid-flight (progress < .85 — the
+//                navalBattleTest intercept criterion) ⇒ intercept sonar
+//   · navalBass— shells-in-flight delta across warships (gun fire)
+// ════════════════════════════════════════════════════════════════
+const _sfxSt = { bgmStep: 0, shells: null, threats: null, lastBass: -1e9, lastPing: -1e9, stung: false };
+function _sfxFrame() {
+    if (!SFX.ctx) return;
+    const gc = document.getElementById('gc');
+    const inGame = !window.startSpawnPhase && !gOver && gc && gc.style.display !== 'none';
+    if (SFX.muted) { if (SFX._bed) SFX.bedOff(); return; }
+    if (!inGame) { if (SFX._bed) SFX.bedOff(); return; }
+    // beat sequencer (~100bpm feel: one 16th every 9 frames)
+    if (frame % 9 === 0) SFX.bgmStep(_sfxSt.bgmStep++);
+    // ambient bed + tension from MY war scan (economy agent's own data)
+    SFX.bedOn();
+    const atWar = econState && (econDefensiveWar(myRole) || econWarPartnerCount(myRole) > 0);
+    SFX.bedTension(atWar ? 1 : (econState && econState._warDirs.size ? 0.35 : 0));
+    if (!_sfxSt.stung && econState && econState._warDirs.size) {
+        for (const d of econState._warDirs) {
+            if (d.startsWith(myRole + '>') || d.endsWith('>' + myRole)) { _sfxSt.stung = true; SFX.stinger(); break; }
+        }
+    }
+    // naval gun bass — shells in flight (READ-ONLY warships scan)
+    if (frame % 6 === 0) {
+        let total = 0;
+        for (const w of warships) if (!w.dead) total += w.shells.length;
+        if (_sfxSt.shells != null && total > _sfxSt.shells && frame - _sfxSt.lastBass > 15) {
+            _sfxSt.lastBass = frame; SFX.navalBass();
+        }
+        _sfxSt.shells = total;
+    }
+    // intercept ping — tracked hostile missile vanished mid-flight
+    if (frame % 3 === 0) {
+        const cur = new Map();
+        for (const m of missiles) if (!m.dead && !m.isSAM) cur.set(m.id, m.progress || 0);
+        const prev = _sfxSt.threats;
+        if (prev) {
+            for (const [id, pr] of prev) {
+                if (!cur.has(id) && pr < 0.85 && frame - _sfxSt.lastPing > 30) {
+                    _sfxSt.lastPing = frame; SFX.ping(); break;
+                }
+            }
+        }
+        _sfxSt.threats = cur;
+    }
+}
+
+// ── 🎚️ mixer panel (button injected next to the mute button; lazy DOM —
+//    index.html stays untouched) ─────────────────────────────────
+function ensureSfxMixer() {
+    if (document.getElementById('sfxMixBtn')) return;
+    const mute = document.getElementById('btnMute');
+    if (!mute || !mute.parentElement) return;
+    const btn = document.createElement('button');
+    btn.id = 'sfxMixBtn'; btn.className = 'iconBtn'; btn.textContent = '🎚️';
+    btn.title = 'مزج الصوت (Master + فئات)';
+    mute.after(btn);
+    btn.addEventListener('click', (e) => { e.stopPropagation(); toggleSfxMixer(); });
+}
+function toggleSfxMixer(force) {
+    ensureSfxMixer();
+    let p = document.getElementById('sfxMix');
+    if (!p) {
+        p = document.createElement('div');
+        p.id = 'sfxMix';
+        const rows = [['vol', 'الرئيسي'], ['amb', 'البيئة'], ['bgm', 'الإيقاع'], ['weapons', 'الأسلحة'], ['ui', 'الواجهة'], ['alerts', 'التنبيهات']];
+        p.innerHTML = `<div class="sxHead"><span>🎚️ مزج الصوت</span><button class="sxClose">✕</button></div>` +
+            rows.map(([k, lbl]) =>
+                `<div class="sxRow"><label>${lbl}</label><input type="range" min="0" max="100" data-bus="${k}" value="${Math.round((k === 'vol' ? SFX.vol : SFX.busVol[k]) * 100)}"><span class="sxVal"></span></div>`).join('') +
+            `<div class="sxHint">يُحفظ تلقائياً — الأسهم: الرئيسي/البيئة/الإيقاع/الأسلحة/الواجهة/التنبيهات</div>`;
+        document.body.appendChild(p);
+        p.querySelector('.sxClose').addEventListener('click', () => p.classList.remove('open'));
+        p.querySelectorAll('input[type=range]').forEach(r => {
+            const upd = () => {
+                const v = r.value / 100;
+                if (r.dataset.bus === 'vol') SFX.setVolume(v); else SFX.setBus(r.dataset.bus, v);
+                r.parentElement.querySelector('.sxVal').textContent = r.value + '%';
+            };
+            r.addEventListener('input', upd); upd();
+        });
+    }
+    const open = force != null ? force : !p.classList.contains('open');
+    if (open) {   // anchor under the 🎚 button
+        const b = document.getElementById('sfxMixBtn');
+        if (b) {
+            const r = b.getBoundingClientRect();
+            p.style.left = Math.max(8, Math.min(window.innerWidth - 244, r.left - 190)) + 'px';
+            p.style.top = (r.bottom + 8) + 'px';
+        }
+    }
+    p.classList.toggle('open', open);
+}
+ensureSfxMixer();
+
+// ── TASK-408 probe: audioTest() → node/state census; audioTest(true)
+//    also fires one sound per category so a human can hear each bus.
+window.audioTest = function (playAll) {
+    const out = {
+        ctx: SFX.ctx ? { state: SFX.ctx.state, sampleRate: SFX.ctx.sampleRate, t: +SFX.ctx.currentTime.toFixed(1) } : null,
+        vol: +SFX.vol.toFixed(2),
+        buses: Object.fromEntries(Object.entries(SFX.busVol).map(([k, v]) => [k, +v.toFixed(2)])),
+        muted: SFX.muted,
+        activeSources: SFX._active,
+        bed: SFX._bed ? { on: true, tension: SFX._tension } : { on: false },
+        bgmStepCount: _sfxSt.bgmStep,
+        stingerFired: _sfxSt.stung,
+        events: SFX._evtLog.slice(-12),
+    };
+    if (playAll) { SFX.ui('click'); SFX.ping(); SFX.fanfare(); SFX.navalBass(); SFX.stinger(); SFX.bgmStep(0); SFX.bedOn(); }
+    console.log('[audioTest]', out);
+    return out;
 };
 
 // Remove all TASK-404 visuals (menu return / new game reset).
@@ -15083,6 +15321,8 @@ function gameFrame() {
     // TASK-301 milestones + TASK-404 second-tick (fuel crisis watch, loans,
     // bonds, sanctions, intel, trade lanes, sparkline, observer) — 1/s.
     if (frame % 60 === 0) econSecondTick();
+    
+    _sfxFrame();   // TASK-408: bgm/bed/intercept-ping/naval-bass observations
     
     // Spawn Trade Ships and Trains on interval
     if(frame % GAME_CONSTANTS.TRADE_SHIP_SPAWN_INTERVAL === 0) {

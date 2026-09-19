@@ -633,6 +633,22 @@ html, body {
 #econDebt { color: #ff8f6b; font-size: 10px; font-weight: 800; margin-inline-start: 5px;
     white-space: nowrap; text-shadow: 0 0 6px rgba(255, 80, 40, .5); }
 
+/* 🎚️ TASK-408 sound mixer panel */
+#sfxMix { position: fixed; z-index: 65; width: 232px; padding: 10px 12px;
+    background: rgba(14, 16, 22, .94); border: 1px solid #2c3a4a; border-radius: 10px;
+    color: #e8e8e8; font-size: 12px; box-shadow: 0 12px 34px rgba(0, 0, 0, .55);
+    opacity: 0; transform: translateY(8px); pointer-events: none; transition: all .2s ease; }
+#sfxMix.open { opacity: 1; transform: none; pointer-events: auto; }
+#sfxMix .sxHead { display: flex; align-items: center; justify-content: space-between;
+    font-weight: 700; color: #8fd3ff; margin-bottom: 8px; }
+#sfxMix .sxClose { background: none; border: none; color: #888; cursor: pointer; font-size: 13px; }
+#sfxMix .sxClose:hover { color: #fff; }
+#sfxMix .sxRow { display: grid; grid-template-columns: 58px 1fr 36px; align-items: center; gap: 8px; margin-bottom: 6px; }
+#sfxMix .sxRow label { color: #9aa3ad; font-size: 11px; }
+#sfxMix input[type=range] { width: 100%; accent-color: #8fd3ff; cursor: pointer; }
+#sfxMix .sxVal { color: #9aa3ad; font-size: 10px; text-align: left; }
+#sfxMix .sxHint { color: #6b7683; font-size: 9.5px; margin-top: 6px; line-height: 1.5; }
+
 /* 🏦 black-market panel (key K) */
 #econMkt {
     position: fixed; bottom: 86px; left: 14px; z-index: 60;
