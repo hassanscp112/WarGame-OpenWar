@@ -1,5 +1,5 @@
 import { MCFG, MTAGS, PCFG, DCFG, TCFG, GAME_CONSTANTS, WORLD_CITIES, SDEFS, ITEM_ICONS, TECH_TREE, BOT_COUNTRIES, BOTS_MAX } from './data/constants.js';
-import { ECON_CONSTANTS } from './econ/constants.js';   // TASK-504: qaTest verifies the GAME_CONSTANTS spread
+import { ECON_CONSTANTS } from './econ/constants.js';   // TASK-504: econQATest verifies the GAME_CONSTANTS spread
 import { FormationLayout, TANK_BEHAVIORS, IndirectFire } from './land/landUnits.js';   // TASK-405
 import { ConquestGrid, ConquestAttack, CONQUEST_CFG, registerOwner, clearRegisteredOwners, setBiomeFlatMode, setBiomeBandColor, getBiomeBandColor, getBiomeBands, attackLogic, attackTilesPerTickCtx } from './core/conquest.js';
 import { initNewUI, uiToast } from './ui.js';
@@ -13626,7 +13626,7 @@ function isPortBlockaded(port) {
 // haversineDist() allocates TWO Vector3 per call (latLonToVec3 ×2) — at
 // 20+ ports/cities/factories that's ~1000+ Vector3/frame of pure churn.
 // Same spherical law of cosines, zero allocations, identical results to
-// float epsilon (probe-verified in qaTest). Econ code only — the shared
+// float epsilon (probe-verified in econQATest). Econ code only — the shared
 // helper stays untouched for everyone else.
 const _econHavNA = (() => {
     const RAD = Math.PI / 180;
@@ -14582,7 +14582,7 @@ const _sfxSt = { bgmStep: 0, shells: null, lastBass: -1e9, lastPing: -1e9, stung
 const _sfxThreats = new Map();
 let _sfxThreatTick = 0;
 // TASK-504 FINISH — intercept-ping criterion, v2. PURE (probe-tested by
-// qaTest): a vanished tracked missile reads as an INTERCEPT when it died
+// econQATest): a vanished tracked missile reads as an INTERCEPT when it died
 // with real flight time left. Fixes three v1 gaps:
 //   · terminal-dive intercepts (pr .85–1.0) were missed by the fixed
 //     pr<.85 cutoff — now estimated remaining flight (progress/rate) must
@@ -14738,7 +14738,9 @@ window.audioTest = function (playAll) {
 function _tensionName(t) { return t >= .5 ? 'war' : (t > 0 ? 'foreign-war' : 'peace'); }
 
 // ════════════════════════════════════════════════════════════════
-// TASK-504 PROBE: qaTest() — economy+sound mastery self-checks.
+// TASK-504 PROBE: econQATest() — economy+sound mastery self-checks.
+//   (Named econQATest, NOT qaTest — six Phase-5 mastery probes would
+//    collide on window.qaTest at merge. Navy's probe is navalQATest.)
 //   · constants spread (src/econ/constants.js → GAME_CONSTANTS)
 //   · no-alloc haversine equivalence + zero Vector3 churn in the scan
 //   · credit-cap exact boundary + bond epoch reset (FINISH items)
@@ -14747,10 +14749,10 @@ function _tensionName(t) { return t >= .5 ? 'war' : (t > 0 ? 'foreign-war' : 'pe
 //   · bgm pattern tables + rotation (FINISH item)
 //   · mixer clamps + persistence round-trip
 // All mutations are save/restore-synchronous (TASK-404 probe pattern);
-// safe to run mid-game. qaTest(true) additionally measures econScanFrame
+// safe to run mid-game. econQATest(true) additionally measures econScanFrame
 // at synthetic scale (20 ports/cities/factories) with a Vector3 counter.
 // ════════════════════════════════════════════════════════════════
-window.qaTest = function (perf) {
+window.econQATest = function (perf) {
     const C = GAME_CONSTANTS;
     const out = { when: new Date().toISOString(), checks: [], perf: null, pass: true };
     const chk = (name, ok, info) => {
@@ -14914,7 +14916,7 @@ window.qaTest = function (perf) {
         chk('mixer: clamps [0,1] + localStorage round-trip', clamped && restored);
     }
 
-    // 9) perf at synthetic scale (qaTest(true)): 20 ports/cities/factories
+    // 9) perf at synthetic scale (econQATest(true)): 20 ports/cities/factories
     //    × 50 forced scans with the Vector3 construction counter.
     if (perf && typeof structs !== 'undefined') {
         const savedStructs = structs.slice();
@@ -14946,8 +14948,8 @@ window.qaTest = function (perf) {
         }
     }
 
-    console.log(`[qaTest] ${out.checks.filter(c => c.ok).length}/${out.checks.length} checks ${out.pass ? 'PASS ✅' : 'FAIL ❌'}`);
-    window.__qaTestLog = (window.__qaTestLog || []).concat([{ at: out.when, pass: out.pass }]);
+    console.log(`[econQATest] ${out.checks.filter(c => c.ok).length}/${out.checks.length} checks ${out.pass ? 'PASS ✅' : 'FAIL ❌'}`);
+    window.__econQATestLog = (window.__econQATestLog || []).concat([{ at: out.when, pass: out.pass }]);
     return out;
 };
 
