@@ -5,41 +5,41 @@ import { ECON_CONSTANTS } from '../econ/constants.js';
 
 export const MCFG={
  /* SCUD-B: صاروخ باليستي سوفيتي بطيء بدقة ضعيفة جداً - حقيقي */
- scud:       {name:'سكود SCUD-B',      cost:80,  spd:3.8, acc:.06, grav:.10, drag:.002, dmg:60,  rad:80,  col:'#88ff44',trl:'#ccff99',arc:340,type:'ballistic',
-               samEvade:.05, civsEvade:.03, piercing:false, spinTrail:true, suppress:1, devMul:1.0},
+ scud:       {name:'سكود SCUD-B',      cost:80,  spd:3.8, acc:.06, dmg:60,  rad:80,  col:'#88ff44',trl:'#ccff99',type:'ballistic',
+               samEvade:.05, suppress:1, devMul:1.0},
  /* SRBM: أسرع وأدق من السكود بمسار باليستي عالٍ */
- ballistic:  {name:'باليستي SRBM',     cost:130, spd:5.5, acc:.14, grav:.075,drag:.001, dmg:110, rad:82,  col:'#4488ff',trl:'#aaccff',arc:420,type:'ballistic',
-               samEvade:.12, civsEvade:.05, piercing:false, spinTrail:false, devMul:1.0},
+ ballistic:  {name:'باليستي SRBM',     cost:130, spd:5.5, acc:.14, dmg:110, rad:82,  col:'#4488ff',trl:'#aaccff',type:'ballistic',
+               samEvade:.12, devMul:1.0},
  /* BGM-109C: طيران منخفض بطيء لكن دقيق - يتحاشى الرادار */
- cruise:     {name:'كروز BGM-109C',    cost:190, spd:4.8, acc:.35, grav:.015,drag:.004, dmg:100, rad:60,  col:'#ff9900',trl:'#ffcc77',arc:45, type:'cruise',
-               samEvade:.28, civsEvade:.22, piercing:false, hugsGround:true, devMul:0.8},
+ cruise:     {name:'كروز BGM-109C',    cost:190, spd:4.8, acc:.35, dmg:100, rad:60,  col:'#ff9900',trl:'#ffcc77',type:'cruise',
+               samEvade:.28, devMul:0.8},   /* low-flyer: maxArc pinned in Missile.update by type */
  /* CBU-97: انتشار عنقودي واسع - دقة منخفضة لكن تغطية كبيرة */
- cluster:    {name:'عنقودي CBU-97',    cost:240, spd:5.2, acc:.15, grav:.065,drag:.002, dmg:45,  rad:200, col:'#ffaa00',trl:'#ffdd88',arc:280,type:'cluster',
-               samEvade:.08, civsEvade:.04, piercing:false, scatterCount:10, troopMul:3.2, devMul:1.3},
+ cluster:    {name:'عنقودي CBU-97',    cost:240, spd:5.2, acc:.15, dmg:45,  rad:200, col:'#ffaa00',trl:'#ffdd88',type:'cluster',
+               samEvade:.08, scatterCount:8, troopMul:3.2, devMul:1.3},   /* scatterCount: bomblets per impact (WARHEADS.cluster + split FX read it) */
  /* EMP AGM-84H: يشل الإلكترونيات - لا يدمر مادياً */
- emp:        {name:'EMP AGM-86B',      cost:300, spd:4.5, acc:.25, grav:.025,drag:.003, dmg:8,   rad:260, col:'#00ffcc',trl:'#99ffee',arc:180,type:'emp',
-               samEvade:.20, civsEvade:.18, piercing:false, empRadius:320, empTime:600, devMul:0.4},
+ emp:        {name:'EMP AGM-86B',      cost:300, spd:4.5, acc:.25, dmg:8,   rad:260, col:'#00ffcc',trl:'#99ffee',type:'emp',
+               samEvade:.20, empRadius:320, empTime:600, devMul:0.4},   /* empTime in frames (600 = 10s) */
  /* BGM-109A Tomahawk: أكثر دقة وأسرع من الكروز العادي */
- tomahawk:   {name:'توماهوك BGM-109A', cost:350, spd:5.8, acc:.52, grav:.012,drag:.0045,dmg:150, rad:65,  col:'#00ddff',trl:'#88eeff',arc:38, type:'cruise',
-               samEvade:.35, civsEvade:.30, piercing:false, hugsGround:true, devMul:0.8},
+ tomahawk:   {name:'توماهوك BGM-109A', cost:350, spd:5.8, acc:.52, dmg:150, rad:65,  col:'#00ddff',trl:'#88eeff',type:'cruise',
+               samEvade:.35, devMul:0.8},
  /* FAE/Thermobaric: بطيء لكن انفجار هائل بموجة ضغط */
- thermobaric:{name:'ثيرموباريك TOS-1', cost:420, spd:3.5, acc:.12, grav:.085,drag:.0012,dmg:280, rad:185, col:'#ff2200',trl:'#ff8866',arc:320,type:'thermobaric',
-               samEvade:.04, civsEvade:.03, piercing:false, pressureWave:true, troopMul:1.5, devMul:1.8},
+ thermobaric:{name:'ثيرموباريك TOS-1', cost:420, spd:3.5, acc:.12, dmg:280, rad:185, col:'#ff2200',trl:'#ff8866',type:'thermobaric',
+               samEvade:.04, troopMul:1.5, devMul:1.8},
  /* JASSM-ER: شبحي يراوغ الدفاعات - طيران منخفض */
- stealth_m:  {name:'شبحي JASSM-ER',   cost:480, spd:5.5, acc:.38, grav:.016,drag:.003, dmg:190, rad:65,  col:'#445566',trl:'#556677',arc:48, type:'stealth',
-               samEvade:.62, civsEvade:.55, piercing:false, hugsGround:true, stealthRCS:true, devMul:0.8},
+ stealth_m:  {name:'شبحي JASSM-ER',   cost:480, spd:5.5, acc:.38, dmg:190, rad:65,  col:'#445566',trl:'#556677',type:'stealth',
+               samEvade:.62, devMul:0.8},   /* stealth type = radar-invisible to ALL defense scans (Structure.update + interceptor drones) */
  /* GBU-28: خارق للتحصينات سريع وثقيل */
- bunker_bust:{name:'خارق GBU-28',      cost:560, spd:9.5, acc:.42, grav:.04, drag:.002, dmg:420, rad:48,  col:'#cc4400',trl:'#ff9955',arc:260,type:'ballistic',
-               samEvade:.15, civsEvade:.08, piercing:true, pierceDmg:2.6, devMul:0.7},
+ bunker_bust:{name:'خارق GBU-28',      cost:560, spd:9.5, acc:.42, dmg:420, rad:48,  col:'#cc4400',trl:'#ff9955',type:'ballistic',
+               samEvade:.15, pierceDmg:2.6, devMul:0.7},
  /* Zircon/HGV: فرط صوتي حقيقي - سرعة هائلة لا يمكن اعتراضه */
- hyper:      {name:'فرط صوتي 3M22',    cost:650, spd:22,  acc:.55, grav:.005,drag:.00015,dmg:220,rad:110, col:'#ff22aa',trl:'#ff99ee',arc:200,type:'hyper',
-               samEvade:.88, civsEvade:.82, piercing:true, plasmaSheath:true, shockwave:true, devMul:1.1},
+ hyper:      {name:'فرط صوتي 3M22',    cost:650, spd:22,  acc:.55, dmg:220,rad:110, col:'#ff22aa',trl:'#ff99ee',type:'hyper',
+               samEvade:.88, plasmaSheath:true, devMul:1.1},   /* hyper type = skipped by defense scans (too fast to lock) */
  /* ICBM R-36: عابر قاري ضخم - مسار بالستي عالٍ جداً */
- icbm:       {name:'ICBM R-36M',       cost:1000,spd:12,  acc:.32, grav:.05, drag:.0003,dmg:560, rad:260, col:'#ff8800',trl:'#ffcc88',arc:650,type:'ballistic',
-               samEvade:.55, civsEvade:.45, piercing:false, mirv:false, reentryFlash:true, devMul:1.2},
+ icbm:       {name:'ICBM R-36M',       cost:1000,spd:12,  acc:.32, dmg:560, rad:260, col:'#ff8800',trl:'#ffcc88',type:'ballistic',
+               samEvade:.55, reentryFlash:true, devMul:1.2},   /* MIRV split at progress>0.7: 3 RVs × 0.55 dmg (Missile.update) */
  /* نووي تكتيكي W80: تدمير شامل + EMP */
- nuke_tac:   {name:'نووي تكتيكي W80',  cost:2000,spd:5.5, acc:.15, grav:.032,drag:.001, dmg:750, rad:360, col:'#ffffff',trl:'#aaffaa',arc:440,type:'nuke',
-               samEvade:.72, civsEvade:.65, piercing:true, empRadius:500, empTime:420, nuclearBlast:true, devMul:2.0},
+ nuke_tac:   {name:'نووي تكتيكي W80',  cost:2000,spd:5.5, acc:.15, dmg:750, rad:360, col:'#ffffff',trl:'#aaffaa',type:'nuke',
+               samEvade:.72, empRadius:500, empTime:420, devMul:2.0},
 };
 /* ── WARHEAD ROLE TABLE (TASK-204 balance audit — 2026-09-19) ──
  * BEFORE → AFTER (cost / dmg / key identity change):
@@ -58,22 +58,23 @@ export const MCFG={
  * samEvade (was DEAD) is now the evade stat: ONE flare/chaff dodge vs the
  * FIRST interceptor of each flight (consumed on roll, win or lose). */
 
-/* ── MTAGS (TASK-403): short tooltip tags per warhead, synced to the
- * TASK-204/403 balance numbers. WIRED into the missile-mode HUD chips
- * (title attr — hover a chip in [R] mode). 4 tags each, Arabic. ── */
+/* ── MTAGS (TASK-403, final-balance pass TASK-503): short tooltip tags per
+ * warhead, EVERY number verified against the live MCFG + code paths
+ * (WARHEADS table / Missile.update / defense scans). Wired into the
+ * missile-mode HUD chips (title attr — hover a chip in [R] mode). ── */
 export const MTAGS={
- scud:       ['رخيص $80 — أرخص ضربة','رعب: يصدم إعادة التعبئة','دقة ضعيفة ±16كم','يكشفه الرادار بسهولة'],
- ballistic:  ['حصان العمل $130/110','أفضل ضرر لكل دولار','دقة متوسطة','مسار باليستي عالٍ'],
- cruise:     ['دقة عالية','يحلق على 50م','يتفادى 28% من SAM','دقيق ضد الأهداف المفردة'],
- cluster:    ['8 قنابل فرعية','يفتّت المشاة ×3.2','تغطية 200م واسعة','دقة منخفضة — للمجموعات'],
+ scud:       ['رخيص $80 — أرخص ضربة','رعب: يصدم إعادة التعبئة','دقة ضعيفة ±16كم','بطيء — يكشفه الرادار بسهولة'],
+ ballistic:  ['حصان العمل $130/110','أفضل ضرر لكل دولار','دقة متوسطة ±15كم','مسار باليستي عالٍ'],
+ cruise:     ['دقة عالية 35%','طيران منخفض يتفادى الرادار','يراوغ أول اعتراض 28%','دقيق ضد الأهداف المفردة'],
+ cluster:    ['8 قنابل فرعية','يفتّت المشاة ×3.2','تغطية واسعة 200كم','دقة منخفضة — للمجموعات'],
  emp:        ['يشل الإلكترونيات 10ث','يعطل SAM والرادار والسلسلة','ضرر مادي شبه معدوم','افتح به هجومك'],
- tomahawk:   ['أدق صاروخ (دقة 52%)','مسار منخفض جداً 35م','يتفادى 35% من الاعتراض','دقيق لكنه غالٍ'],
+ tomahawk:   ['أدق صاروخ (دقة 52%)','طيران منخفض تحت الرادار','يراوغ أول اعتراض 35%','دقيق لكنه غالٍ'],
  thermobaric:['موجة ضغط 280 هائلة','أعمق تخريب للأرض ×1.8','يحرق المشاة ×1.5','بطيء — قابل للاعتراض'],
- stealth_m:  ['غير مرئي للرادار','يتفادى 62% من الاعتراض','مسار 35م من الأرض','سلاح اختراق الدفاعات'],
- bunker_bust:['×2.6 ضد التحصينات','يخترق 6م باطون','ضرر 420 هائل','سلاح كسر الحصار'],
- hyper:      ['ماخ 6+ — لا يُعترض','يتفادى 88% من الدفاعات','غلاف بلازما متوهج','أغنى سرعة بأغلى سعر'],
- icbm:       ['MIRV: 3 رؤوس ×55%','مدى عابر للقارات','انتشار واسع للرؤوس','يتفادى 55% من الدفاعات'],
- nuke_tac:   ['انفجار نووي 750','EMP عميق 7 ثوان','يتفادى 72% من الدفاعات','نهاية اللعبة — غالٍ جداً'],
+ stealth_m:  ['غير مرئي لرادارات العدو','الدفاعات لا تراه أصلاً','دقة عالية 38%','سلاح اختراق الدفاعات'],
+ bunker_bust:['×2.6 ضد التحصينات','خارق — يكسر القباب والقواعد','ضرر 420 هائل','سلاح كسر الحصار'],
+ hyper:      ['ماخ 6+ — لا يُعترض','أسرع من أي رادار قفل','غلاف بلازما متوهج','أغلى سرعة بأغلى سعر'],
+ icbm:       ['MIRV: 3 رؤوس ×55%','مدى عابر للقارات','انتشار واسع للرؤوس','يراوغ أول اعتراض 55%'],
+ nuke_tac:   ['انفجار نووي 750','EMP عميق 7 ثوان','يراوغ أول اعتراض 72%','نهاية اللعبة — غالٍ جداً'],
 };
 
 /* ── TASK-401: PCFG v2 — role defaults + per-type specs ──
@@ -180,7 +181,6 @@ export const TCFG={
 export const GAME_CONSTANTS = {
   RESOURCE_TICK: 0.2,
   AI_TICK_RATE: 200,
-  BASE_SPEED_MULTIPLIER: 0.00015,   // legacy (unused — missiles are distance-aware now)
   // Missile speed = cfg.spd × MISSILE_SPEED_KM_S in km/SECOND; flight time
   // scales with DISTANCE. ballistic 5.5→248km/s (~8s per 2000km), icbm→540km/s.
   // (90 was too fast per playtest — halved so flights are visible.)
