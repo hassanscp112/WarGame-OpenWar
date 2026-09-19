@@ -548,3 +548,30 @@ html, body {
 #cursorHud.m-build { color: #4da3ff; }
 #cursorHud.m-missile { color: #ff8800; }
 #cursorHud.m-missile .ch-ring { opacity: 0.6; stroke-dasharray: 4 3.5; }
+
+/* ── TASK-301: economy income breakdown tooltip (hover 💰 / 📈) ── */
+#econTip {
+    position: fixed; top: 54px; left: 12px; z-index: 12000;
+    direction: rtl; text-align: right;
+    background: rgba(8, 14, 12, 0.96);
+    border: 1px solid var(--accent, #00ff88); border-radius: 10px;
+    padding: 10px 12px; min-width: 235px; max-width: 300px;
+    font-size: 11px; line-height: 1.6; color: #cfe6dd;
+    pointer-events: none; opacity: 0; transform: translateY(-6px);
+    transition: opacity .15s, transform .15s;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, .55);
+}
+#econTip.show { opacity: 1; transform: translateY(0); }
+#econTip .etRow { display: flex; justify-content: space-between; gap: 14px; white-space: nowrap; }
+#econTip .etRow span:last-child { color: #9fe8b0; font-variant-numeric: tabular-nums; }
+#econTip .etTrade span:last-child { color: #8cd0ff; }
+#econTip .etMile span:last-child { color: var(--gold, #ffd700); }
+#econTip .etDrain span:last-child { color: #ff9b9b; }
+#econTip .etSep { height: 1px; background: rgba(255, 255, 255, .12); margin: 6px 0; }
+#econTip .etNet {
+    margin-top: 4px; font-weight: bold; color: #00ff88;
+    border-top: 1px solid rgba(255, 255, 255, .12); padding-top: 5px;
+}
+#econTip .etNet.etNeg { color: #ff5555; }
+#econTip .etBlk { color: #ff7755; font-weight: bold; margin-top: 4px; }
+#econTip .etMiles { color: var(--gold, #ffd700); font-size: 10px; opacity: .9; margin-top: 4px; }

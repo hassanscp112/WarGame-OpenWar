@@ -172,6 +172,33 @@ export const GAME_CONSTANTS = {
   WARSHIP_PATROL_RADIUS_KM: 350,    // wander radius around the clicked patrol point
   WARSHIP_HEAL_RATE: 4,             // HP/sec repaired near own port
   WARSHIP_HEAL_RANGE_KM: 400,       // 'near own port' distance
+  // ── TASK-301: Economy Depth ──
+  // 1) WAR UPKEEP: standing armies above the free threshold drain gold/sec.
+  //    Counts home troops + cohorts in the field. Makes booming vs fighting
+  //    a real economic trade-off (armies that sit still cost money).
+  WAR_UPKEEP_FREE_TROOPS: 25000,   // troops below this cost nothing
+  WAR_UPKEEP_PER_K: 0.02,         // gold/sec per 1000 troops above the threshold
+  // 2) BLOCKADE: enemy warship parked within this radius of YOUR port seals
+  //    it — no trade ships spawn from it while blocked (READ-ONLY scan of
+  //    warships[]; the navy agent owns the class).
+  BLOCKADE_RADIUS_KM: 350,
+  // 3) SYNERGY: adjacency bonuses between structures (shown in selection
+  //    panel + income tooltip).
+  SYNERGY_RANGE_KM: 420,          // max distance for a synergy link
+  SYNERGY_FACTORY_CITY: 0.30,     // factory output +30% per linked city (cap 3)
+  SYNERGY_PORT_CITY_INCOME: 0.05, // gold/sec per port↔city link (throughput)
+  // 4) MILESTONES: one-time bonuses at territory/army thresholds. All sides
+  //    (player + bots) earn them. `cells` uses the conquest grid in mode 1
+  //    (mode 2 falls back to owned cities × 800). Thresholds calibrated vs
+  //    real growth curves (army hits ~220k by 2 min, ~450k by 10 min; cells
+  //    ~22/s): regional ≈2 min, industry ≈5-6 min, superpower ≈10 min.
+  ECON_MILESTONES: [
+    { id:'regional',   icon:'🏙️', name:'قوة إقليمية',  cells:2500,   rewardGold:300,  incomeMul:1.00 },
+    { id:'grand_army', icon:'🎖️', name:'جيش عظيم',     troops:300000,  rewardGold:250,  incomeMul:1.00 },
+    { id:'industry',   icon:'🏭', name:'ثورة صناعية',  cells:5000,   rewardGold:0,    incomeMul:1.10 },
+    { id:'war_econ',   icon:'⚔️', name:'اقتصاد حربي',  troops:450000, rewardGold:0,    incomeMul:1.10 },
+    { id:'superpower', icon:'🌍', name:'قوة عظمى',      cells:7000,   rewardGold:1500, incomeMul:1.00 },
+  ],
   // ── Win conditions (mode 1) ──
   WIN_LAND_PERCENT: 0.8,            // OpenFront FFA: own 80% of the land → victory
   WIN_TIME_LIMIT_S: 10200,          // 170-minute hard limit → draw (OpenFront)
