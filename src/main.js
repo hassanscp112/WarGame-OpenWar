@@ -3043,6 +3043,44 @@ window.__ffaProbe = {
         return { dev: +conquestGrid.devastationAt(c).toFixed(2) };
     },
     devAt: (lat, lon) => conquestGrid ? +conquestGrid.devastationAt(conquestGrid.latLonToCell(lat, lon)).toFixed(2) : 'no grid',
+    // REAL conquest-rate measurement: launch an attack with N troops at nearby
+    // neutral land, report cells gained per second over `secs`.
+    // Returns a handle; call conquestRateResult() after the wait.
+    conquestRateTest: (troops, secs = 8) => {
+        if (!conquestGrid || !conquestCtx) return 'no grid';
+        const me = myRole;
+        const myCode = me === 'player' ? CONQUEST_CFG.PLAYER : CONQUEST_CFG.ENEMY;
+        // find ANY owned cell (strided scan — player may be anywhere)
+        let src = null;
+        const owner = conquestGrid.owner;
+        for (let cell = 0; cell < owner.length; cell += 37) {
+            if (owner[cell] === myCode) {
+                const ll = conquestGrid.cellToLatLon(cell);
+                src = ll; break;
+            }
+        }
+        if (!src) return 'no owned cell for source';
+        // target: neutral land near the source (offset south 12°, clamped)
+        const tLat = Math.max(-60, Math.min(60, src.lat - 12));
+        const tLon = src.lon + 8 > 180 ? src.lon - 8 : src.lon + 8;
+        const atk = new ConquestAttack({
+            grid: conquestGrid, owner: me, target: 'neutral',
+            troops, srcLat: src.lat, srcLon: src.lon, dstLat: tLat, dstLon: tLon, ctx: conquestCtx,
+        });
+        if (!atk.active) return 'attack aborted (no frontier)';
+        activeAttacks.push(atk);
+        const c0 = conquestGrid.countCells(me);
+        window.__rateT = { atk, c0, t0: performance.now(), troops };
+        return { started: true, troops, cellsBefore: c0, src: [Math.round(src.lat), Math.round(src.lon)] };
+    },
+    conquestRateResult: () => {
+        const t = window.__rateT; if (!t) return null;
+        const secs = (performance.now() - t.t0) / 1000;
+        const gained = conquestGrid.countCells(t.atk.owner) - t.c0;
+        return { troops: t.troops, secs: +secs.toFixed(1), cellsGained: gained,
+                 cellsPerSec: Math.round(gained / Math.max(1, secs)), attackAlive: t.atk.active };
+    },
+    setTroops: (n) => { conquestCtx.addTroops('player', n - conquestCtx.getTroops('player')); return Math.round(conquestCtx.getTroops('player')); },
     // fire a missile at LAND (devastation target test) — Arabia
     fireTestMissileLand: (key) => {
         const cfg = MCFG[key] || MCFG['ballistic'];

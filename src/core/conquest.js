@@ -85,7 +85,7 @@ export const CONQUEST_CFG = {
   // ── Tick throttle: run attack logic every N game frames (6 frames ≈ 10 ticks/sec) ──
   TICK_INTERVAL: 6,
   // Max cells a single attack may conquer in one tick (safety cap)
-  MAX_CELLS_PER_TICK: 12,
+  MAX_CELLS_PER_TICK: 12,   // BASE cap — attack Troops scale it up (see ConquestAttack.tick)
 };
 
 // ── Owner code ↔ string helpers ──
@@ -1150,16 +1150,15 @@ export function attackLogic(grid, attackTroops, attackerStr, defenderStr, cell, 
   } else {
     // vs neutral wilderness — OpenFront: bots expand at HALF the human cost
     // (attackerTroopLoss: bot ? mag/10 : mag/5).
-    // TASK-102 TROOP-SCALE: neutral expansion speed now scales with force
-    // commitment via sqrt (soft) instead of the old hard min(…,100) ceiling
-    // where 100 troops and 100,000 troops expanded at the SAME rate.
-    const forceScale = Math.sqrt(Math.max(1, attackTroops) / 100);
-    // TASK-102: big forces also lose FEWER troops per tile (economy of force).
+    // TASK-102: per-tile COST is INVERSE with force (a big army steamrolls
+    // cheaply, floor 5) — the BUDGET scaling lives in attackTilesPerTickCtx
+    // and the dynamic cap in ConquestAttack.tick. (My first attempt scaled
+    // cost UP with troops — one tile ate the whole budget: 1 cell/tick.)
     const forceEff = Math.max(0.45, 1 / (1 + Math.log10(Math.max(1, attackTroops / 500)) * 0.5));
     return {
       attackerTroopLoss: ((attackerStr === 'enemy' || isBot(attackerStr)) ? mag / 10 : mag / 5) * forceEff,
       defenderTroopLoss: 0,
-      tilesPerTickUsed: Math.min(100, (20 * Math.max(10, speed)) * forceScale * devSpeed),
+      tilesPerTickUsed: within((2000 * Math.max(10, speed)) / Math.max(1, attackTroops), 5, 100) * devSpeed,
     };
   }
 }
@@ -1177,9 +1176,9 @@ export function attackTilesPerTickCtx(grid, attackTroops, defenderStr, defenderT
   }
   // TASK-102 TROOP-SCALE (neutral): tile rate now scales with committed force
   // via sqrt — was a flat numAdjacent×2 where 100 and 100,000 troops were
-  // identical. 10k troops ≈ 10× faster expansion (capped by MAX_CELLS_PER_TICK).
+  // identical.
   const forceScale = Math.sqrt(Math.max(1, attackTroops) / 1000);
-  return numAdjacentEnemyCells * 2 * Math.min(10, forceScale);
+  return numAdjacentEnemyCells * 2 * Math.min(6, forceScale);
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1398,7 +1397,14 @@ _enqueueTargetCell(attackerCell, targetCell) {
     const defenderTroops = this.ctx.getTroops(this.target);
     const numAdjacent = Math.min(this.border.size, 40) + this._nextInt(0, 5);
     let numTilesThisTick = attackTilesPerTickCtx(grid, this.troops, this.target, defenderTroops, numAdjacent);
-    numTilesThisTick = Math.min(numTilesThisTick, cfg.MAX_CELLS_PER_TICK);
+    // TASK-102 v2: DYNAMIC per-tick cap — the old flat MAX_CELLS_PER_TICK=12
+    // ate ALL troop scaling above ~2k troops (everything capped at the same
+    // 12 cells/tick = "no matter how many troops, it's the same"). Now a big
+    // commitment visibly conquers faster: cap grows with sqrt(troops),
+    // ~3× base at 10k, 5× at 25k+ (soft, still bounded for perf).
+    const capScale = 1 + Math.min(4, Math.sqrt(Math.max(0, this.troops - 500) / 1500));
+    const dynamicCap = Math.round(cfg.MAX_CELLS_PER_TICK * capScale);
+    numTilesThisTick = Math.min(numTilesThisTick, dynamicCap);
 
     let processed = 0;
     while (numTilesThisTick > 0) {
@@ -1440,7 +1446,7 @@ _enqueueTargetCell(attackerCell, targetCell) {
       this._addNeighbors(cell);
 
       processed++;
-      if (processed >= cfg.MAX_CELLS_PER_TICK) break;
+      if (processed >= dynamicCap) break;
 
       // check elimination
       if (this.target !== 'neutral' && grid.countCells(this.target) < cfg.ELIMINATION_CELL_THRESHOLD) {
