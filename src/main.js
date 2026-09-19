@@ -12602,6 +12602,7 @@ window.droneTest = function () {
     const res = { part1_kamikaze: {}, part2_interceptor: {} };
     // ── Part 1: kamikaze drone spawns, acquires, strikes, KILLS ──
     const flak = new Structure(30, 30, 'flak', 'enemy');   // hp 80 < kamikaze dmg 95
+    structs.push(flak);
     const drone = new Drone(28.6, 28.6, 'kamikaze', 'player', { homeLat: 28.6, homeLon: 28.6 });
     res.part1_kamikaze.meshBuilt = !!(drone.mesh && drone.mesh.children.length > 0);
     // Target-hook design: restrict acquisition to the probe target ONLY
@@ -12626,9 +12627,9 @@ window.droneTest = function () {
     while (s2++ < 900 && !threat.dead) {
         frame++;
         ix.update();
+        if (missiles.some(x => x.isSAM && x.tgt === threat)) fired = true;   // check BEFORE compaction
         for (const mm of missiles) if (!mm.dead) mm.update();
         missiles = missiles.filter(mm => !mm.dead);
-        if (missiles.some(x => x.isSAM && x.tgt === threat)) fired = true;
     }
     const intercepted = threat.dead && threat.progress < 0.9;
     res.part2_interceptor = { fired, threatDead: threat.dead, intercepted, progressAtDeath: +threat.progress.toFixed(2), chargesLeft: ix.charges };
@@ -12643,6 +12644,8 @@ window.droneTest = function () {
         flak.accents.forEach(m => m.dispose());
         if (flak.selRing && flak.selRing.material) flak.selRing.material.dispose();
     }
+    const fi = structs.indexOf(flak);
+    if (fi >= 0) structs.splice(fi, 1);   // remove probe struct
     const pass = res.part1_kamikaze.engaged && res.part1_kamikaze.killed && res.part2_interceptor.intercepted;
     console.log('[droneTest]', res);
     logEvent(`[droneTest] ${pass ? 'PASS ✅' : 'FAIL ❌'} — كاميكازي: اشتبك=${engaged} قتل=${flak.dead} · صائدة: أطلقت=${fired} اعترضت=${intercepted}`, pass ? 'info' : 'err');
@@ -12671,7 +12674,10 @@ window.samTest = function () {
         _killMissile(tA);
         missiles = missiles.filter(m => !m.dead);
         // B) radar covering the threat → chain lock → FIRES
+        //    (Structure ctor does NOT self-register — push to structs so the
+        //     radar chain scan can see it, then splice it out on cleanup)
         const radar = new Structure(21.5, 20, 'radar', 'player');
+        structs.push(radar);
         const tB = mkThreat();
         for (let i = 0; i < 10; i++) { frame++; sam.update(); }
         res.B_chain_lock = missiles.some(x => x.isSAM && x.tgt === tB);
@@ -12686,6 +12692,8 @@ window.samTest = function () {
         res.C_emp_dark = !missiles.some(x => x.isSAM && x.tgt === tC);
         _killMissile(tC);
         missiles = missiles.filter(m => !m.dead);
+        const ri = structs.indexOf(radar);
+        if (ri >= 0) structs.splice(ri, 1);
         _cleanupStruct(radar);
         // D) EMP'd SAM itself → cannot scan at all (even inside base range)
         sam.reload = 0; sam.empT = 30;
