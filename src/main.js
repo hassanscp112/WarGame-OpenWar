@@ -14884,9 +14884,9 @@ window.qaTest = function (perf) {
         // patterns; war tension swaps in the tension-heavy sequence.
         const seen = new Set();
         const svT = SFX._tension; SFX._tension = 0;
-        for (let f = 0; f < 192; f++) { if (SFX._bgmPat(f)) seen.add(f >> 5); }
+        for (let f = 0; f < 192; f++) { if (SFX._bgmPat(f)) seen.add(SFX.BGM_SEQ_PEACE[Math.floor(f / 32) % 6]); }   // pattern idx per 2-bar slot
         SFX._tension = .7;
-        const warPat = SFX._bgmPat(128);   // war seq slot 4 → tension (heartbeat array)
+        const warPat = SFX._bgmPat(96);   // war seq [0,2,1,2,1,2] slot 3 → tension (heartbeat array)
         SFX._tension = svT;
         ok = ok && seen.size === 3 && Array.isArray(warPat);
         chk('bgm: 3 sane patterns + rotation + war weighting', ok,
