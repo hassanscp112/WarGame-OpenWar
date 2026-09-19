@@ -629,6 +629,10 @@ html, body {
 #pFuel.lowFuel + .fBarWrap .fFill { background: #ff5533; }
 @keyframes econFuelBlink { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 
+/* 🏦 debt badge inside the gold stat (observer-driven — econBus 'debt') */
+#econDebt { color: #ff8f6b; font-size: 10px; font-weight: 800; margin-inline-start: 5px;
+    white-space: nowrap; text-shadow: 0 0 6px rgba(255, 80, 40, .5); }
+
 /* 🏦 black-market panel (key K) */
 #econMkt {
     position: fixed; bottom: 86px; left: 14px; z-index: 60;

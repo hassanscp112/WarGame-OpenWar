@@ -12490,6 +12490,25 @@ function econBusPublish() {
     emit('debt', L && L.owed > 0 ? Math.ceil(L.owed) : 0);
 }
 
+// Debt badge inside the gold stat — the flagship econBus subscriber
+// (TASK-404 observer pattern: this UI is NEVER written from updateHUD;
+// it only ever changes when the published 'debt' value changes).
+function _econDebtBadge(v) {
+    let b = document.getElementById('econDebt');
+    if (!v) { if (b) b.style.display = 'none'; return; }
+    if (!b) {
+        const g = document.getElementById('pGold');
+        const host = (g && g.closest && g.closest('.stat')) || document.body;
+        b = document.createElement('span');
+        b.id = 'econDebt';
+        host.appendChild(b);
+    }
+    b.style.display = '';
+    b.textContent = `🏦$${v}`;
+    b.title = `دين قائم $${v} — يُسدد تلقائياً من الدخل`;
+}
+econBus.on('debt', _econDebtBadge);
+
 // ── Dirty-flag DOM writes: updateHUD fires from ~20 call sites + the HUD
 //    cadence — most textContent/style writes are redundant. Per-element
 //    keyed cache skips identical writes entirely (OPTIMIZE item).
@@ -13128,18 +13147,83 @@ window.economyTest = function(followSec) {
         chk('milestone defs sane (unique ids, thresholds, mul ≥ 1)', sane, [...ids].join(','));
     }
     // blockade distance logic — synthetic warship pushed & popped synchronously
-    // (no frame can interleave; the real warships[] is untouched afterwards)
+    // (no frame can interleave; the real warships[] is untouched afterwards).
+    // TASK-404: isPortBlockaded reads the 30f war cache — force a rebuild
+    // between mutations by rewinding _warFrame (saved + restored around it).
     {
-        const fakePort = { lat: 30, lon: 30, owner: 'player' };
-        const fakeShip = { dead: false, owner: 'enemy', lat: 30, lon: 30 };
-        warships.push(fakeShip);
-        const near = isPortBlockaded(fakePort);
+        // The cache is built from structs+warships — push BOTH fakes, and use
+        // a REAL hostile side ('enemy' only exists in 1v1; FFA uses bot strs).
+        const hostile = bots.length ? bots[0].str : 'enemy';
+        const fakePort = { id: 'probe_blk_port', type: 'port', dead: false, lat: 30, lon: 30, owner: 'player' };
+        const fakeShip = { dead: false, owner: hostile, lat: 30, lon: 30 };
+        const savedWf = econState._warFrame;
+        structs.push(fakePort); warships.push(fakeShip);
+        econState._warFrame = -1e9; const near = isPortBlockaded(fakePort);
         fakeShip.lon = 40;                    // ≈1040km away — outside radius
-        const far = isPortBlockaded(fakePort);
+        econState._warFrame = -1e9; const far = isPortBlockaded(fakePort);
         fakeShip.lon = 30; fakeShip.owner = 'player';   // own ship never blocks
-        const own = isPortBlockaded(fakePort);
-        warships.pop();
-        chk('blockade: near✓ far✗ own✗', near === true && far === false && own === false, `R=${C.BLOCKADE_RADIUS_KM}km`);
+        econState._warFrame = -1e9; const own = isPortBlockaded(fakePort);
+        structs.pop(); warships.pop();
+        econState._warFrame = savedWf;        // live cache resumes untouched
+        chk('blockade: near✓ far✗ own✗ (30f cache)', near === true && far === false && own === false, `R=${C.BLOCKADE_RADIUS_KM}km vs ${hostile}`);
+    }
+
+    // ── A2. TASK-404 unit checks (fuel / loans / bonds / sanctions / refund) ──
+    // Probe sides ('probe404') are never in econFuelSides() → no live tick
+    // touches them; every mutation is saved + restored synchronously.
+    {
+        // fuel math (pure snapshot, per-second)
+        const f0 = econFuelRatesFromSnapshot({});
+        chk('fuel: base trickle', Math.abs(f0.income - C.ECON_FUEL_INCOME_BASE) < 1e-9 && f0.upkeep === 0, f0.income.toFixed(2) + '/s');
+        const f1 = econFuelRatesFromSnapshot({ openPorts: 3, factories: 2, planes: 4, tanks: 2, drones: 5 });
+        const expInc = C.ECON_FUEL_INCOME_BASE + 3 * C.ECON_FUEL_PER_PORT + 2 * C.ECON_FUEL_PER_FACTORY;
+        const expUp = 4 * C.ECON_FUEL_UPKEEP_PLANE + 2 * C.ECON_FUEL_UPKEEP_TANK + 5 * C.ECON_FUEL_UPKEEP_DRONE;
+        chk('fuel: income/upkeep parts', Math.abs(f1.income - expInc) < 1e-9 && Math.abs(f1.upkeep - expUp) < 1e-9,
+            `net ${f1.net.toFixed(2)}/s`);
+        // fuel spend gate (deducts on success, refuses when short)
+        const hadFuel = 'probe404' in econState.fuel;
+        const oldFuel = econState.fuel.probe404;
+        econState.fuel.probe404 = 30;
+        const s1 = econFuelSpend('probe404', 25, true);
+        const s2 = econFuelSpend('probe404', 10, true);
+        const s3 = econState.fuel.probe404 === 5;
+        if (hadFuel) econState.fuel.probe404 = oldFuel; else delete econState.fuel.probe404;
+        chk('fuel: spend gate deducts + refuses', s1 === true && s2 === false && s3 === true);
+        // drone-squad refund math (AUDIT #17)
+        chk('drone refund: unlaunched share returned',
+            _droneRefund(90, 2, 3) === 30 && _droneRefund(90, 3, 3) === 0 && _droneRefund(90, 0, 3) === 90);
+        // loan: amount + interest + credit cap (probe side — econResAdd no-ops)
+        delete econState.loans.probe404;
+        const t1 = econTakeLoan('probe404', true);
+        const L2 = econLoanOf('probe404');
+        const t2 = econTakeLoan('probe404', true), t3 = econTakeLoan('probe404', true);   // 3rd crosses the cap
+        const loanOk = t1 === true && t2 === true && t3 === false
+            && L2.principal === 2 * C.ECON_LOAN_AMOUNT
+            && Math.abs(L2.owed - 2 * C.ECON_LOAN_AMOUNT * C.ECON_LOAN_INTEREST) < 1e-9;
+        delete econState.loans.probe404;
+        chk('loan: +$800 @30% interest, credit-capped', loanOk);
+        // bond: refused outside a defensive war (probe side has no incoming war)
+        delete econState.bonds.probe404; delete econState.defWar.probe404;
+        const bondRefused = econTakeBond('probe404', true) === false;
+        delete econState.bonds.probe404; delete econState.defWar.probe404;
+        chk('bond: refused outside a defensive war', bondRefused);
+        // sanctions: synthetic war partners (saved + restored synchronously)
+        const svPairs = econState._warPairs, svWf2 = econState._warFrame;
+        econState._warPairs = ['probe404|a', 'probe404|b', 'probe404|c', 'x|y'];
+        const nPart = econWarPartnerCount('probe404');
+        const sanc = econSanctioned('probe404');
+        const notSanc = econSanctioned('x');
+        econState._warPairs = svPairs; econState._warFrame = svWf2;
+        chk('sanctions: ≥3 war partners → trade penalty', nPart === 3 && sanc === true && notSanc === false,
+            `threshold ${C.ECON_SANCTIONS_MIN_WARS}`);
+        // sparkline: rolling window — once full it stays at exactly 60
+        const svHist = econState.netHist;
+        econState.netHist = Array.from({ length: 60 }, (_, i) => i);   // full window [0..59]
+        econState.netHist.push(60);
+        if (econState.netHist.length > 60) econState.netHist.shift();  // same maintenance as econSecondTick
+        const cap60 = econState.netHist.length === 60 && econState.netHist[0] === 1 && econState.netHist[59] === 60;
+        econState.netHist = svHist;
+        chk('sparkline: rolling window holds 60 samples', cap60);
     }
 
     // ── B. live snapshot (if a game is running) ──
@@ -13502,6 +13586,7 @@ function runAI() {
         if (_resOf(riv) < DCFG[key].cost) continue;
         const T = tgts[Math.floor(Math.random() * tgts.length)];
         const P = pads[Math.floor(Math.random() * pads.length)];
+        if (!econFuelSpend(riv.str, GAME_CONSTANTS.ECON_FUEL_COST_DRONE, true)) continue;   // TASK-404: bots pay fuel too
         _spendRes(riv, DCFG[key].cost);
         launchDrone(riv.str, key, { lat: P.lat, lon: P.lon }, { homeLat: T.lat, homeLon: T.lon });
       }
@@ -13634,7 +13719,9 @@ function runAI() {
                         let ap = new Structure(bl, bo, 'airport', riv.str);
                         structs.push(ap);
                         _spendRes(riv, SDEFS['airport'].cost);
-                        planes.push(new Plane(ap.lat, ap.lon, PCFG['fighter'], riv.str));
+                        // TASK-404: the bundled starter fighter burns fuel like any deployment
+                        if (econFuelSpend(riv.str, GAME_CONSTANTS.ECON_FUEL_COST_PLANE, true))
+                            planes.push(new Plane(ap.lat, ap.lon, PCFG['fighter'], riv.str));
                     }
                 } else if (!hasNearbyPort && _resOf(riv) >= _enemyPortCost()) {
                     // OpenFront: ports drive the trade economy — snap to the nearest shore.
@@ -13675,8 +13762,9 @@ function runAI() {
                     let ap = new Structure(targetCity.lat + 0.1, targetCity.lon - 0.15, 'airport', 'enemy');
                     structs.push(ap);
                     eRes -= SDEFS['airport'].cost;
-                    // Give them a starting fighter
-                    planes.push(new Plane(ap.lat, ap.lon, PCFG['fighter'], 'enemy'));
+                    // Give them a starting fighter (TASK-404: burns fuel like any deployment)
+                    if (econFuelSpend('enemy', GAME_CONSTANTS.ECON_FUEL_COST_PLANE, true))
+                        planes.push(new Plane(ap.lat, ap.lon, PCFG['fighter'], 'enemy'));
                 }
             }
         }
@@ -13769,6 +13857,7 @@ function runAI() {
             if (!pool.length) continue;
             let total = pool.reduce((s, m) => s + m.w, 0), roll = Math.random() * total, pick = pool[0];
             for (const m of pool) { roll -= m.w; if (roll <= 0) { pick = m; break; } }
+            if (!econFuelSpend(riv.str, C.ECON_FUEL_COST_PLANE, true)) continue;   // TASK-404: bots pay fuel too
             planes.push(new Plane(apt.lat, apt.lon, PCFG[pick.k], riv.str));
             _spendRes(riv, PCFG[pick.k].cost);
         }
@@ -13790,7 +13879,8 @@ function runAI() {
                     const roll = Math.random();
                     const k = roll < 0.4 ? 'light' : roll < 0.8 ? 'medium' : 'heavy';
                     const cfg = TCFG[k];
-                    if (_resOf(riv) >= cfg.cost + 300) {
+                    if (_resOf(riv) >= cfg.cost + 300
+                        && econFuelSpend(riv.str, GAME_CONSTANTS.ECON_FUEL_COST_TANK, true)) {   // TASK-404: bots pay fuel too
                         // muster at the base, fan out to a spread holding point
                         // (the frontal re-aim below re-tasks them as the line moves)
                         spawnTankDivision(fac.lat, fac.lon, k, riv.str,
