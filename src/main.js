@@ -401,14 +401,18 @@ function latLonToVec3(lat, lon, r = EARTH_RADIUS, out = null) {
     );
 }
 
-function vec3ToLatLon(vec) {
+function vec3ToLatLon(vec, out = null) {
+    // TASK-503 OPTIMIZE: optional out-object (same pattern as latLonToVec3's
+    // audit-#22 out-vector) — hot paths (Missile/Drone update) pass a scratch
+    // and stay allocation-free; all other callers unchanged.
     const r = vec.length();
-    if(r < 0.001) return { lat: 0, lon: 0 };
+    if (r < 0.001) { if (out) { out.lat = 0; out.lon = 0; return out; } return { lat: 0, lon: 0 }; }
     const lat = 90 - (Math.acos(Math.max(-1, Math.min(1, vec.y / r))) * 180 / Math.PI);
     let lon = (Math.atan2(vec.z, -vec.x) * 180 / Math.PI) - 180;
     // Normalize to [-180, 180) — atan2 gives [-180,180], minus 180 gives [-360,0]
     lon = ((lon % 360) + 360) % 360;
     if (lon >= 180) lon -= 360;
+    if (out) { out.lat = lat; out.lon = lon; return out; }
     return { lat, lon };
 }
 
@@ -423,9 +427,16 @@ function CheckTargetInRange(lat1, lon1, lat2, lon2, maxRange) {
 }
 
 // Great Circle Distance using precise vector angle (alias for legacy checks)
+// TASK-503 OPTIMIZE: module-scratch vectors — this is the hottest function in
+// the game (defense scans call it O(structs × missiles+drones) every other
+// frame; drones call it every tick); it used to allocate 2 Vector3s per call
+// (≈4k allocs/frame at 30-defense scale). Scratches are consumed within the
+// call (no recursion) — behavior identical, zero allocation.
+const _hvV1 = new THREE.Vector3();
+const _hvV2 = new THREE.Vector3();
 function haversineDist(lat1, lon1, lat2, lon2) {
-    let p1 = latLonToVec3(lat1, lon1, 1.0).normalize();
-    let p2 = latLonToVec3(lat2, lon2, 1.0).normalize();
+    const p1 = latLonToVec3(lat1, lon1, 1.0, _hvV1).normalize();
+    const p2 = latLonToVec3(lat2, lon2, 1.0, _hvV2).normalize();
     let d = p1.dot(p2);
     d = Math.max(-1.0, Math.min(1.0, d));
     return Math.acos(d) * EARTH_RADIUS;
@@ -6674,6 +6685,9 @@ function _nukeFlash() {
 // aerodynamic ones; SAM interceptors cruise). this.phase holds an MPHASE.*
 // value; _profileTick() advances it and returns the speed multiplier.
 const MPHASE = { BOOST: 0, COAST: 1, REENTRY: 2, CRUISE: 3 };
+// TASK-503: shared tangent scratch for Missile.update (used and consumed
+// synchronously by mesh.lookAt — never retained).
+const _mTan = new THREE.Vector3();
 
 // ── TASK-403 REFACTOR: WARHEAD BEHAVIOR TABLE ──
 // One onImpact(ctx) per SPECIALIST warhead; everything else (scud, ballistic,
@@ -7033,6 +7047,11 @@ class Structure {
     }
 }
 
+// TASK-503 OPTIMIZE: shared lookAt-tangent scratch for Missile.update —
+// written and consumed synchronously inside one update (lookAt), never
+// retained, so one module-level vector serves every missile.
+const _msTanV = new THREE.Vector3();
+
 class Missile {
     constructor(slat, slon, tlat, tlon, cfg, owner, isSAM=false, launchStyle='silo') {
         this.id = ++_id; this.cfg = cfg || MCFG['ballistic']; this.owner = owner; this.isSAM = isSAM;
@@ -7051,6 +7070,13 @@ class Missile {
         this.startVec = latLonToVec3(slat, slon);
         this.targetVec = latLonToVec3(tlat, tlon);
         this.dist = this.startVec.distanceTo(this.targetVec);
+        // TASK-503 OPTIMIZE: persistent update scratches — update() used to
+        // clone 2 Vector3s per missile per frame (curVec + tangentVec) and
+        // call vec3ToLatLon twice (2 object allocs). curVec is RETAINED as
+        // this.pos so it must be per-instance; the lookAt tangent shares the
+        // module-level _msTanV; the {lat,lon} lands in this._ll.
+        this._curV = new THREE.Vector3();
+        this._ll = { lat: 0, lon: 0 };
         // Speed in km/SECOND — flight time scales with distance so short-range
         // shots land in ~1-4s and intercontinental in ~10s (was a FIXED 20-30s
         // regardless of range: slower than land conquest, now much faster).
@@ -7114,7 +7140,7 @@ class Missile {
                     if (this.pos.distanceTo(this.targetVec) < hitR) {
                         this.tgt.hit(this.dmgVsDrone || GAME_CONSTANTS.AIR_SAM_DMG);
                         spawnExp(this.tgt.lat, this.tgt.lon, 3, '#ffaa44');
-                        if (this.tgt.dead && this.owner === myRole) logEvent('🛡️ أسقطت SAM دروناً معادياً', 'info');
+                        if (this.tgt.dead && this.owner === myRole) _logDroneKill();   // TASK-503: rate-limited
                         this.explode();
                         return;
                     }
@@ -7141,7 +7167,7 @@ class Missile {
                         spawnExp(this.tgt.lat, this.tgt.lon, 3, '#88ffcc');
                         _debrisBurst(this.targetVec, 5);
                     }
-                    logEvent('🛡️ اعتراض ناجح! أسقطت الدفاع الجوي صاروخاً معادياً', 'info');
+                    _logIntercept();
                     this.explode();
                     return;
                 }
@@ -7227,7 +7253,13 @@ class Missile {
             return;
         }
 
-        let curVec = this.startVec.clone().lerp(this.targetVec, this.progress).normalize();
+        // TASK-503 OPTIMIZE: allocation-free flight path — this.pos is a
+        // persistent vector (created lazily so the first-tick `if (this.pos)`
+        // intercept guard keeps its null semantics), the tangent rides a
+        // module scratch, and the lat/lon conversion runs ONCE (was two
+        // vec3ToLatLon calls + two Vector3 clones per missile per tick).
+        if (!this.pos) this.pos = new THREE.Vector3();
+        const curVec = this.pos.copy(this.startVec).lerp(this.targetVec, this.progress).normalize();
         
         let maxArc = this.dist * 0.4;
         let tp = this.cfg.type;
@@ -7245,12 +7277,12 @@ class Missile {
             : Math.sin(this.progress * Math.PI) * maxArc;
         curVec.multiplyScalar(EARTH_RADIUS + h);
 
-        this.lat = vec3ToLatLon(curVec).lat;
-        this.lon = vec3ToLatLon(curVec).lon;
-        this.pos = curVec;
+        const ll = vec3ToLatLon(curVec);
+        this.lat = ll.lat;
+        this.lon = ll.lon;
 
-        let tangentProg = Math.min(1.0, this.progress + 0.01);
-        let tangentVec = this.startVec.clone().lerp(this.targetVec, tangentProg).normalize();
+        const tangentProg = Math.min(1.0, this.progress + 0.01);
+        const tangentVec = _mTan.copy(this.startVec).lerp(this.targetVec, tangentProg).normalize();
         tangentVec.multiplyScalar(EARTH_RADIUS + (this.tgtIsPlane ? 50 * tangentProg : this.tgtIsDrone ? 22 * tangentProg : Math.sin(tangentProg * Math.PI) * maxArc));
         
         this.mesh.position.copy(curVec);
@@ -7323,7 +7355,10 @@ class Missile {
         // fx: cyan pulse at the station + a spark flicker on the missile
         spawnExp(ecm.lat, ecm.lon, 2, '#00ffcc');
         if (this.pos) _puffAt(this.pos, 0x00ffcc, 2.2, null, 18);
-        if (ecm.owner === myRole) logEvent('📡 ECM: شوّش صاروخاً معادياً — تدهورت دقته', 'info');
+        if (ecm.owner === myRole && frame >= _ecmLogCd) {
+            _ecmLogCd = frame + 90;   // TASK-503: rate-limit (volley spam guard)
+            logEvent('📡 ECM: شوّش صاروخاً معادياً — تدهورت دقته', 'info');
+        }
     }
 
     explode() {
@@ -8470,6 +8505,35 @@ function _mushroomStack(lat, lon, power = 1) {
 
 // TASK-403: enemy radar-ECM station covering this missile's position (EMP'd
 // stations are dark). Returns the station or null.
+// TASK-503: log rate-limit — a volley over a station used to spam one line
+// PER missile (16 identical entries in a raid); now max one per 90f globally.
+let _ecmLogCd = 0;
+// TASK-503: intercept-log batching — a massed raid intercepted by many SAMs
+// logged one line per kill; consecutive kills inside 90f now fold into the
+// NEXT line as ×N (first logs immediately).
+let _intLog = { cd: 0, n: 0 };
+function _logIntercept() {
+    if (frame >= _intLog.cd) {
+        _intLog.cd = frame + 90;
+        const extra = _intLog.n > 0 ? ` (×${_intLog.n + 1})` : '';
+        _intLog.n = 0;
+        logEvent(`🛡️ اعتراض ناجح! أسقطت الدفاع الجوي صاروخاً معادياً${extra}`, 'info');
+    } else {
+        _intLog.n++;
+    }
+}
+// Same batching for SAM drone-kills (swarm raids: one line per kill → ×N)
+const _droneKillLog = { cd: 0, n: 0 };
+function _logDroneKill() {
+    if (frame >= _droneKillLog.cd) {
+        _droneKillLog.cd = frame + 90;
+        const extra = _droneKillLog.n > 0 ? ` (×${_droneKillLog.n + 1})` : '';
+        _droneKillLog.n = 0;
+        logEvent(`🛡️ أسقطت SAM دروناً معادياً${extra}`, 'info');
+    } else {
+        _droneKillLog.n++;
+    }
+}
 function _ecmJam(m) {
     for (const s of structs) {
         if (s.dead || s.owner === m.owner || s.type !== 'radar_ecm') continue;
@@ -8775,12 +8839,14 @@ class Drone {
         return null;
     }
     // Great-circle nudge: move km toward (tLat,tLon); true when arrived
+    // TASK-503 OPTIMIZE: spherical basis built into the class scratch pair
+    // via latLonToVec3's out-param — zero allocations (was 2 Vector3/nudge).
     _nudgeToward(tLat, tLon, km) {
         const d = haversineDist(this.lat, this.lon, tLat, tLon);
         if (d <= km || d < 0.5) { this.lat = tLat; this.lon = tLon; return true; }
         const f = km / d;
-        const a = _droneV1.copy(latLonToVec3(this.lat, this.lon, 1)).normalize();
-        const b = _droneV2.copy(latLonToVec3(tLat, tLon, 1)).normalize();
+        const a = latLonToVec3(this.lat, this.lon, 1, _droneV1).normalize();
+        const b = latLonToVec3(tLat, tLon, 1, _droneV2).normalize();
         a.lerp(b, f).normalize();
         const ll = vec3ToLatLon(a);
         this.lat = ll.lat; this.lon = ll.lon;
@@ -8924,7 +8990,7 @@ class Drone {
     }
     _updateMesh() {
         this.prevPos.copy(this.pos);
-        this.pos = latLonToVec3(this.lat, this.lon, EARTH_RADIUS + DRONE_ALT);
+        latLonToVec3(this.lat, this.lon, EARTH_RADIUS + DRONE_ALT, this.pos);   // TASK-503: persistent pos, no alloc
         this.mesh.position.copy(this.pos);
         this.mesh.up.copy(this.pos).normalize();
         const dir = _droneV1.copy(this.pos).sub(this.prevPos);
@@ -17041,6 +17107,139 @@ window.mixVolleyTest = async function () {
     const pass = res.singleTypes && res.mixTypes && res.mixCost && res.fired && res.liveFirstShot && res.magConsumed;
     console.log('[mixVolleyTest]', res);
     logEvent(`[mixVolleyTest] ${pass ? 'PASS ✅' : 'FAIL ❌'} — مفرد=${res.singleTypes} · مختلط=${res.mixTypes} · كلفة=${res.mixCost} · أطلق=${res.fired} أول=${res.liveFirstShot} مخزون=${res.magConsumed}`, pass ? 'info' : 'err');
+    return res;
+};
+
+// ── TASK-503: qaTest() — the missiles+visual system mastery probe. Runs the
+// full static + behavioral + scale-bench suite and returns one summary:
+//   1. STATIC    — MCFG hygiene (no dead keys resurrected), MTAGS↔MCFG sync,
+//                  crater-pool cap under flood
+//   2. BEHAVIOR  — the seven TASK-204/403 probes, re-run and collected
+//   3. SCALE     — 30 defense structures + 24 missiles + 20 drones pumped
+//                  600 frames: avg/p95 game-frame ms + draw calls (OPTIMIZE
+//                  evidence — run before/after any hot-path change)
+// Safe on a live game: entity arrays are isolated and restored, all probe
+// objects cleaned up (constructors do NOT self-register — this pushes).
+window.qaTest = async function (opts = {}) {
+    const res = { static: {}, behavior: {}, scale: {}, pass: false };
+    const _cleanup = (s) => { if (s && !s.dead) { s.dead = true; scene.remove(s.mesh); scene.remove(s.selRing); if (s.accents) s.accents.forEach(m => m.dispose()); if (s.selRing && s.selRing.material) s.selRing.material.dispose(); } };
+    const _killM = (m) => { if (m && !m.dead) { m.dead = true; scene.remove(m.mesh); disposeMeshDeep(m.mesh); } };
+    const _killD = (d) => { if (d && !d.dead) { d.dead = true; scene.remove(d.mesh); disposeMeshDeep(d.mesh); } };
+
+    // ── 1. STATIC ──
+    // a) dead keys stay dead (TASK-503 cleanup guard)
+    const DEAD = ['civsEvade','piercing','spinTrail','hugsGround','pressureWave','stealthRCS','nuclearBlast','shockwave','mirv','grav','drag','arc'];
+    res.static.deadKeysGone = Object.keys(MCFG).every(k => DEAD.every(d => !(d in MCFG[k])));
+    res.static.baseSpeedMulGone = !('BASE_SPEED_MULTIPLIER' in GAME_CONSTANTS);
+    // b) scatterCount wired (bomblets per cluster impact)
+    res.static.scatterWired = MCFG.cluster.scatterCount === 8;
+    // c) MTAGS↔MCFG sync: same key set, 4 tags each, spot-check numbers
+    res.static.mtagsKeys = Object.keys(MTAGS).join(',') === Object.keys(MCFG).join(',');
+    res.static.mtagsTags = Object.values(MTAGS).every(t => Array.isArray(t) && t.length === 4);
+    res.static.mtagsNumbers =
+        MTAGS.ballistic[0].includes('130/110') && MCFG.ballistic.cost === 130 && MCFG.ballistic.dmg === 110 &&
+        MTAGS.cluster[0].includes('8') && MTAGS.cluster[2].includes('200كم') && MCFG.cluster.rad === 200 &&
+        MTAGS.thermobaric[1].includes('1.8') && MCFG.thermobaric.devMul === 1.8 &&
+        MTAGS.bunker_bust[0].includes('2.6') && MCFG.bunker_bust.pierceDmg === 2.6 &&
+        MTAGS.icbm[0].includes('55%') && MTAGS.nuke_tac[1].includes('7');
+    // d) crater pool cap: flood with 40 spawns → never above CRATER_MAX
+    const crater0 = craterDecals.length;
+    for (let i = 0; i < 40; i++) _spawnCrater(10 + (i % 20), 10 + (i % 30), 80 + i * 5);
+    res.static.craterCap = craterDecals.length <= GAME_CONSTANTS.CRATER_MAX;
+    res.static.craterCount = craterDecals.length;
+    // e) polish layers + tuning live (TASK-303 ownership)
+    res.static.polishLayers = !!(_polishClouds && _polishSun && _polishShimmer);
+    res.static.polishTune = typeof window.__polishTune === 'function' && _polishShimmer.material.uniforms.wGlint.value === _polishTune.shimGlint;
+    res.static.polishBtn = !!document.getElementById('btnPolish');
+
+    // ── 2. BEHAVIOR (existing probes, collected) ──
+    try { const r = await samTest(); res.behavior.samTest = r.A_base_noLock && r.B_chain_lock && r.C_emp_dark && r.D_emp_sam_dark; } catch (e) { res.behavior.samTest = 'ERR ' + e.message; }
+    try { const r = await ecmTest(); res.behavior.ecmTest = !!(r.A_jammed && r.A_aimMoved && r.B_hyperExempt && r.C_empDark && r.D_friendlyImmune && r.E_radius); } catch (e) { res.behavior.ecmTest = 'ERR ' + e.message; }
+    try { const r = await magTest(); res.behavior.magTest = !!(r.magInit === 6 && r.dryAfterSix && r.pickSkipsDry && r.rearmRefill && r.pickAfterRearm); } catch (e) { res.behavior.magTest = 'ERR ' + e.message; }
+    try { const r = await mirvTest(); res.behavior.mirvTest = !!(r.split && r.childCount === 3 && r.allSlimRV && r.scaleOk); } catch (e) { res.behavior.mirvTest = 'ERR ' + e.message; }
+    try { const r = await mixVolleyTest(); res.behavior.mixVolleyTest = !!(r.singleTypes && r.mixTypes && r.mixCost && r.fired && r.liveFirstShot && r.magConsumed); } catch (e) { res.behavior.mixVolleyTest = 'ERR ' + e.message; }
+    try { const r = await droneTest(); res.behavior.droneTest = !!(r.part1_kamikaze.engaged && r.part1_kamikaze.killed && r.part2_interceptor.intercepted); } catch (e) { res.behavior.droneTest = 'ERR ' + e.message; }
+    try { const r = await aaDroneTest(); res.behavior.aaDroneTest = !!(r.samFired && r.droneKilled && r.samSurvived && r.flakDamaged); } catch (e) { res.behavior.aaDroneTest = 'ERR ' + e.message; }
+
+    // ── 3. SCALE BENCH (OPTIMIZE evidence; isolated arrays) ──
+    // Baseline first (live game, no bench entities) → then loaded: the DELTA
+    // is the missiles+drones+defenses cost. opts = { nMissiles, nDrones, nStructs, frames }
+    const N_M = opts.nMissiles ?? 16, N_S = opts.nStructs ?? 30, N_FRAMES = opts.frames ?? 600;
+    const _pumpMeasure = async (n) => {
+        window.__perfState.frameTimes.length = 0;   // isolate this window's samples
+        await window.__pumpGame(n);
+        return window.__perf();
+    };
+    const savedMissiles = missiles, savedDrones = drones, savedStructs = structs;
+    const benchStructs = [], benchDrones = [], benchMissiles = [];
+    missiles = benchMissiles; drones = benchDrones;
+    structs = savedStructs.slice();   // isolate: bench struct updates only see bench structs
+    const benchAdded = [];
+    try {
+        res.scale.baseline = await _pumpMeasure(Math.min(300, N_FRAMES / 2));
+        // 30 defense structures in a defensive cluster (player SAM/radar/ECM/flak)
+        const MIX = ['sam','sam','sam','flak','flak','radar','radar_ecm','iron_dome'];
+        for (let i = 0; i < N_S; i++) {
+            const s = new Structure(20 + (i % 6) * 0.8, 20 + Math.floor(i / 6) * 0.8, MIX[i % MIX.length], 'player');
+            structs.push(s); benchAdded.push(s);
+        }
+        // enemy structures to shoot at + be shot
+        for (let i = 0; i < 6; i++) {
+            const s = new Structure(30 + i * 0.5, 30, i % 2 ? 'launcher' : 'sam', 'enemy');
+            structs.push(s); benchAdded.push(s);
+        }
+        // missiles in flight: attackers + SAM interceptors chasing (total N_M+8)
+        const KEYS = ['scud','ballistic','cluster','cruise','thermobaric','icbm','hyper','stealth_m'];
+        for (let i = 0; i < N_M; i++) {
+            const m = new Missile(20 + (i % 4) * 0.5, 18, 30 + (i % 6), 32, MCFG[KEYS[i % KEYS.length]], 'enemy', false, 'silo');
+            m.progress = (i % 8) * 0.04;   // mid-flight spread across phases
+            missiles.push(m);
+        }
+        for (let i = 0; i < 8; i++) {
+            const m = new Missile(20 + (i % 3) * 0.6, 20, 22, 22, MCFG['ballistic'], 'player', true);
+            m.tgt = missiles[i * 2]; m.speed = GAME_CONSTANTS.SAM_INTERCEPT_SPEED_KM_S;
+            missiles.push(m);
+        }
+        // drones: mixed types + BOTH sides (cap is per-owner; enemy drones
+        // engage the player's bench structs → realistic scan load)
+        const DKEYS = ['nano','swarm','kamikaze','recon','loiter','jammer','armed','heavy','intercept'];
+        for (let i = 0; i < Math.min(16, opts.nDrones ?? 16); i++) {
+            const squad = launchDrone('player', DKEYS[i % DKEYS.length], { lat: 21 + (i % 5) * 0.4, lon: 21 + Math.floor(i / 5) * 0.4 }, { homeLat: 22, homeLon: 22 });
+            if (squad) squad.forEach(d => benchDrones.push(d));
+        }
+        for (let i = 0; i < Math.min(8, (opts.nDrones ?? 24) - 16); i++) {
+            const squad = launchDrone('enemy', DKEYS[(i + 3) % DKEYS.length], { lat: 28 + (i % 4) * 0.4, lon: 28 + Math.floor(i / 4) * 0.4 }, { homeLat: 27, homeLon: 27 });
+            if (squad) squad.forEach(d => benchDrones.push(d));
+        }
+        res.scale.entities = { structs: benchAdded.length, missiles: missiles.length, drones: drones.length };
+        const p = await _pumpMeasure(N_FRAMES);
+        res.scale.avgGameFrameMs = p.avgGameFrameMs;
+        res.scale.p95Ms = p.p95Ms;
+        res.scale.framesPumped = p.sampledFrames;
+        res.scale.deltaMs = +(p.avgGameFrameMs - res.scale.baseline.avgGameFrameMs).toFixed(2);
+        res.scale.drawCalls = renderer && renderer.info ? renderer.info.render.calls : null;
+        res.scale.fpsAvg = window.__perfState.fpsAvg ? Math.round(window.__perfState.fpsAvg) : null;
+    } finally {
+        // cleanup: bench entities only
+        for (const m of missiles) _killM(m);
+        missiles = savedMissiles;
+        for (const d of drones) _killD(d);
+        drones = savedDrones;
+        structs = savedStructs;
+        for (const s of benchAdded) _cleanup(s);
+        // radar-chain + acquire caches invalidated by array-length signature on next use
+    }
+
+    // ── summary ──
+    const staticPass = res.static.deadKeysGone && res.static.baseSpeedMulGone && res.static.scatterWired &&
+        res.static.mtagsKeys && res.static.mtagsTags && res.static.mtagsNumbers && res.static.craterCap &&
+        res.static.polishLayers && res.static.polishTune && res.static.polishBtn;
+    const behaviorPass = Object.values(res.behavior).every(v => v === true);
+    // Perf gate: the DELTA my entities add to a logic frame must stay under
+    // 3ms at scale (absolute gameFrame includes every other system's work).
+    res.pass = staticPass && behaviorPass && res.scale.deltaMs < 3;
+    console.log('[qaTest]', res);
+    logEvent(`[qaTest] ${res.pass ? 'PASS ✅' : 'FAIL ❌'} — ثابت=${staticPass} · سلوك=${Object.values(res.behavior).filter(v => v === true).length}/7 · مقياس: ${res.scale.entities ? res.scale.entities.missiles + ' صاروخ/' + res.scale.entities.drones + ' درون/' + res.scale.entities.structs + ' مبنى' : '—'} @ +${res.scale.deltaMs}ms/إطار فوق الأساس ${res.scale.baseline ? res.scale.baseline.avgGameFrameMs + 'ms' : ''} (p95 ${res.scale.p95Ms})`, res.pass ? 'info' : 'err');
     return res;
 };
 
