@@ -3135,6 +3135,145 @@ window.__ffaProbe = {
         planes.push(new Plane(24.6, -40.8, PCFG['fighter'], myRole));
         return 'player fighter staged at (24.6,-40.8)';
     },
+    // ═══ TASK-201: Air Force probes ═══
+    // Manual logic-tick stepper — drives the sim deterministically for probe
+    // tests even when the tab is hidden (RAF throttles to zero in background).
+    step: (n = 1) => { for (let i = 0; i < n; i++) gameFrame(); return window.__perfState.frames; },
+    airStats: () => ({ ...window.__airStats, planes: planes.length, aams: aamMissiles.length }),
+    // model-chain sanity: build every PCFG type once, report GLB/OBJ/proxy source
+    airModelsCheck: () => {
+        if (!scene) return 'start a game first (scene not ready)';
+        const out = {};
+        for (const k of Object.keys(PCFG)) {
+            const p = new Plane(0, 0, PCFG[k], 'player');
+            let meshes = 0;
+            if (p.mesh) p.mesh.traverse(o => { if (o.isMesh) meshes++; });
+            out[k] = { src: p.modelSrc, meshes };
+            if (p.mesh) { scene.remove(p.mesh); disposeMeshDeep(p.mesh); }
+            if (p.selRing && p.selRing.material) { scene.remove(p.selRing); p.selRing.material.dispose(); }
+            p.dead = true;   // never enters gameFrame
+        }
+        return out;
+    },
+    // dogfight probe: hostile fighters forced into a merge — verify AAMs fly
+    // and someone dies. dogfightResult() → pass:true when resolved by AAM fire.
+    dogfightTest: () => {
+        const a = new Plane(20, -40, PCFG['f22'], myRole);
+        const b = new Plane(20.9, -39.6, PCFG['fighter'], 'enemy');
+        planes.push(a, b);
+        for (const p of [a, b]) { p.parked = false; p.mode = 'patrol'; p.tlat = 20.4; p.tlon = -39.8; }
+        window.__dogT = { a, b, t0: performance.now(), s0: { ...window.__airStats } };
+        return 'staged: F-22 vs F-16, both airborne ~110km apart, converging';
+    },
+    dogfightResult: () => {
+        const t = window.__dogT; if (!t) return null;
+        const d = window.__airStats, s = t.s0;
+        return {
+            s: Math.round((performance.now() - t.t0) / 1000),
+            aDead: t.a.dead, bDead: t.b.dead,
+            aHp: Math.max(0, Math.round(t.a.hp)), bHp: Math.max(0, Math.round(t.b.hp)),
+            aamFired: d.aamFired - s.aamFired,
+            aamHits: d.aamHits - s.aamHits,
+            gunBursts: d.gunBursts - s.gunBursts,
+            flaresUsed: d.flaresUsed - s.flaresUsed,
+            resolved: t.a.dead || t.b.dead,
+            pass: (t.a.dead || t.b.dead) && (d.aamFired - s.aamFired > 0)
+        };
+    },
+    // airstrike probe: A-10 vs a defended enemy compound — verifies role A2G
+    // (anti-armor strikes + ammo burn + RTB) AND AA-vs-plane (flak/sam damage).
+    airstrikeTest: () => {
+        const s1 = new Structure(30, -41, 'launcher', 'enemy');
+        const s2 = new Structure(30.15, -41.1, 'flak', 'enemy');
+        const s3 = new Structure(29.9, -40.9, 'sam', 'enemy');
+        structs.push(s1, s2, s3);
+        const hp0 = [s1, s2, s3].map(s => s.hp);
+        const p = new Plane(29.2, -40.2, PCFG['a10'], myRole);
+        planes.push(p);
+        p.parked = false; p.mode = 'attack'; p.tlat = 30; p.tlon = -41;
+        window.__airT = { p, s1, s2, s3, hp0, t0: performance.now(), s0: { ...window.__airStats } };
+        return 'staged: A-10 attack run on enemy compound (flak + SAM defense)';
+    },
+    airstrikeResult: () => {
+        const t = window.__airT; if (!t) return null;
+        const d = window.__airStats, s = t.s0;
+        const dmg = [t.s1, t.s2, t.s3].map((st, i) => Math.max(0, Math.round(t.hp0[i] - st.hp)));
+        return {
+            s: Math.round((performance.now() - t.t0) / 1000),
+            structDmg: dmg, destroyed: [t.s1, t.s2, t.s3].map(st => st.dead),
+            planeHp: Math.max(0, Math.round(t.p.hp)), planeMode: t.p.mode, planeDead: t.p.dead,
+            agAmmo: Math.floor(t.p.agAmmo), gunAmmo: Math.floor(t.p.gunAmmo), flares: Math.floor(t.p.flares),
+            flakHits: d.flakHits - s.flakHits, samAtPlanes: d.samAtPlanes - s.samAtPlanes,
+            strikeRuns: d.strikeRuns - s.strikeRuns,
+            pass: (dmg.reduce((a, b) => a + b, 0) > 0) && (d.strikeRuns - s.strikeRuns > 0)
+        };
+    },
+    // bot-wing probe: enemy airport + parked fighter — verifies auto-scramble
+    // (parked → airborne CAP/strike) and RTB re-arm cycling.
+    botWingTest: () => {
+        const apt = new Structure(0, -20, 'airport', 'enemy');
+        structs.push(apt);
+        const p = new Plane(apt.lat, apt.lon, PCFG['fighter'], 'enemy');
+        planes.push(p);
+        window.__botWingT = { p, apt };
+        return 'staged: enemy fighter parked at (0,-20) — watch it scramble';
+    },
+    botWingResult: () => {
+        const t = window.__botWingT; if (!t) return null;
+        return {
+            parked: t.p.parked, mode: t.p.mode,
+            pos: [+t.p.lat.toFixed(1), +t.p.lon.toFixed(1)],
+            fuel: Math.round(t.p.fuel), aaAmmo: t.p.aaAmmo,
+            launched: !t.p.parked, away: haversineDist(t.p.lat, t.p.lon, t.apt.lat, t.apt.lon) > 20,
+            pass: !t.p.parked && !t.p.dead
+        };
+    },
+    // stealth probe: a B-2 deep in enemy SAM range must NOT be auto-engaged
+    // until it closes inside AIR_STEALTH_DETECT.
+    stealthTest: () => {
+        const sam = new Structure(35, -45, 'sam', 'enemy');
+        structs.push(sam);
+        const b2 = new Plane(34.6, -44.6, PCFG['stealth'], myRole);
+        planes.push(b2);
+        b2.parked = false; b2.mode = 'patrol'; b2.tlat = 35; b2.tlon = -45;
+        window.__stlT = { b2, sam, t0: performance.now(), s0: { ...window.__airStats } };
+        return 'staged: B-2 inbound at ~55km from enemy SAM (detect ring 30km)';
+    },
+    // focused AA probe: slow heli flying STRAIGHT at a SAM battery — verifies
+    // the guided interceptor can actually connect (damage or flare decoy).
+    samVsPlaneTest: () => {
+        const sam = new Structure(10, -30, 'sam', 'enemy');
+        structs.push(sam);
+        const heli = new Plane(9.2, -30, PCFG['heli'], myRole);
+        planes.push(heli);
+        heli.parked = false; heli.mode = 'patrol'; heli.tlat = 10; heli.tlon = -30;
+        window.__svpT = { heli, sam, s0: { ...window.__airStats } };
+        return 'staged: heli ~90km out, boring straight in on the SAM';
+    },
+    samVsPlaneResult: () => {
+        const t = window.__svpT; if (!t) return null;
+        const d = window.__airStats, s = t.s0;
+        return {
+            heliHp: Math.round(t.heli.hp), heliDead: t.heli.dead, flaresLeft: t.heli.flares,
+            samFired: d.samAtPlanes - s.samAtPlanes, flaresUsed: d.flaresUsed - s.flaresUsed,
+            distNow: Math.round(haversineDist(t.heli.lat, t.heli.lon, t.sam.lat, t.sam.lon)),
+            // pass = the SAM meaningfully engaged (damage dealt or flares spent)
+            pass: t.heli.hp < t.heli.cfg.hp || (d.flaresUsed - s.flaresUsed) > 0
+        };
+    },
+    stealthResult: () => {
+        const t = window.__stlT; if (!t) return null;
+        const d = window.__airStats, s = t.s0;
+        const dist = haversineDist(t.b2.lat, t.b2.lon, t.sam.lat, t.sam.lon);
+        return {
+            s: Math.round((performance.now() - t.t0) / 1000),
+            distKm: Math.round(dist),
+            samEngaged: (d.samAtPlanes - s.samAtPlanes) > 0,
+            b2Hp: Math.max(0, Math.round(t.b2.hp)), b2Dead: t.b2.dead,
+            // pass = SAM held fire while the B-2 was outside the stealth ring
+            pass: t.b2.dead || !((d.samAtPlanes - s.samAtPlanes) > 0) || dist < GAME_CONSTANTS.AIR_STEALTH_DETECT + 15
+        };
+    },
     // ── speed timing probes ──
     // Fire a ballistic over a known distance and time the flight.
     missileTest: () => {
@@ -5043,6 +5182,7 @@ function init3D() {
     scene.add(rangeMarkerMesh);
 
     preloadAssets();
+    loadAircraftModels();   // TASK-201: GLB registry (async, per-aircraft fallback)
     
     // Initialize Geo-Renderer (for enhanced geographic data)
     GEO_RENDERER.init(scene, camera);
@@ -5081,6 +5221,65 @@ function preloadAssets() {
             }, undefined, function(e) { console.error("Missing asset", a.name, e); });
         });
     });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TASK-201: AIRCRAFT GLB REGISTRY — asset pipeline for user-authored
+//  Blender models. One GLB per PCFG key lands in Assets/Aircraft/
+//  (-Z forward, meters). Until the art exists every aircraft degrades
+//  gracefully: GLB → OBJ jet (GLOBAL_MODELS) → low-poly proxy. The
+//  system is fully playable BEFORE any model exists.
+// ═══════════════════════════════════════════════════════════════════
+const AIRCRAFT_GLB_MANIFEST = {
+    // pkey  → { file, span }  span = real-world wingspan in METERS (log-scale
+    // mapped to globe units below so a B-2 visibly out-sizes an F-16).
+    heli:        { file: 'heli.glb',        span: 14.6 },  // AH-64
+    fighter:     { file: 'fighter.glb',     span: 9.96 },  // F-16
+    bomber:      { file: 'bomber.glb',      span: 17.6 },  // Su-24
+    interceptor: { file: 'interceptor.glb', span: 11.4 },  // MiG-29
+    a10:         { file: 'a10.glb',         span: 17.5 },  // A-10C
+    gunship:     { file: 'gunship.glb',     span: 40.4 },  // AC-130
+    awacs:       { file: 'awacs.glb',       span: 44.4 },  // E-3 (+rotodome)
+    su57:        { file: 'su57.glb',        span: 14.0 },  // Su-57
+    stealth:     { file: 'stealth.glb',     span: 52.4 },  // B-2
+    f22:         { file: 'f22.glb',         span: 13.6 },  // F-22
+};
+// Real wingspans span 10-52m — mapped onto a 9-24 globe-unit range so every
+// aircraft stays visible at globe scale while relative size still reads.
+function _aircraftSpanToUnits(spanMeters) {
+    return 9 + 15 * Math.min(1, Math.max(0, (spanMeters - 10) / 42));
+}
+const AIRCRAFT_MODELS = {};   // pkey → { group:THREE.Group (normalized, +Z nose), spanUnits }
+
+function loadAircraftModels() {
+    if (typeof THREE === 'undefined' || !THREE.GLTFLoader) return;   // CDN missing → OBJ/proxy fallback
+    const loader = new THREE.GLTFLoader();
+    for (const key in AIRCRAFT_GLB_MANIFEST) {
+        const entry = AIRCRAFT_GLB_MANIFEST[key];
+        loader.load('Assets/Aircraft/' + entry.file, (gltf) => {
+            try {
+                const inner = gltf.scene;
+                const bb = new THREE.Box3().setFromObject(inner);
+                const size = new THREE.Vector3(); bb.getSize(size);
+                const spanXZ = Math.max(size.x, size.z);
+                if (spanXZ < 0.0001) return;                        // empty/degenerate model → skip
+                // Authors export -Z forward; wrap so the GROUP flies nose-first
+                // under lookAt() (+Z), and normalize size to the span table.
+                inner.rotation.y = Math.PI;
+                inner.scale.setScalar(_aircraftSpanToUnits(entry.span) / spanXZ);
+                inner.traverse(child => {
+                    if (child.isMesh && child.material) {
+                        const mats = Array.isArray(child.material) ? child.material : [child.material];
+                        mats.forEach(m => { if (m.emissive) m.emissive.setHex(0x1a1a1a); });
+                    }
+                });
+                const wrap = new THREE.Group();
+                wrap.add(inner);
+                AIRCRAFT_MODELS[key] = { group: wrap, spanUnits: _aircraftSpanToUnits(entry.span) };
+                console.log('[AIR] model ready:', key, '→', entry.file);
+            } catch (e) { console.warn('[AIR] model rejected:', key, e.message); }
+        }, undefined, () => { /* file not authored yet — expected pre-art */ });
+    }
 }
 
 function createLineFromLatLon(coordSet, material) {
@@ -5945,6 +6144,39 @@ class Structure {
             }
             if(trg) { fireSAM(this, trg); this.reload = this.maxReload; }
         }
+
+        // ── TASK-201: AA vs AIRCRAFT ── same ground-range scan pattern as the
+        // missile interception fix (offset frame parity to spread the cost).
+        // Stealth is radar-invisible beyond close range; speed = exposure —
+        // fast jets spend few ticks inside the envelope, slow CAS loiters in it.
+        if (this.fireRange > 0 && frame % 2 === 1 && this.reload === 0) {
+            for (const p of planes) {
+                if (p.dead || p.parked || p.owner === this.owner) continue;
+                const engageR = Math.min(this.fireRange, airDetectRange(null, p));
+                if (haversineDist(this.lat, this.lon, p.lat, p.lon) >= engageR) continue;
+                if (this.type === 'flak' || this.type === 'ciws') {
+                    // Barrage: direct probabilistic damage — fast jets jink through
+                    const hitChance = Math.max(0.12, 0.8 - p.speed * 0.45);
+                    this.reload = this.maxReload;
+                    // muzzle flash at the battery
+                    spawnExp(this.lat, this.lon, 1.2, this.type === 'ciws' ? '#66ddff' : '#ffdd88');
+                    if (Math.random() < hitChance) {
+                        window.__airStats.flakHits++;
+                        p.hit(this.type === 'ciws' ? GAME_CONSTANTS.AIR_CIWS_DMG : GAME_CONSTANTS.AIR_FLAK_DMG, this.owner);
+                        spawnExp(p.lat, p.lon, 2, '#ffaa44');   // flak burst on the airframe
+                    } else {
+                        spawnExp(p.lat + rnd(-0.05, 0.05), p.lon + rnd(-0.06, 0.06), 1.5, '#aaaaaa');   // near miss puff
+                    }
+                    if (SFX && SFX.gun) SFX.gun();
+                } else {
+                    // sam / iron_dome: guided interceptor at the aircraft
+                    fireSAMPlane(this, p);
+                    this.reload = this.maxReload;
+                    window.__airStats.samAtPlanes++;
+                }
+                break;   // one engagement per cycle
+            }
+        }
     }
 }
 
@@ -5981,10 +6213,25 @@ class Missile {
             // single tick — missiles were never intercepted. The radius now
             // covers one full tick of closing speed + margin.
             if (this.pos) {
-                const tgtSpeedPerTick = (this.tgt.speed ? this.tgt.speed / 60 : 0.5);
-                const mySpeedPerTick = this.speed / 60;
-                const hitR = 2 + tgtSpeedPerTick + mySpeedPerTick;
-                if (this.pos.distanceTo(this.targetVec) < hitR) {
+                // TASK-201: vs AIRCRAFT — plane.speed is km/FRAME (not km/s);
+                // flares decoy first, then damage instead of instant kill.
+                if (this.tgtIsPlane) {
+                    const tgtSpeedPerTick = (this.tgt.speed || 0.8);
+                    const mySpeedPerTick = this.speed / 60;
+                    const hitR = 3 + tgtSpeedPerTick + mySpeedPerTick;
+                    if (this.pos.distanceTo(this.targetVec) < hitR) {
+                        if (this.tgt.tryDecoy && this.tgt.tryDecoy()) {
+                            // decoyed — missile chases the flare
+                            spawnExp(this.tgt.lat, this.tgt.lon, 2, '#ffcc66');
+                        } else {
+                            this.tgt.hit(this.dmgVsPlane || GAME_CONSTANTS.AIR_SAM_DMG, this.owner);
+                            spawnExp(this.tgt.lat, this.tgt.lon, 4, '#ff8844');
+                        }
+                        this.explode();
+                        return;
+                    }
+                } else
+                if (this.pos.distanceTo(this.targetVec) < 2 + (this.tgt.speed ? this.tgt.speed / 60 : 0.5) + this.speed / 60) {
                     this.tgt.dead = true;
                     // Interception flash at the kill point (visible confirmation)
                     spawnExp(this.tgt.lat, this.tgt.lon, 3, '#88ffcc');
@@ -6021,6 +6268,16 @@ class Missile {
         }
 
         if(this.progress >= 1.0) {
+            // TASK-201: AA interceptor exhausted its chase at the target's
+            // last position — resolve against the aircraft, not the ground.
+            if (this.tgtIsPlane && this.tgt && !this.tgt.dead) {
+                if (this.tgt.tryDecoy && this.tgt.tryDecoy()) {
+                    spawnExp(this.tgt.lat, this.tgt.lon, 2, '#ffcc66');
+                } else if (this.pos && this.pos.distanceTo(this.targetVec) < 25) {
+                    this.tgt.hit(this.dmgVsPlane || GAME_CONSTANTS.AIR_SAM_DMG, this.owner);
+                    spawnExp(this.tgt.lat, this.tgt.lon, 4, '#ff8844');
+                }
+            }
             this.explode();
             return;
         }
@@ -6033,7 +6290,11 @@ class Missile {
         else if (tp === 'icbm') maxArc = this.dist * 1.5; 
         else if (tp === 'hyper') maxArc = this.dist * 0.2; 
         
-        let h = Math.sin(this.progress * Math.PI) * maxArc;
+        // TASK-201: AA interceptors vs AIRCRAFT climb to the target's cruise
+        // altitude instead of flying a ground-ballistic arc (the arc returns
+        // to the surface at progress=1 while planes cruise at +50 — SAMs
+        // always landed short under the target).
+        let h = (this.tgtIsPlane) ? (50 * this.progress) : Math.sin(this.progress * Math.PI) * maxArc;
         curVec.multiplyScalar(EARTH_RADIUS + h);
 
         this.lat = vec3ToLatLon(curVec).lat;
@@ -6042,7 +6303,7 @@ class Missile {
 
         let tangentProg = Math.min(1.0, this.progress + 0.01);
         let tangentVec = this.startVec.clone().lerp(this.targetVec, tangentProg).normalize();
-        tangentVec.multiplyScalar(EARTH_RADIUS + Math.sin(tangentProg * Math.PI) * maxArc);
+        tangentVec.multiplyScalar(EARTH_RADIUS + (this.tgtIsPlane ? 50 * tangentProg : Math.sin(tangentProg * Math.PI) * maxArc));
         
         this.mesh.position.copy(curVec);
         this.mesh.up.copy(curVec).normalize();
@@ -6127,7 +6388,7 @@ class Missile {
                 if (s.owner !== this.owner && !s.dead && dst(this, s) < blastR) s.hit(dmg);
             });
         }
-        if (this.isSAM && this.tgt) this.tgt.dead = true;
+        if (this.isSAM && this.tgt && !this.tgtIsPlane) this.tgt.dead = true;   // TASK-201: planes take damage instead
     }
 }
 
@@ -6139,14 +6400,174 @@ const _parkV4 = new THREE.Vector3();
 const _parkV5 = new THREE.Vector3();
 const _parkV6 = new THREE.Vector3();
 
+// ═══════════════════════════════════════════════════════════════════
+//  TASK-201: AIR COMBAT CORE — stealth-aware detection, AAM tracer
+//  entities, flare decoys, gun passes. Uses the latent `aamMissiles`
+//  array (declared since forever, never populated).
+// ═══════════════════════════════════════════════════════════════════
+// Live air-combat counters (probe/debug readout — window.__ffaProbe.airStats)
+window.__airStats = { aamFired: 0, aamHits: 0, gunBursts: 0, flaresUsed: 0, planesDowned: 0, strikeRuns: 0, samAtPlanes: 0, flakHits: 0 };
+
+// Detection envelope of an aircraft from a given observer's side. Stealth
+// (B-2) is invisible to auto-targeting beyond very close range; Su-57/F-22
+// are low-observable (harder to lock, halved envelope). An airborne friendly
+// AWACS within 800km widens the observer's envelope ×1.5.
+function airDetectRange(observer, target) {
+    const C = GAME_CONSTANTS;
+    let r = C.AIR_DETECT_RANGE;
+    if (target.cfg.role === 'stealth') r = C.AIR_STEALTH_DETECT;
+    else if (target.pkey === 'su57' || target.pkey === 'f22') r *= C.AIR_LOW_OBS_MULT;
+    if (observer && observer.awacsBoost) r *= 1.5;
+    return r;
+}
+
+// Rear-arc check: true when `a` sits in the tail hemisphere of `b` (classic
+// rear-aspect IR shot geometry; all-aspect missiles skip this requirement).
+function _isBehind(a, b) {
+    if (!b.prevPos) return false;
+    const fwd = _airV1.copy(b.pos).sub(b.prevPos);
+    if (fwd.lengthSq() < 1e-9) return false;
+    fwd.normalize();
+    const toA = _airV2.copy(a.pos).sub(b.pos).normalize();
+    return fwd.dot(toA) > 0.25;
+}
+
+const _airV1 = new THREE.Vector3();
+const _airV2 = new THREE.Vector3();
+const _airV3 = new THREE.Vector3();
+
+// Short tracer streak between two world points (gun fire visual).
+function _spawnGunTracer(from, to, col) {
+    if (particles.length > GAME_CONSTANTS.MAX_PARTICLES) return;
+    if (!GEO_CACHE['gunTrace']) GEO_CACHE['gunTrace'] = new THREE.BoxGeometry(0.35, 0.35, 3.2);
+    const mat = _getFxMat(col || 0xffee88, 1.0);
+    const m = new THREE.Mesh(GEO_CACHE['gunTrace'], mat);
+    m.position.copy(from).lerp(to, 0.4 + Math.random() * 0.3);
+    m.lookAt(to);
+    m.userData = { life: 0.5, maxLife: 0.09 };
+    scene.add(m);
+    particles.push(m);
+}
+
+// Flare pop: bright decoy sparks streaming behind an aircraft.
+function _spawnFlares(plane) {
+    for (let i = 0; i < 5; i++) {
+        if (particles.length > GAME_CONSTANTS.MAX_PARTICLES) break;
+        if (!GEO_CACHE['flareP']) GEO_CACHE['flareP'] = new THREE.BoxGeometry(0.5, 0.5, 0.5);
+        const mat = _getFxMat(0xffaa33, 1.0);
+        const m = new THREE.Mesh(GEO_CACHE['flareP'], mat);
+        m.position.copy(plane.pos).add(_airV3.set(rnd(-3, 3), rnd(-3, 3), rnd(-3, 3)));
+        m.userData = { life: 1.0, maxLife: 0.03 };
+        scene.add(m);
+        particles.push(m);
+    }
+    if (SFX && SFX.flare) SFX.flare();
+}
+
+// ── AAM: air-to-air missile tracer entity ──
+// Launched with a launch-time probability-of-kill roll (range/aspect/
+// agility/stealth factored). Flies a pursuit curve at AIR_AAM_SPEED;
+// on arrival the target spends a flare to decoy, else takes the hit.
+class AAM {
+    constructor(shooter, tgt) {
+        this.owner = shooter.owner; this.tgt = tgt; this.dead = false;
+        this.pos = shooter.pos.clone();
+        this.speed = GAME_CONSTANTS.AIR_AAM_SPEED;
+        this.life = 110;   // frames before self-destruct (fuel exhaustion)
+        // ── PK roll at launch ──
+        const C = GAME_CONSTANTS;
+        const d = haversineDist(shooter.lat, shooter.lon, tgt.lat, tgt.lon);
+        let p = 0.42;
+        p += (1 - Math.min(1, d / C.AIR_AAM_RANGE)) * 0.20;                     // closer = deadlier
+        if (!shooter.cfg.allAspect && !_isBehind(shooter, tgt)) p -= 0.25;      // rear-aspect seekers
+        else if (shooter.cfg.allAspect) p += 0.05;
+        p += (shooter.cfg.turnRate - tgt.cfg.turnRate) * 1.2;                   // agility edge
+        p -= tgt.cfg.spd * 0.02;                                                // fast targets jink
+        if (tgt.cfg.role === 'stealth') p *= 0.45;                              // B-2 low observable
+        if (tgt.pkey === 'su57' || tgt.pkey === 'f22') p *= 0.7;
+        if (shooter.pkey === 'interceptor' &&
+            (tgt.cfg.role === 'ground' || tgt.cfg.role === 'cas' || tgt.cfg.role === 'stealth')) p += 0.25; // interceptor vs bombers
+        if (tgt.parked) p = 0.95;                                               // sitting duck on the ramp
+        this.pKill = Math.max(0.05, Math.min(0.92, p));
+        this.willHit = Math.random() < this.pKill;
+        this.dmg = C.AIR_AAM_DMG * (shooter.cfg.gunCaliber >= 1 ? 1 : 0.8);
+        // visual: slim white tracer
+        if (!GEO_CACHE['aamBody']) {
+            const g = new THREE.CylinderGeometry(0.22, 0.22, 3.4, 5);
+            g.rotateX(Math.PI / 2);   // cylinder Y-axis → +Z nose (lookAt flies it)
+            GEO_CACHE['aamBody'] = g;
+        }
+        this.mesh = new THREE.Mesh(GEO_CACHE['aamBody'], _getFxMat(0xffffff, 1.0));
+        scene.add(this.mesh);
+        window.__airStats.aamFired++;
+    }
+    update() {
+        if (this.tgt.dead) { this._fizzle(); return; }   // target gone (kill credited elsewhere)
+        this.life--;
+        if (this.life <= 0) { this._fizzle(); return; }
+        // pursuit: 3D lerp toward the target's CURRENT world position
+        _airV1.copy(this.tgt.pos).sub(this.pos);
+        const dist = _airV1.length();
+        const step = this.speed;
+        if (dist <= step + 2.5) { this._resolve(); return; }
+        _airV1.normalize().multiplyScalar(step);
+        this.pos.add(_airV1);
+        this.mesh.position.copy(this.pos);
+        this.mesh.up.copy(this.pos).normalize();
+        _airV2.copy(this.pos).add(_airV1);
+        this.mesh.lookAt(_airV2);
+        if (Math.random() < 0.4) createTrailMesh(this.pos);
+    }
+    _resolve() {
+        const t = this.tgt;
+        // flares first: a stocked, lucky defender decoys the missile
+        if (t.tryDecoy && t.tryDecoy()) {
+            spawnExp(t.lat, t.lon, 2, '#ffcc66');
+            this._fizzle();
+            return;
+        }
+        if (this.willHit) {
+            window.__airStats.aamHits++;
+            t.hit(this.dmg, this.owner);
+            spawnExp(t.lat, t.lon, 4, '#ff8844');
+            if (SFX && SFX.exp) SFX.exp(30);
+        } else {
+            spawnExp(t.lat, t.lon, 1.5, '#888888');   // near miss
+        }
+        this._fizzle();
+    }
+    _fizzle() {
+        this.dead = true;
+        scene.remove(this.mesh);
+        if (this.mesh.material) _recycleMat(this.mesh.material);
+    }
+}
+
 class Plane {
     constructor(lat, lon, cfg, owner) {
         this.id = ++_id; this.lat = lat; this.lon = lon; this.cfg = cfg || PCFG['fighter']; this.owner = owner;
+        this.pkey = Object.keys(PCFG).find(k => PCFG[k] === cfg) || 'fighter';
         this.hp = cfg ? cfg.hp : 100; this.dead = false; this.parked = true;
         this.speed = (cfg ? cfg.spd : 5) * GAME_CONSTANTS.PLANE_SPEED_MULTIPLIER; 
         this.tlat = lat; this.tlon = lon;
         this.mode = 'patrol';
         this.fireT = 0;
+        // ── TASK-201: latent PCFG stats come alive ──
+        this.maxFuel = (cfg && cfg.fuel) || 900; this.fuel = this.maxFuel;
+        this.aaAmmo = (cfg && cfg.aaAmmo) || 0; this.maxAa = this.aaAmmo;
+        this.agAmmo = (cfg && cfg.agAmmo) || 0; this.maxAg = this.agAmmo;
+        this.gunAmmo = (cfg && cfg.gunAmmo) || 0; this.maxGun = this.gunAmmo;
+        this.flares = (cfg && cfg.flares) || 0; this.maxFlares = this.flares;
+        this.airTgt = null;        // current dogfight target
+        this.gndTgt = null;        // current strike target
+        this.gunT = 0;             // gun burst cooldown
+        this.strikeCd = 0;         // weapon-release cooldown (per pass)
+        this.overshootT = 0;       // post-pass fly-through (breaks orbit lock)
+        this.awacsBoost = false;   // set when a friendly AWACS is nearby
+        this.rearmedFlag = true;   // spawn fully armed
+        this.scrambleAt = frame + GAME_CONSTANTS.AIR_BOT_SCRAMBLE_FRAMES;   // AI launch delay
+        this.prevPos = null;
+        this.lastHitBy = null;
         // B4 FIX: Find NEAREST airport, not just the first one in the array
         this.baseStruct = null;
         {
@@ -6160,20 +6581,40 @@ class Plane {
         }
         this.pos = latLonToVec3(lat, lon, EARTH_RADIUS);
         
-        // Use OBJ if cached
+        // ── TASK-201 model chain: authored GLB → OBJ jet → low-poly proxy ──
         let r = this.cfg.role || 'fighter';
         this.modelKey = 'F15';
         if(r === 'stealth') this.modelKey = 'F22';
         else if (owner === 'enemy') this.modelKey = 'Su27'; // rough assignment
         
         this.modelSwapped = false;
+        this.modelSrc = 'proxy';
         
-        if (GLOBAL_MODELS[this.modelKey]) {
+        const glbEntry = AIRCRAFT_MODELS[this.pkey];
+        if (glbEntry) {
+            this._mountGlbModel(glbEntry);
+            this.modelSrc = 'glb';
+        } else if (GLOBAL_MODELS[this.modelKey]) {
             this.swapModel();
+            this.modelSrc = 'obj';
         } else {
             this.mesh = createLowPolyGeo(r, owner==='player'?0x00ff88:0xffaa00);
             scene.add(this.mesh);
         }
+    }
+    
+    // Mount an authored GLB (already normalized +Z nose + span-scaled at load).
+    _mountGlbModel(entry) {
+        if (this.mesh) { scene.remove(this.mesh); disposeMeshDeep(this.mesh); }
+        this.mesh = entry.group.clone(true);
+        // attach the shared selection ring like the OBJ path
+        if(!GEO_CACHE['selRing']) GEO_CACHE['selRing'] = new THREE.RingGeometry(3, 3.5, 16);
+        const ringMat = new THREE.MeshBasicMaterial({color:0xffff00, side:THREE.DoubleSide, transparent:true, opacity:0.8});
+        this.selRing = new THREE.Mesh(GEO_CACHE['selRing'], ringMat);
+        this.selRing.rotation.x = -Math.PI/2;
+        this.mesh.add(this.selRing);
+        scene.add(this.mesh);
+        this.modelSwapped = true;   // no deferred swap needed
     }
     
     swapModel() {
@@ -6197,14 +6638,32 @@ class Plane {
     }
     
     update() {
-        if(!this.modelSwapped && GLOBAL_MODELS[this.modelKey]) this.swapModel();
-        if(this.hp <= 0 && !this.dead) { this.dead = true; scene.remove(this.mesh); if(this.selRing && this.selRing.material) this.selRing.material.dispose(); spawnExp(this.lat, this.lon, 4, '#ffaa00'); return; }
-        if(this.dead) return;
+        // Deferred model upgrade: an authored GLB may land after construction.
+        if (!this.modelSwapped) {
+            const glbEntry = AIRCRAFT_MODELS[this.pkey];
+            if (glbEntry) { this._mountGlbModel(glbEntry); this.modelSrc = 'glb'; }
+            else if (GLOBAL_MODELS[this.modelKey]) { this.swapModel(); this.modelSrc = 'obj'; }
+        }
+        if (this.hp <= 0 && !this.dead) { this.down(this.lastHitBy); return; }
+        if (this.dead) return;
         
-        if(this.selRing) this.selRing.visible = !!this.selected;
+        if (this.selRing) this.selRing.visible = !!this.selected;
 
-        if(this.parked) {
-             if(this.baseStruct && !this.baseStruct.dead) {
+        if (this.parked) {
+             if (this.baseStruct && !this.baseStruct.dead) {
+                 // ── TASK-201: rearm + refuel on the ramp ──
+                 const C = GAME_CONSTANTS;
+                 if (this.fuel < this.maxFuel) this.fuel = Math.min(this.maxFuel, this.fuel + this.maxFuel / C.AIR_REARM_FUEL_FRAMES);
+                 if (this.maxAa > 0) this.aaAmmo = Math.min(this.maxAa, this.aaAmmo + this.maxAa / C.AIR_REARM_AMMO_FRAMES);
+                 if (this.maxAg > 0) this.agAmmo = Math.min(this.maxAg, this.agAmmo + this.maxAg / C.AIR_REARM_AMMO_FRAMES);
+                 if (this.maxGun > 0) this.gunAmmo = Math.min(this.maxGun, this.gunAmmo + this.maxGun / C.AIR_REARM_AMMO_FRAMES);
+                 if (this.maxFlares > 0) this.flares = Math.min(this.maxFlares, this.flares + this.maxFlares / C.AIR_REARM_AMMO_FRAMES);
+                 this.rearmedFlag = this.fuel >= this.maxFuel * 0.99 && this.aaAmmo >= this.maxAa * 0.99 &&
+                     this.agAmmo >= this.maxAg * 0.99 && this.gunAmmo >= this.maxGun * 0.99 && this.flares >= this.maxFlares * 0.99;
+                 // AI air wings auto-scramble once fueled/armed (offline bots only)
+                 if (!isOnline && this.owner !== myRole && this.rearmedFlag && frame >= (this.scrambleAt || 0)) {
+                     this._botScramble();
+                 }
                  // P9 FIX: Use scratch vectors — zero allocations per frame
                  const bPos = _parkV1.copy(this.baseStruct.pos).normalize();
                  const angle = (frame + (this.id * 100)) * 0.03;
@@ -6223,6 +6682,7 @@ class Plane {
                  
                  this.mesh.position.copy(this.pos);
                  this.mesh.up.copy(bPos);
+                 this.prevPos = this.prevPos ? this.prevPos.copy(this.pos) : this.pos.clone();
                  
                  // Ahead position (for lookAt orientation) — reuse scratch vectors
                  const aheadAngle = angle + 0.1;
@@ -6232,7 +6692,7 @@ class Plane {
                  _parkV6.add(_parkV5.copy(up).multiplyScalar(sinA2));
                  
                  this.mesh.lookAt(_parkV6);
-                 if(this.mesh.isGroup) this.mesh.rotateY(Math.PI/2);
+                 if (this.modelSrc === 'obj') this.mesh.rotateY(Math.PI/2);
                  this.mesh.visible = true; 
                  
              } else {
@@ -6241,39 +6701,69 @@ class Plane {
              return;
         }
 
-        if(this.fireT > 0) this.fireT--;
+        if (this.fireT > 0) this.fireT--;
+        if (this.gunT > 0) this.gunT--;
+        if (this.strikeCd > 0) this.strikeCd--;
+        if (this.overshootT > 0) this.overshootT--;
+
+        // ── TASK-201: fuel — burn airborne, force RTB at 25%, crash at 0 ──
+        this.fuel -= GAME_CONSTANTS.AIR_BURN_RATE;
+        if (this.fuel <= 0) { this._crash(); return; }
+        if (this.fuel < this.maxFuel * GAME_CONSTANTS.AIR_RTB_FUEL_PCT && this.mode !== 'return') {
+            this.mode = 'return';
+            this.airTgt = null;
+            if (this.owner === myRole) logEvent(`⛽ ${this.cfg.name}: وقود منخفض — عودة للقاعدة`, 'info');
+        }
+
+        // AWACS boost refresh (staggered per-plane)
+        if (frame % 60 === this.id % 60) {
+            this.awacsBoost = planes.some(q => !q.dead && !q.parked && q.owner === this.owner &&
+                q.cfg.role === 'awacs' && haversineDist(this.lat, this.lon, q.lat, q.lon) < 800);
+        }
+
+        // air-combat: scan (staggered) + weapons (fast cadence)
+        if (frame % 15 === this.id % 15) this._dogfightScan();
+        if (frame % 4 === this.id % 4) this._dogfightWeapons();
+
+        // strike tick scans structs — staggered per-plane for perf (steering
+        // persists between ticks via tlat/tlon)
+        if (this.mode === 'attack' && frame % 4 === this.id % 4) this._strikeTick();
+
+        // Dogfight steering overrides the mission heading while engaged
+        // (except during a post-burst overshoot fly-through).
+        if (this.airTgt && !this.airTgt.dead && this.overshootT <= 0) {
+            this.tlat = this.airTgt.lat; this.tlon = this.airTgt.lon;
+        }
 
         let targetVec = latLonToVec3(this.tlat, this.tlon, EARTH_RADIUS + 50.0); 
         let dist = this.pos.distanceTo(targetVec);
 
-        if(this.mode === 'return') {
-            if(this.baseStruct && !this.baseStruct.dead) {
+        if (this.mode === 'return') {
+            if (this.baseStruct && !this.baseStruct.dead) {
                 targetVec = latLonToVec3(this.baseStruct.lat, this.baseStruct.lon, EARTH_RADIUS + 50.0);
-                if(this.pos.distanceTo(targetVec) < 2) {
+                dist = this.pos.distanceTo(targetVec);
+                if (dist < 2) {
                     this.parked = true;
+                    this.mode = 'patrol';
+                    this.airTgt = null; this.gndTgt = null;
+                    if (!isOnline && this.owner !== myRole) this.scrambleAt = frame + GAME_CONSTANTS.AIR_BOT_SCRAMBLE_FRAMES;
                     return;
                 }
             } else {
                 this.mode = 'patrol'; 
             }
-        } else if(dist < 5 && this.mode === 'attack') {
-            if(this.fireT <= 0) {
-                let enemies = structs.filter(s=>s.owner!==this.owner && !s.dead);
-                if(enemies.length) {
-                    let closest = enemies.sort((a,b) => dst(this, a) - dst(this, b))[0];
-                    if(closest && dst(this, closest) < 20) {
-                        let m = new Missile(this.lat, this.lon, closest.lat, closest.lon, MCFG['cruise'], this.owner);
-                        missiles.push(m);
-                        this.fireT = 150;
-                        this.mode = 'return';
-                    }
-                }
-            }
+        } else if (this.mode === 'patrol' && !isOnline && this.owner !== myRole && dist < 10) {
+            // AI patrol plane reached its waypoint → new mission (CAP or strike)
+            this._botScramble();
+            return;
         }
 
         let curNormalized = this.pos.clone().normalize();
         let targetNormalized = targetVec.clone().normalize();
         let slerpSpeed = Math.min(1.0, this.speed / Math.max(0.1, dist));
+        // TASK-201: turnRate now matters — agile fighters corner inside
+        // heavy airframes (only bites when maneuvering near the target).
+        slerpSpeed *= (0.55 + this.cfg.turnRate * 1.8);
         
         let curVec = curNormalized.clone().lerp(targetNormalized, slerpSpeed).normalize().multiplyScalar(EARTH_RADIUS + 50.0);
         this.lat = vec3ToLatLon(curVec).lat; this.lon = vec3ToLatLon(curVec).lon;
@@ -6284,10 +6774,260 @@ class Plane {
         let aheadVec = curVec.clone().normalize().lerp(targetNormalized, 0.1).normalize().multiplyScalar(EARTH_RADIUS + 50.0);
         this.mesh.lookAt(aheadVec);
         
-        // Some OBJ models point towards X originally, so adjust if it's the custom model
-        if(this.mesh.isGroup) this.mesh.rotateY(Math.PI/2); 
+        // OBJ jets nose +X; GLB/proxy already fly +Z
+        if (this.modelSrc === 'obj') this.mesh.rotateY(Math.PI/2); 
 
+        if (this.prevPos) this.prevPos.copy(this.pos); else this.prevPos = this.pos.clone();
         this.pos.copy(curVec);
+        // light contrail
+        if (Math.random() < 0.12) createTrailMesh(curVec);
+    }
+
+    // ═══ TASK-201: combat methods ═══
+
+    // Spend a flare against an incoming AAM/SAM. True = decoyed.
+    tryDecoy() {
+        if (this.flares <= 0) return false;
+        this.flares--;
+        window.__airStats.flaresUsed++;
+        _spawnFlares(this);
+        return Math.random() < GAME_CONSTANTS.AIR_FLARE_DECOY;
+    }
+
+    hit(dmg, by) {
+        if (this.dead) return;
+        this.hp -= dmg;
+        if (by) this.lastHitBy = by;
+        if (this.hp <= 0) this.down(by);
+    }
+
+    down(by) {
+        if (this.dead) return;
+        this.dead = true;
+        window.__airStats.planesDowned++;
+        spawnExp(this.lat, this.lon, 9, '#ff8833');
+        if (SFX && SFX.exp) SFX.exp(60);
+        if (this.owner === myRole) logEvent(`💥 أسقط العدو طائرتنا ${this.cfg.name}!`, 'err');
+        else if (by === myRole) logEvent(`🎉 أسقطنا ${this.cfg.name} للعدو!`, 'info');
+        scene.remove(this.mesh);
+        disposeMeshDeep(this.mesh);
+        this.mesh = null;
+        if (this.selRing && this.selRing.material) this.selRing.material.dispose();
+    }
+
+    _crash() {
+        this.dead = true;
+        window.__airStats.planesDowned++;
+        spawnExp(this.lat, this.lon, 7, '#ffaa00');
+        if (this.owner === myRole) logEvent(`⛽ ${this.cfg.name}: نفد الوقود — تحطمت!`, 'err');
+        scene.remove(this.mesh);
+        disposeMeshDeep(this.mesh);
+        this.mesh = null;
+        if (this.selRing && this.selRing.material) this.selRing.material.dispose();
+    }
+
+    // ── Air-to-air target acquisition ──
+    _dogfightScan() {
+        const C = GAME_CONSTANTS;
+        this.airTgt = null;
+        if (this.cfg.role === 'awacs') {
+            // AWACS never fights — it flees contacts toward its base
+            for (const q of planes) {
+                if (q.dead || q.owner === this.owner || q.parked) continue;
+                if (haversineDist(this.lat, this.lon, q.lat, q.lon) < 250) {
+                    this.mode = 'return';
+                    break;
+                }
+            }
+            return;
+        }
+        if (this.aaAmmo <= 0 && this.gunAmmo <= 0) return;   // toothless
+        // Fighters/interceptors hunt; everything else defends only when
+        // an enemy is right on top of them (bombers press on to the target).
+        const aggressive = this.cfg.role === 'air' || this.cfg.role === 'intercept';
+        let best = null, bestD = Infinity;
+        for (const q of planes) {
+            if (q.dead || q.owner === this.owner || q.parked) continue;
+            const d = haversineDist(this.lat, this.lon, q.lat, q.lon);
+            const dr = airDetectRange(this, q);
+            if (d >= dr) continue;                       // stealth gate
+            if (!aggressive) {
+                const defensiveR = (q.airTgt === this) ? 160 : C.AIR_GUN_RANGE;
+                if (d >= defensiveR) continue;
+            }
+            if (d < bestD) { bestD = d; best = q; }
+        }
+        this.airTgt = best;
+    }
+
+    // ── Air-to-air weapons: AAM salvos + gun passes ──
+    _dogfightWeapons() {
+        const C = GAME_CONSTANTS;
+        const t = this.airTgt;
+        if (!t || t.dead) return;
+        const d = haversineDist(this.lat, this.lon, t.lat, t.lon);
+        // AAM launch: within envelope, aspect allows, cooldown ready
+        if (d < C.AIR_AAM_RANGE && this.aaAmmo > 0 && this.fireT <= 0) {
+            if (this.cfg.allAspect || _isBehind(this, t) || d < C.AIR_GUN_RANGE) {
+                const salvo = Math.max(1, Math.min(this.cfg.aamCount || 1, this.aaAmmo));
+                for (let i = 0; i < salvo; i++) aamMissiles.push(new AAM(this, t));
+                this.aaAmmo -= salvo;
+                this.fireT = 110;
+                if (SFX && SFX.launch) SFX.launch('small');
+                return;
+            }
+        }
+        // Gun pass: close + aligned down the shooter's nose
+        if (d < C.AIR_GUN_RANGE && this.gunAmmo > 0 && this.gunT <= 0 && this.cfg.gunCaliber > 0) {
+            const fwd = _airV1.copy(this.pos).sub(this.prevPos || this.pos);
+            if (fwd.lengthSq() > 1e-9) {
+                fwd.normalize();
+                const toT = _airV2.copy(t.pos).sub(this.pos).normalize();
+                const align = fwd.dot(toT);
+                if (align > 0.75) {
+                    const burst = Math.min(35, this.gunAmmo);
+                    this.gunAmmo -= burst;
+                    t.hit(burst * C.AIR_GUN_BURST_DMG * this.cfg.gunCaliber * align / 10, this.owner);
+                    window.__airStats.gunBursts++;
+                    _spawnGunTracer(this.pos, t.pos);
+                    if (SFX && SFX.gun) SFX.gun();
+                    this.gunT = 22;
+                    this.overshootT = 40;   // fly through, then re-attack
+                }
+            }
+        }
+    }
+
+    // ── Air-to-ground: role-differentiated strike runs ──
+    _strikeTick() {
+        const C = GAME_CONSTANTS;
+        // acquire / validate the ground target near the ordered point
+        if (!this.gndTgt || this.gndTgt.dead) {
+            this.gndTgt = null;
+            let best = null, bestD = 300;
+            for (const s of structs) {
+                if (s.dead || s.owner === this.owner) continue;
+                const d = haversineDist(this.tlat, this.tlon, s.lat, s.lon);
+                if (d < bestD) { bestD = d; best = s; }
+            }
+            this.gndTgt = best;
+            if (!best) { this.mode = 'patrol'; return; }   // nothing to strike here
+        }
+        const t = this.gndTgt;
+        const d = haversineDist(this.lat, this.lon, t.lat, t.lon);
+        const role = this.cfg.role;
+
+        if (this.pkey === 'gunship') { this._gunshipOrbit(t, d); return; }
+
+        // pass steering (gunship orbits instead — handled above)
+        if (this.overshootT <= 0) { this.tlat = t.lat; this.tlon = t.lon; }
+
+        const releaseRange = role === 'ground' ? C.AIR_STRIKE_RANGE_BOMBER
+            : (role === 'cas' || role === 'heli') ? C.AIR_STRIKE_RANGE_CAS
+            : C.AIR_STRIKE_RANGE_DEFAULT;
+        if (d > releaseRange || this.strikeCd > 0) return;
+
+        if (this.agAmmo >= 1) {
+            if (role === 'ground') this._carpetBomb(t);
+            else if (role === 'cas') this._precisionStrike(t);
+            else this._lightStrike(t);
+            this.agAmmo -= 1;
+            this.strikeCd = 150;
+            this.overshootT = 55;
+            window.__airStats.strikeRuns++;
+        } else if (this.gunAmmo > 0 && this.cfg.gunCaliber > 0 && role !== 'ground') {
+            this._gunStrafe(t);   // dry on ordnance → gun harassment
+        } else {
+            this.mode = 'return';   // Winchester → RTB to rearm
+            if (this.owner === myRole) logEvent(`🔙 ${this.cfg.name}: نفد الذخيرة — عودة للتسليح`, 'info');
+        }
+    }
+
+    // Bomber (Su-24): area carpet — a stick of bombs across the footprint.
+    _carpetBomb(aim) {
+        const R = 28;   // km blast footprint
+        for (const s of structs) {
+            if (s.dead || s.owner === this.owner) continue;
+            if (haversineDist(aim.lat, aim.lon, s.lat, s.lon) < R) s.hit(90);
+        }
+        for (let i = 0; i < 6; i++) {
+            spawnExp(aim.lat + rnd(-0.2, 0.2), aim.lon + rnd(-0.25, 0.25), rnd(3, 6), '#ffaa44');
+        }
+        if (SFX && SFX.exp) SFX.exp(50);
+    }
+
+    // A-10 / heli (CAS): anti-armor precision — missiles + the gun, hard-target bonus.
+    _precisionStrike(t) {
+        const HARD = { launcher: 1, sam: 1, himars: 1, ciws: 1, iron_dome: 1, nuke_plant: 1 };
+        t.hit(HARD[t.type] ? 190 : 120);
+        spawnExp(t.lat, t.lon, 4, '#ffcc66');
+        if (SFX && SFX.exp) SFX.exp(30);
+    }
+
+    // Fighters / multirole: light standoff AGM pop at a single target.
+    _lightStrike(t) {
+        t.hit(55);
+        spawnExp(t.lat, t.lon, 3, '#ffdd88');
+        if (SFX && SFX.exp) SFX.exp(20);
+    }
+
+    // Dry bomberless gun harassment for aircraft still packing rounds.
+    _gunStrafe(t) {
+        const burst = Math.min(30, this.gunAmmo);
+        this.gunAmmo -= burst;
+        t.hit(burst * GAME_CONSTANTS.AIR_GUN_BURST_DMG * this.cfg.gunCaliber / 12);
+        _spawnGunTracer(this.pos, t.pos);
+        if (SFX && SFX.gun) SFX.gun();
+        this.strikeCd = 90;
+        window.__airStats.strikeRuns++;
+    }
+
+    // AC-130 gunship: sustained orbit — pulses damage around the aim point.
+    _gunshipOrbit(t, d) {
+        const C = GAME_CONSTANTS;
+        if (frame % 30 === this.id % 30) {
+            const a = frame * 0.02 + this.id;
+            this.tlat = t.lat + Math.cos(a) * 0.25;
+            this.tlon = t.lon + Math.sin(a) * 0.25;
+        }
+        if (d > C.AIR_GUNSHIP_ORBIT + 15 || this.strikeCd > 0) return;
+        if (this.agAmmo >= 0.25) {
+            this.agAmmo -= 0.25;
+            for (const s of structs) {
+                if (s.dead || s.owner === this.owner) continue;
+                if (haversineDist(t.lat, t.lon, s.lat, s.lon) < 26) s.hit(16);
+            }
+            spawnExp(t.lat + rnd(-0.08, 0.08), t.lon + rnd(-0.1, 0.1), 2.5, '#ffaa55');
+            if (SFX && SFX.gun) SFX.gun();
+            window.__airStats.strikeRuns++;
+            this.strikeCd = 40;   // ~0.7s between pulses = sustained rain
+            if (this.agAmmo < 0.25) {
+                this.mode = 'return';
+                if (this.owner === myRole) logEvent(`🔙 ${this.cfg.name}: نفد الذخيرة — عودة للتسليح`, 'info');
+            }
+        }
+    }
+
+    // AI (offline bots): launch from the ramp into a CAP or strike mission.
+    _botScramble() {
+        const base = this.baseStruct;
+        if (!base) return;
+        this.parked = false;
+        this.mode = 'patrol';
+        this.airTgt = null; this.gndTgt = null;
+        this.scrambleAt = frame + GAME_CONSTANTS.AIR_BOT_SCRAMBLE_FRAMES;
+        if (this.agAmmo > 0 && Math.random() < 0.45) {
+            let best = null, bestD = 1500;
+            for (const s of structs) {
+                if (s.dead || s.owner === this.owner) continue;
+                const d = haversineDist(base.lat, base.lon, s.lat, s.lon);
+                if (d < bestD) { bestD = d; best = s; }
+            }
+            if (best) { this.mode = 'attack'; this.tlat = best.lat; this.tlon = best.lon; return; }
+        }
+        const ang = Math.random() * Math.PI * 2, r = rnd(120, 350) / 111;
+        this.tlat = base.lat + Math.cos(ang) * r * 0.7;
+        this.tlon = base.lon + Math.sin(ang) * r;
     }
 }
 
@@ -6320,6 +7060,19 @@ function fireSAM(src, tgt) {
     const m = new Missile(src.lat, src.lon, tgt.lat || 0, tgt.lon || 0, MCFG['ballistic'], src.owner, true);
     m.tgt = tgt;
     m.speed = GAME_CONSTANTS.SAM_INTERCEPT_SPEED_KM_S;   // km/s — out-runs ~500km/s attackers
+    missiles.push(m);
+}
+
+// TASK-201: SAM/iron-dome interceptor against AIRCRAFT — same pursuit
+// mechanics as fireSAM, but the aircraft can decoy with flares and takes
+// damage instead of an instant kill (see Missile.update tgtIsPlane branch).
+function fireSAMPlane(src, plane) {
+    const m = new Missile(src.lat, src.lon, plane.lat, plane.lon, MCFG['ballistic'], src.owner, true);
+    m.tgt = plane;
+    m.tgtIsPlane = true;
+    m.dmgVsPlane = GAME_CONSTANTS.AIR_SAM_DMG;
+    m.speed = GAME_CONSTANTS.SAM_INTERCEPT_SPEED_KM_S / 3;   // slower vs agile targets
+    m.mesh.scale.setScalar(0.6);                              // slimmer AA look
     missiles.push(m);
 }
 
@@ -7838,13 +8591,15 @@ function applyOpponentAction(action) {
         structs.push(new Structure(action.lat, action.lon, action.btype, oS));
     }
     if (action.type === 'plane_move') {
-        // Find plane by ID or type? Better by type for simplification in this build
-        // Or just spawn a remote plane proxy
-        let p = planes.find(p => p.owner === oS && p.cfg.name === PCFG[action.ptype].name);
+        // Match by plane id first (TASK-201, scoped to the sender's planes),
+        // else fall back to type matching
+        let p = (action.pid != null && planes.find(q => q.owner === oS && q.id === action.pid))
+            || planes.find(p => p.owner === oS && p.cfg.name === PCFG[action.ptype].name);
         if(p) {
             p.tlat = action.tlat;
             p.tlon = action.tlon;
             p.parked = false;
+            if (action.mode) { p.mode = action.mode; p.gndTgt = null; }
         }
     }
     if(action.type === 'spawn_plane') {
@@ -8266,6 +9021,15 @@ function updateSelectionPanel() {
             structInfo[unit.type]().forEach(row => {
                 statsHtml += `<div class="sstat"><span>${row.k}</span><span>${row.v}</span></div>`;
             });
+        } else if (unit.fuel !== undefined) {
+            // TASK-201: aircraft station readout — fuel + stores + mode
+            const fp = Math.round((unit.fuel / unit.maxFuel) * 100);
+            statsHtml += `<div class="sstat"><span>وضع</span><span>${unit.parked ? 'مركونة (تسليح)' : unit.mode}</span></div>`;
+            statsHtml += `<div class="sstat"><span>⛽ وقود</span><span>${fp}%${fp < 25 ? ' ⚠️' : ''}</span></div>`;
+            statsHtml += `<div class="sstat"><span>🚀 جو-جو</span><span>${Math.floor(unit.aaAmmo)}/${unit.maxAa}</span></div>`;
+            statsHtml += `<div class="sstat"><span>💥 جو-أرض</span><span>${Math.floor(unit.agAmmo)}/${unit.maxAg}</span></div>`;
+            statsHtml += `<div class="sstat"><span>🔫 رشاش</span><span>${Math.floor(unit.gunAmmo)}/${unit.maxGun}</span></div>`;
+            statsHtml += `<div class="sstat"><span>✨ شعلات</span><span>${Math.floor(unit.flares)}/${unit.maxFlares}</span></div>`;
         } else if (unit.mode) {
             statsHtml += `<div class="sstat"><span>وضع</span><span>${unit.mode}</span></div>`;
         }
@@ -8327,7 +9091,8 @@ window.orderPlanesAt = function(mode, lat, lon) {
         p.tlon = tLon + offsetLon;
         p.mode = mode;
         p.parked = false;
-        if (isOnline) sendAction({ type: 'plane_move', ptype: p.cfg === PCFG['fighter'] ? 'fighter' : 'fighter', tlat: p.tlat, tlon: p.tlon });
+        p.gndTgt = null;   // re-acquire near the new aim point
+        if (isOnline) sendAction({ type: 'plane_move', ptype: p.pkey, pid: p.id, tlat: p.tlat, tlon: p.tlon, mode });
     });
     logEvent(`تم توجيه ${sel.planes.length} طائرة: ${mode}`, 'info');
 };
@@ -9188,6 +9953,7 @@ function initWorld(difficulty, pCountryKey='usa', eCountryKey='random', gameMode
     structs.forEach(s => { if(s.mesh) { scene.remove(s.mesh); disposeMeshDeep(s.mesh); } if(s.selRing) { scene.remove(s.selRing); disposeMeshDeep(s.selRing); } });
     missiles.forEach(m => { if(m.mesh) { scene.remove(m.mesh); disposeMeshDeep(m.mesh); } });
     planes.forEach(p => { if(p.mesh) { scene.remove(p.mesh); disposeMeshDeep(p.mesh); } if(p.selRing) { scene.remove(p.selRing); disposeMeshDeep(p.selRing); } });
+    aamMissiles.forEach(m => { if(m.mesh) { scene.remove(m.mesh); if(m.mesh.material) _recycleMat(m.mesh.material); } });   // TASK-201 AAM tracers
     exps.forEach(e => { scene.remove(e); disposeMeshDeep(e); });
     particles.forEach(p => { scene.remove(p); disposeMeshDeep(p); });
     tradeShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
@@ -9959,6 +10725,33 @@ function runAI() {
             _spendRes(riv, wc);
         }
     }
+
+    // 5. AI Air Force (TASK-201) — rivals with an airport grow a mixed wing.
+    //    Weighted buys: cheap fighters early, interceptors/A-10s mid, bombers
+    //    + Su-57 when rich. Cap keeps the sky sane.
+    if (window.gameMode === 'mode1' && frame % GAME_CONSTANTS.AI_TICK_RATE === 0) {
+        const C = GAME_CONSTANTS;
+        const MIX = [
+            { k: 'fighter', w: 4 }, { k: 'interceptor', w: 2 }, { k: 'a10', w: 2 },
+            { k: 'bomber', w: 1.5 }, { k: 'heli', w: 1 }, { k: 'gunship', w: 0.6 },
+            { k: 'su57', w: 0.4 }, { k: 'stealth', w: 0.2 },
+        ];
+        for (const riv of _rivals()) {
+            const myPlanes = planes.reduce((n, p) => n + (!p.dead && p.owner === riv.str ? 1 : 0), 0);
+            if (myPlanes >= C.AIR_AI_MAX_PLANES) continue;
+            const apt = structs.find(s => !s.dead && s.owner === riv.str && s.type === 'airport');
+            if (!apt) continue;
+            if (Math.random() > 0.35) continue;   // cadenced by AI_TICK_RATE
+            // weighted pick within budget
+            const budget = _resOf(riv) - 400;   // keep a reserve for rebuilding
+            let pool = MIX.filter(m => PCFG[m.k].cost <= budget);
+            if (!pool.length) continue;
+            let total = pool.reduce((s, m) => s + m.w, 0), roll = Math.random() * total, pick = pool[0];
+            for (const m of pool) { roll -= m.w; if (roll <= 0) { pick = m; break; } }
+            planes.push(new Plane(apt.lat, apt.lon, PCFG[pick.k], riv.str));
+            _spendRes(riv, PCFG[pick.k].cost);
+        }
+    }
 }
 
 // Fixed-timestep game loop: logic always runs at exactly 60 ticks/sec of GAME
@@ -10095,6 +10888,8 @@ function gameFrame() {
     _compactAlive(missiles, m => m.update());
     for (let p of planes) p.update();
     _compactDead(planes);
+    // TASK-201: air-to-air missile tracers
+    _compactAlive(aamMissiles, m => m.update());
     
     // Update OpenFront objects
     _compactAlive(tradeShips, ts => ts.update());
@@ -10360,6 +11155,7 @@ function backToMenu() {
     structs.forEach(s => { if(s.mesh) { scene.remove(s.mesh); disposeMeshDeep(s.mesh); } if(s.selRing) { scene.remove(s.selRing); disposeMeshDeep(s.selRing); } });
     missiles.forEach(m => { if(m.mesh) { scene.remove(m.mesh); disposeMeshDeep(m.mesh); } });
     planes.forEach(p => { if(p.mesh) { scene.remove(p.mesh); disposeMeshDeep(p.mesh); } if(p.selRing) { scene.remove(p.selRing); disposeMeshDeep(p.selRing); } });
+    aamMissiles.forEach(m => { if(m.mesh) { scene.remove(m.mesh); if(m.mesh.material) _recycleMat(m.mesh.material); } });   // TASK-201 AAM tracers
     tradeShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
     transportShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
     warships.forEach(w => { if(w.mesh) { scene.remove(w.mesh); disposeMeshDeep(w.mesh); } w.shells.forEach(sh => scene.remove(sh.mesh)); });

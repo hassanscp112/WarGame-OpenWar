@@ -89,6 +89,31 @@ export const GAME_CONSTANTS = {
   // Was 0.005 (fighter 1.65 km/s — slower than conquest frontier!).
   // Now fighter ≈ 50 km/s, F-22 ≈ 81 — planes cross continents in ~1 min.
   PLANE_SPEED_MULTIPLIER: 0.15,
+  // ── Air Force system (TASK-201) ──
+  // Ranges are GROUND km (planes fly ~22-81 km/s — envelopes must be wide
+  // or engagements last a single frame).
+  AIR_DETECT_RANGE: 400,       // km — air-to-air acquisition (radar + visual)
+  AIR_STEALTH_DETECT: 30,      // km — stealth aircraft (B-2) only lockable this close
+  AIR_LOW_OBS_MULT: 0.55,      // Su-57/F-22 detection multiplier against hunters
+  AIR_AAM_RANGE: 300,          // km — AAM launch envelope
+  AIR_GUN_RANGE: 60,           // km — gun-pass envelope
+  AIR_STRIKE_RANGE_DEFAULT: 40,// km — default AGM release range (fighters/heli)
+  AIR_STRIKE_RANGE_BOMBER: 60, // km — bomber carpet-release range
+  AIR_STRIKE_RANGE_CAS: 45,    // km — A-10/heli precision release range
+  AIR_GUNSHIP_ORBIT: 80,       // km — AC-130 standoff orbit radius around aim point
+  AIR_BURN_RATE: 0.5,          // fuel/frame airborne (fighter 900 → 30s sortie)
+  AIR_RTB_FUEL_PCT: 0.25,      // fuel fraction below which planes force RTB
+  AIR_REARM_FUEL_FRAMES: 300,  // parked refuel to full (5s)
+  AIR_REARM_AMMO_FRAMES: 420,  // parked rearm to full (7s)
+  AIR_FLARE_DECOY: 0.55,       // base decoy chance per flare pop vs AAM/SAM
+  AIR_AAM_DMG: 55,             // damage per AAM hit
+  AIR_AAM_SPEED: 6.0,          // km/frame — AAM tracer speed (out-runs any jet)
+  AIR_GUN_BURST_DMG: 6,        // per-round damage × gunCaliber × alignment
+  AIR_FLAK_DMG: 16,            // flak barrage tick damage vs aircraft
+  AIR_CIWS_DMG: 11,            // CIWS pulse damage vs aircraft
+  AIR_SAM_DMG: 65,             // SAM interceptor damage vs aircraft
+  AIR_AI_MAX_PLANES: 6,        // air wing size cap per rival bot
+  AIR_BOT_SCRAMBLE_FRAMES: 360,// bot parked-plane auto-launch delay (6s)
   SAM_INTERCEPT_SPEED: 0.004,   // legacy (unused)
   MAX_PARTICLES: 200,
   // Zone of Control
