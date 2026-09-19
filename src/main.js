@@ -6062,6 +6062,7 @@ class Structure {
         this.hp = d.hp; this.maxHp = d.hp;
         this.reload = 0; this.maxReload = d.reload; this.name = cityName || d.name;
         this.dead = false; this.selected = false;
+        this.empT = 0;   // TASK-204: EMP/jam countdown — freezes reload + scans + radar
         this.radarRange = d.radarRange || (type==='base'||type==='city'?150:0);
         this.fireRange = d.fireRange || 0;
         this.planes = [];
@@ -6122,13 +6123,16 @@ class Structure {
             if (this.anim.rail) this.anim.rail.rotation.y = Math.sin(frame * 0.004 + this.id) * 0.25;
             if (this.anim.barrels && this.type === 'ciws') this.anim.barrels.rotation.x -= 0.08;
         }
-        if(this.reload > 0) this.reload--;
+        // TASK-204: EMP/jam window — reloads FROZEN, defense scans + radar dark.
+        if (this.empT > 0) { this.empT--; }
+        else if (this.reload > 0) this.reload--;
         // Air-defense scan — every 2 frames (was 5: fast missiles spent only
         // ~7-30 ticks inside short-range envelopes like CIWS 15km and could
         // exit between scans). missiles[] is small (<50) — trivial cost.
         // Stealth missiles are radar-invisible and hypersonics too fast to lock —
         // auto-defense skips both (they must be absorbed or dodged).
-        if(this.reload === 0 && this.fireRange > 0 && frame % 2 === 0) {
+        // EMP'd batteries (empT) don't scan at all — the EMP push window.
+        if(this.reload === 0 && this.fireRange > 0 && this.empT <= 0 && frame % 2 === 0) {
             // Target selection: the enemy missile CLOSEST TO IMPACT on anything
             // we own (i.e., most progress) inside our envelope — defends what
             // matters instead of whichever missile the array order finds first.
@@ -6139,7 +6143,10 @@ class Structure {
             for (const m of missiles) {
                 if (m.dead || m.owner === this.owner) continue;
                 if (m.cfg.type === 'stealth' || m.cfg.type === 'hyper') continue;
-                if (haversineDist(this.lat, this.lon, m.lat, m.lon) >= this.fireRange) continue;
+                // TASK-204 radar chain: a friendly radar (or recon drone)
+                // covering the missile gives SAMs early lock (×2.2 range).
+                const effR = this.type === 'sam' ? _samEffRange(this, m) : this.fireRange;
+                if (haversineDist(this.lat, this.lon, m.lat, m.lon) >= effR) continue;
                 if (m.progress > bestProg) { bestProg = m.progress; trg = m; }
             }
             if(trg) { fireSAM(this, trg); this.reload = this.maxReload; }
@@ -6149,7 +6156,8 @@ class Structure {
         // missile interception fix (offset frame parity to spread the cost).
         // Stealth is radar-invisible beyond close range; speed = exposure —
         // fast jets spend few ticks inside the envelope, slow CAS loiters in it.
-        if (this.fireRange > 0 && frame % 2 === 1 && this.reload === 0) {
+        // TASK-204: EMP/jam blinds this scan too — electronics are electronics.
+        if (this.fireRange > 0 && frame % 2 === 1 && this.reload === 0 && this.empT <= 0) {
             for (const p of planes) {
                 if (p.dead || p.parked || p.owner === this.owner) continue;
                 const engageR = Math.min(this.fireRange, airDetectRange(null, p));
@@ -6181,12 +6189,18 @@ class Structure {
 }
 
 class Missile {
-    constructor(slat, slon, tlat, tlon, cfg, owner, isSAM=false) {
+    constructor(slat, slon, tlat, tlon, cfg, owner, isSAM=false, launchStyle='silo') {
         this.id = ++_id; this.cfg = cfg || MCFG['ballistic']; this.owner = owner; this.isSAM = isSAM;
         this.lat = slat; this.lon = slon;
         this.tlat = tlat; this.tlon = tlon;
         this.tgt = null;
         this.progress = 0; this.dead = false;
+        // TASK-204: launch platform style (silo | rail | sub | air) + the
+        // one-shot evade charge (flare/chaff vs the FIRST interceptor).
+        this.launchStyle = isSAM ? null : launchStyle;
+        this.evadeUsed = false;
+        this.phase = 'boost';
+        this.subT = (!isSAM && launchStyle === 'sub') ? 26 : 0;   // buoy pop-up hold
         this.startVec = latLonToVec3(slat, slon);
         this.targetVec = latLonToVec3(tlat, tlon);
         this.dist = this.startVec.distanceTo(this.targetVec);
@@ -6200,10 +6214,22 @@ class Missile {
         this.isWarhead = false;
         this.mirvDone = false;
         this.mesh = buildMissileModel(this.mkey, owner);
+        if (this.subT > 0) this.mesh.visible = false;   // underwater until pop-up
         scene.add(this.mesh);
+        if (!isSAM && this.launchStyle !== 'air') _launchFlash(slat, slon, this.launchStyle);
         if(SFX && SFX.launch) SFX.launch(this.cfg.type);
     }
     update() {
+        // SUBSURFACE HOLD: the booster waits under the surface, then the buoy
+        // pops, water sheets off, and the flight begins (launch variety).
+        if (this.subT > 0) {
+            this.subT--;
+            if (this.subT === 0) {
+                this.mesh.visible = true;
+                _subSurfaceSplash(this.lat, this.lon);
+            }
+            return;
+        }
         if(this.isSAM && this.tgt && !this.tgt.dead) {
             this.tlat = this.tgt.lat; this.tlon = this.tgt.lon;
             this.targetVec.copy(this.tgt.pos || latLonToVec3(this.tlat, this.tlon));
@@ -6231,10 +6257,21 @@ class Missile {
                         return;
                     }
                 } else
+                // TASK-204: vs MISSILE — ONE flare/chaff dodge vs the FIRST
+                // interceptor of the flight (cfg.samEvade — was a dead stat).
                 if (this.pos.distanceTo(this.targetVec) < 2 + (this.tgt.speed ? this.tgt.speed / 60 : 0.5) + this.speed / 60) {
+                    const ev = this.tgt.cfg ? (this.tgt.cfg.samEvade || 0) : 0;
+                    if (!this.tgt.evadeUsed && ev > 0 && Math.random() < ev) {
+                        this.tgt.evadeUsed = true;
+                        _flareBurst(this.tgt);
+                        logEvent('🪂 شلب حراري! تفادى الصاروخ أول صائدة', 'warn');
+                        this.explode();   // decoyed interceptor self-destructs — missile survives
+                        return;
+                    }
                     this.tgt.dead = true;
-                    // Interception flash at the kill point (visible confirmation)
+                    // Interception flash at the kill point + falling debris
                     spawnExp(this.tgt.lat, this.tgt.lon, 3, '#88ffcc');
+                    _debrisBurst(this.targetVec, 5);
                     logEvent('🛡️ اعتراض ناجح! أسقطت الدفاع الجوي صاروخاً معادياً', 'info');
                     this.explode();
                     return;
@@ -6244,7 +6281,26 @@ class Missile {
         
         // Distance-aware advance: km/s ÷ 60 = km per TICK, as a fraction of
         // the total flight distance.
-        this.progress += (this.speed / 60 / Math.max(1, this.dist)) * (this.isSAM ? 1.5 : 1.0);
+        // TASK-204 FLIGHT PROFILE — boost / coast / re-entry (fast-slow-fast):
+        // ballistics claw off the pad, coast through the arc, then sprint on
+        // re-entry; hypersonics skip straight to sprint; cruise-profile types
+        // (cruise/stealth/emp) fly steady. Rail launches boost harder than silo.
+        let phaseMul = 1.0;
+        if (!this.isSAM) {
+            const bt = this.cfg.type;
+            if (bt === 'hyper') { this.phase = this.progress < 0.1 ? 'boost' : 'reentry'; phaseMul = this.progress < 0.1 ? 0.8 : 1.35; }
+            else if (bt === 'ballistic' || bt === 'cluster' || bt === 'thermobaric' || bt === 'nuke') {
+                if (this.progress < 0.12) { this.phase = 'boost'; phaseMul = this.launchStyle === 'rail' ? 0.7 : 0.55; }
+                else if (this.progress > 0.72) { this.phase = 'reentry'; phaseMul = 1.45; }
+                else { this.phase = 'coast'; }
+            } else this.phase = 'cruise';
+            // ICBM re-entry fireball (R-36M signature)
+            if (this.cfg.reentryFlash && this.phase === 'reentry' && !this._reentryFx) {
+                this._reentryFx = true;
+                spawnExp(this.lat, this.lon, 4, '#ffcc88');
+            }
+        }
+        this.progress += (this.speed * phaseMul / 60 / Math.max(1, this.dist)) * (this.isSAM ? 1.5 : 1.0);
 
         // MIRV: the ICBM bus splits into 3 independent warheads at the
         // terminal phase (R-36M style) — each flies its own arc to a spread
@@ -6254,8 +6310,8 @@ class Missile {
             for (let i = 0; i < 3; i++) {
                 const off = (i - 1) * 1.2;
                 const child = new Missile(this.lat, this.lon,
-                    this.tlat + rnd(off - 0.6, off + 0.6), this.tlon + rnd(-0.8, 0.8), this.cfg, this.owner);
-                child.dmgScale = 0.5;
+                    this.tlat + rnd(off - 0.6, off + 0.6), this.tlon + rnd(-0.8, 0.8), this.cfg, this.owner, false, 'air');
+                child.dmgScale = 0.55;
                 child.isWarhead = true;
                 child.mesh.scale.setScalar(0.55);
                 missiles.push(child);
@@ -6314,7 +6370,18 @@ class Missile {
             for(let i=0; i<8; i++) spawnExp(this.lat + rnd(-2,2), this.lon + rnd(-2,2), 2, '#ffaa00');
         }
         
-        if(Math.random() < 0.5 && this.mesh.visible) createTrailMesh(curVec);
+        // Phase contrails: boost = thick bright smoke, coast = thin sparse,
+        // re-entry = hot streak; hypersonics drag a plasma sheath.
+        let trailP = this.phase === 'boost' ? 0.85 : this.phase === 'reentry' ? 0.7 : 0.3;
+        if (this.cfg.plasmaSheath) trailP = 0.9;
+        if (Math.random() < trailP && this.mesh.visible) {
+            const t = createTrailMesh(curVec);
+            if (t) {
+                if (this.cfg.plasmaSheath) { t.material.color.set(0xff99ee); t.scale.setScalar(1.8); }
+                else if (this.phase === 'boost') { t.material.color.set(0xe8e8e8); t.scale.setScalar(1.5); }
+                else if (this.phase === 'reentry') { t.material.color.set(0xffcc88); t.scale.setScalar(1.25); }
+            }
+        }
     }
     explode() {
         this.dead = true;
@@ -6327,10 +6394,13 @@ class Missile {
         const rad = cfg.rad || 60;
         const blastR = rad / 5;   // legacy blast-radius scale (world units)
         spawnExp(this.lat, this.lon, rad / 15, cfg.col || '#ffaa00');
-        // TASK-102: blasts paint DEVASTATION — pounded territory resists
+        if (!this.isSAM) _spawnCrater(this.lat, this.lon, rad);   // TASK-204: fading impact scar
+        // TASK-102/204: blasts paint DEVASTATION — pounded territory resists
         // less and falls faster to land attacks (see conquest.js attackLogic).
+        // devMul scales the paint: thermobaric/nuke scar deepest, EMP barely.
         if (conquestGrid && conquestGrid.applyDevastation) {
-            conquestGrid.applyDevastation(this.lat, this.lon, Math.max(30, rad * 1.2), Math.min(1.6, 0.4 + (cfg.dmg || 50) / 400));
+            const dm = cfg.devMul || 1;
+            conquestGrid.applyDevastation(this.lat, this.lon, Math.max(30, rad * (0.9 + 0.5 * dm)), Math.min(1.6, (0.4 + (cfg.dmg || 50) / 400) * dm));
         }
         if (SFX && SFX.exp) SFX.exp(rad, cfg.type === 'nuke');
 
@@ -6343,12 +6413,18 @@ class Missile {
                     if (s.owner !== this.owner && !s.dead && haversineDist(bl, bo, s.lat, s.lon) < blastR / 2) s.hit(dmg * 0.35);
                 });
             }
+            // Anti-troop identity: bomblets SHRED committed troop concentrations
+            this._hitTroops(dmg * (cfg.troopMul || 1), blastR * 1.6);
         } else if (this.mkey === 'emp') {
-            // EMP: electronics kill — freezes reload cycles 8s + chip damage
+            // EMP: electronics kill — THE push enabler. Freezes reloads, blinds
+            // defense scans AND radar chains for empTime ticks + chip damage.
+            const eR = Math.max(blastR, (cfg.empRadius || rad) / 5);
+            _empRing(this.lat, this.lon, cfg.empRadius || rad);
             structs.forEach(s => {
-                if (s.owner !== this.owner && !s.dead && dst(this, s) < rad / 3.5) {
+                if (s.owner !== this.owner && !s.dead && dst(this, s) < eR) {
                     s.hit(dmg);
-                    s.reload = Math.max(s.reload, 480);
+                    s.reload = Math.max(s.reload, cfg.empTime || 600);
+                    s.empT = Math.max(s.empT || 0, cfg.empTime || 600);
                     spawnExp(s.lat, s.lon, 3, '#00ffcc');
                 }
             });
@@ -6357,6 +6433,7 @@ class Missile {
             structs.forEach(s => {
                 if (s.owner !== this.owner && !s.dead && dst(this, s) < blastR) s.hit(dmg);
             });
+            this._hitTroops(dmg * (cfg.troopMul || 1) * 0.6, blastR * 1.2);
             [400, 850].forEach(d => setTimeout(() => {
                 if (gOver) return;
                 const l2 = this.lat + rnd(-rad / 110, rad / 110), o2 = this.lon + rnd(-rad / 110, rad / 110);
@@ -6379,16 +6456,43 @@ class Missile {
                     const d = haversineDist(this.lat, this.lon, s.lat, s.lon);
                     if (d < blastR) {
                         s.hit(dmg * (1 - 0.7 * (d / blastR)));
-                        if (!s.dead) s.reload = Math.max(s.reload, 300);
+                        if (!s.dead) { s.reload = Math.max(s.reload, 300); s.empT = Math.max(s.empT || 0, cfg.empTime || 420); }
                     }
                 }
             });
         } else {
             structs.forEach(s => {
-                if (s.owner !== this.owner && !s.dead && dst(this, s) < blastR) s.hit(dmg);
+                if (s.owner !== this.owner && !s.dead && dst(this, s) < blastR) {
+                    s.hit(dmg);
+                    // Scud identity — suppression: terror warheads shock the
+                    // crew; reload cycles stall even when the damage is light.
+                    if (cfg.suppress && s.maxReload) s.reload = Math.max(s.reload, Math.floor(s.maxReload * 0.6) + 180);
+                }
             });
+            this._hitTroops(dmg * (cfg.troopMul || 0.8), blastR);   // incidental troop casualties
         }
         if (this.isSAM && this.tgt && !this.tgtIsPlane) this.tgt.dead = true;   // TASK-201: planes take damage instead
+    }
+
+    // TASK-204 anti-troop: damage committed troop cohorts inside radiusUnits
+    // (world units). Cluster is the shredder (troopMul 3.2), thermobaric burns
+    // formations, others cause incidental casualties.
+    _hitTroops(dmgPer, radiusUnits) {
+        if (!troopCohorts.length || dmgPer <= 0) return;
+        for (const tc of troopCohorts) {
+            if (tc.dead || tc.owner === this.owner) continue;
+            const ll = vec3ToLatLon(tc.mesh.position);
+            if (haversineDist(this.lat, this.lon, ll.lat, ll.lon) < radiusUnits) {
+                const kill = Math.floor(dmgPer * 12);   // dmg scale → troops
+                tc.troops -= kill;
+                spawnExp(ll.lat, ll.lon, 3, '#ff8866');
+                if (tc.troops <= 0) {
+                    tc.dead = true;
+                    scene.remove(tc.mesh);
+                    if (tc.mesh.material) tc.mesh.material.dispose();
+                }
+            }
+        }
     }
 }
 
@@ -7058,11 +7162,577 @@ function createTrailMesh(pos) {
     return m;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// TASK-204 MISSILE & DEFENSE FX KIT
+// transients[] — one lightweight array for all short-lived effects with
+// velocity/growth (tracers, debris chunks, EMP rings, launch smoke).
+// Craters — slow-fading impact scars (see _spawnCrater).
+// ═══════════════════════════════════════════════════════════════════
+let transients = [];
+function _addTransient(mesh, lifeFrames, opts = {}) {
+    if (mesh.material) mesh.material.transparent = true;
+    transients.push({ mesh, life: lifeFrames, maxLife: lifeFrames, vel: opts.vel || null, grow: opts.grow || 0 });
+    return mesh;
+}
+function _killTransient(t) {
+    scene.remove(t.mesh);
+    if (t.mesh.material) _recycleMat(t.mesh.material);
+    if (t.mesh.geometry && !(t.mesh.geometry.userData && t.mesh.geometry.userData.shared)) t.mesh.geometry.dispose();
+}
+function _updateTransients() {
+    let w = 0;
+    for (let r = 0; r < transients.length; r++) {
+        const t = transients[r];
+        t.life--;
+        if (t.life <= 0) { _killTransient(t); continue; }
+        const k = t.life / t.maxLife;
+        if (t.vel) t.mesh.position.addScaledVector(t.vel, 1);
+        if (t.grow) t.mesh.scale.multiplyScalar(1 + t.grow);
+        if (t.mesh.material) t.mesh.material.opacity = Math.min(1, k * 1.6);
+        if (w !== r) transients[w] = t;
+        w++;
+    }
+    transients.length = w;
+}
+
+// Colored smoke/spark puff (shared unit box, pooled material, per-instance scale)
+const _upV = new THREE.Vector3();
+function _puffAt(pos, col, size, vel, life) {
+    if (!GEO_CACHE['fxPuff']) GEO_CACHE['fxPuff'] = new THREE.BoxGeometry(1, 1, 1);
+    const m = new THREE.Mesh(GEO_CACHE['fxPuff'], _getFxMat(col, 0.9));
+    m.position.copy(pos);
+    m.scale.setScalar(size);
+    scene.add(m);
+    _addTransient(m, life, { vel: vel || null, grow: 0.015 });
+    return m;
+}
+
+// Defense tracer: bright line from the battery to the track point
+function _tracer(srcPos, dstPos, col) {
+    if (!srcPos || !dstPos) return;
+    const g = new THREE.BufferGeometry().setFromPoints([srcPos.clone(), dstPos.clone()]);
+    const mat = new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 1, depthWrite: false });
+    const line = new THREE.Line(g, mat);
+    scene.add(line);
+    _addTransient(line, 8);
+}
+
+// Interception debris: dark chunks tumbling down toward the planet
+function _debrisBurst(pos, n = 5) {
+    const nrm = pos.clone().normalize();
+    for (let i = 0; i < n; i++) {
+        if (!GEO_CACHE['fxDebris']) GEO_CACHE['fxDebris'] = new THREE.BoxGeometry(1.4, 1.4, 1.4);
+        const m = new THREE.Mesh(GEO_CACHE['fxDebris'], _getFxMat(0x3a3a42, 0.95));
+        m.position.copy(pos);
+        m.scale.setScalar(rnd(0.6, 1.6));
+        scene.add(m);
+        const tangent = new THREE.Vector3(rnd(-1, 1), rnd(-1, 1), rnd(-1, 1)).cross(nrm).normalize();
+        const vel = tangent.multiplyScalar(rnd(1.2, 2.6)).addScaledVector(nrm, -0.55);
+        _addTransient(m, Math.floor(rnd(30, 55)), { vel });
+    }
+}
+
+// Flare/chaff dodge visual: white-hot decoys popping around the missile
+function _flareBurst(m) {
+    if (!m || !m.pos) return;
+    for (let i = 0; i < 6; i++) {
+        const off = new THREE.Vector3(rnd(-6, 6), rnd(-6, 6), rnd(-6, 6));
+        _puffAt(m.pos.clone().add(off), i % 2 ? 0xfff4c0 : 0xffb347, rnd(1.5, 2.6), off.clone().multiplyScalar(0.08), 26);
+    }
+}
+
+// EMP shockwave ring: expanding cyan circle on the surface
+function _empRing(lat, lon, radiusKm) {
+    const geo = DrawSphericalRangeIndicator(lat, lon, Math.max(60, radiusKm * 0.6));
+    const mat = new THREE.LineBasicMaterial({ color: 0x00ffcc, transparent: true, opacity: 0.9, depthWrite: false });
+    const ring = new THREE.Line(geo, mat);
+    scene.add(ring);
+    _addTransient(ring, 55, { grow: 0.012 });
+}
+
+// Launch flash per platform style: silo smoke column / rail spark shower /
+// sub surface buoy pop / air (MIRV bus split — no ground fx)
+function _launchFlash(lat, lon, style) {
+    const p = latLonToVec3(lat, lon, EARTH_RADIUS + 8);
+    const up = _upV.copy(p).normalize();
+    if (style === 'sub') {
+        spawnExp(lat, lon, 7, '#cceeff');
+        // white spray + expanding surface ring
+        for (let i = 0; i < 5; i++) {
+            const off = new THREE.Vector3(rnd(-4, 4), rnd(2, 9), rnd(-4, 4));
+            _puffAt(p.clone().add(off), 0xeaf6ff, rnd(2, 4), off.clone().multiplyScalar(0.06), 40);
+        }
+        const geo = DrawSphericalRangeIndicator(lat, lon, 90);
+        const mat = new THREE.LineBasicMaterial({ color: 0xbfe8ff, transparent: true, opacity: 0.8, depthWrite: false });
+        const ring = new THREE.Line(geo, mat);
+        scene.add(ring);
+        _addTransient(ring, 45, { grow: 0.01 });
+    } else if (style === 'rail') {
+        spawnExp(lat, lon, 6, '#ffd28a');
+        // spark shower thrown sideways off the rail
+        for (let i = 0; i < 8; i++) {
+            const off = new THREE.Vector3(rnd(-9, 9), rnd(0.5, 3), rnd(-9, 9));
+            _puffAt(p.clone().add(off), i % 3 ? 0xffc266 : 0xfff1b8, rnd(1, 2.2), off.clone().multiplyScalar(0.09), 30);
+        }
+    } else if (style === 'silo') {
+        spawnExp(lat, lon, 7, '#fff3aa');
+        // billowing smoke column
+        for (let i = 0; i < 5; i++) {
+            _puffAt(p.clone().addScaledVector(up, 4 + i * 5), 0x8a8a8a, 3.5 + i * 0.9, up.clone().multiplyScalar(0.5 + i * 0.12), 55 + i * 9);
+        }
+    }
+    // 'air': no ground fx (MIRV bus)
+}
+
+// Subsurface pop-up: buoy emerges, water sheets off, then the booster lights
+function _subSurfaceSplash(lat, lon) {
+    const p = latLonToVec3(lat, lon, EARTH_RADIUS + 6);
+    spawnExp(lat, lon, 8, '#dff2ff');
+    const up = _upV.copy(p).normalize();
+    for (let i = 0; i < 7; i++) {
+        const off = new THREE.Vector3(rnd(-7, 7), rnd(1, 10), rnd(-7, 7));
+        _puffAt(p.clone().add(off), 0xd8ecfa, rnd(2.5, 5), off.clone().multiplyScalar(0.05), 42);
+    }
+}
+
+// Impact crater: dark scorch decal fading over ~20s
+let craterDecals = [];
+function _spawnCrater(lat, lon, rad) {
+    if (craterDecals.length >= GAME_CONSTANTS.CRATER_MAX) {
+        const old = craterDecals.shift();
+        scene.remove(old.mesh);
+        if (old.mesh.material) _recycleMat(old.mesh.material);
+    }
+    const size = Math.max(10, Math.min(rad * 0.16, 90));
+    const key = 'crater' + Math.round(size);
+    if (!GEO_CACHE[key]) {
+        GEO_CACHE[key] = new THREE.CircleGeometry(size, 18);
+        GEO_CACHE[key].userData = { shared: true };
+    }
+    const mat = _getFxMat(0x151009, 0.85);
+    const m = new THREE.Mesh(GEO_CACHE[key], mat);
+    const p = latLonToVec3(lat, lon, EARTH_RADIUS + 1.2);
+    m.position.copy(p);
+    m.lookAt(p.clone().multiplyScalar(2));
+    scene.add(m);
+    craterDecals.push({ mesh: m, life: GAME_CONSTANTS.CRATER_LIFE_FRAMES, maxLife: GAME_CONSTANTS.CRATER_LIFE_FRAMES });
+}
+function _updateCraters() {
+    let w = 0;
+    for (let r = 0; r < craterDecals.length; r++) {
+        const c = craterDecals[r];
+        c.life--;
+        if (c.life <= 0) { scene.remove(c.mesh); if (c.mesh.material) _recycleMat(c.mesh.material); continue; }
+        c.mesh.material.opacity = Math.min(0.85, (c.life / c.maxLife) * 1.4);
+        if (w !== r) craterDecals[w] = c;
+        w++;
+    }
+    craterDecals.length = w;
+}
+
+// ── TASK-204 RADAR CHAIN ──
+// A friendly radar (or recon drone) covering the incoming missile's position
+// gives SAM batteries early lock: fireRange × RADAR_CHAIN_MULT. EMP'd (or
+// jammed) radars are dark and contribute nothing.
+function _radarCovers(lat, lon, owner) {
+    for (const s of structs) {
+        if (s.dead || s.owner !== owner || (s.empT || 0) > 0) continue;
+        const rr = s.radarRange || 0;
+        if (rr && haversineDist(lat, lon, s.lat, s.lon) < rr) return true;
+    }
+    for (const d of drones) {
+        if (d.dead || d.owner !== owner || d.cfg.type !== 'recon') continue;
+        if (haversineDist(lat, lon, d.lat, d.lon) < GAME_CONSTANTS.DRONE_RECON_COVER) return true;
+    }
+    return false;
+}
+function _samEffRange(sam, m) {
+    let r = sam.fireRange;
+    if ((sam.empT || 0) <= 0 && _radarCovers(m.lat, m.lon, sam.owner)) r *= GAME_CONSTANTS.RADAR_CHAIN_MULT;
+    return r;
+}
+
 function fireSAM(src, tgt) {
     const m = new Missile(src.lat, src.lon, tgt.lat || 0, tgt.lon || 0, MCFG['ballistic'], src.owner, true);
     m.tgt = tgt;
     m.speed = GAME_CONSTANTS.SAM_INTERCEPT_SPEED_KM_S;   // km/s — out-runs ~500km/s attackers
     missiles.push(m);
+    // Defense VFX: muzzle flash + tracer to the track point (CIWS/flak = hot
+    // yellow rapid-fire, SAM = cool blue lock line)
+    const rapid = src.type === 'ciws' || src.type === 'flak';
+    _tracer(src.pos, tgt.pos || latLonToVec3(tgt.lat, tgt.lon), rapid ? 0xffe066 : 0x9fd8ff);
+    spawnExp(src.lat, src.lon, rapid ? 2 : 3, rapid ? '#ffe066' : '#9fd8ff');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TASK-204 DRONE SYSTEM — the DCFG configs are now LIVE.
+// Generic owner + target-hook design so other platforms can use it:
+//   • launchDrone(owner, key, {lat,lon}, {homeLat, homeLon}) — navy drone
+//     carriers (and any future platform) call this directly.
+//   • Drone.ACQUIRE — static target-picker hook (owner → candidate list);
+//     override/restrict it without touching the class.
+// Behaviors by DCFG.type:
+//   swarm/kamikaze/heavy — one-way strikers (transit → beeline → detonate)
+//   loiter               — patrols its station, dives on the best target in engageR
+//   armed (MQ-9)         — standoff: orbits the target, repeated strikes, survives
+//   recon                — mobile radar: its orbit feeds the SAM radar chain
+//   jammer               — EW: enemy defenses inside its orbit go dark (empT)
+//   intercept            — missile hunter: orbits + fires chase interceptors
+// ═══════════════════════════════════════════════════════════════════
+const DRONE_ALT = 22;
+const _droneV1 = new THREE.Vector3();
+const _droneV2 = new THREE.Vector3();
+
+const DRONE_MODEL_BUILDERS = {
+    nano(acc) {          // micro quad
+        const g = new THREE.Group();
+        _M(g, _box(0.5, 0.22, 0.5), _sm(LP.DGRAY), 0, 0, 0);
+        _M(g, _box(1.3, 0.06, 0.12), _sm(LP.METAL), 0, 0.08, 0);
+        _M(g, _box(0.12, 0.06, 1.3), _sm(LP.METAL), 0, 0.08, 0);
+        [[0.6, 0.6], [-0.6, 0.6], [0.6, -0.6], [-0.6, -0.6]].forEach(([x, z]) => {
+            _M(g, _cyl(0.32, 0.32, 0.04, 8), _am(acc), x, 0.16, z).name = 'rotor';
+        });
+        return g;
+    },
+    swarm(acc) {         // quad + sensor ball
+        const g = new THREE.Group();
+        _M(g, _box(0.7, 0.3, 0.9), _sm(LP.DGRAY), 0, 0, 0);
+        _M(g, _sph(0.18, 8, 6), _am(acc), 0, -0.1, 0.45);
+        _M(g, _box(1.7, 0.07, 0.14), _sm(LP.METAL), 0, 0.12, 0);
+        _M(g, _box(0.14, 0.07, 1.7), _sm(LP.METAL), 0, 0.12, 0);
+        [[0.8, 0.8], [-0.8, 0.8], [0.8, -0.8], [-0.8, -0.8]].forEach(([x, z]) => {
+            _M(g, _cyl(0.4, 0.4, 0.05, 8), _am(acc), x, 0.2, z).name = 'rotor';
+        });
+        return g;
+    },
+    kamikaze(acc) {      // switchblade tube + spring wings
+        const g = new THREE.Group();
+        _M(g, _cyl(0.22, 0.22, 2.2, 8), _sm(LP.DGRAY), 0, 0, 0, Math.PI / 2);
+        _M(g, _cone(0.22, 0.7, 8), _sm(LP.METAL), 0, 0, 1.45, Math.PI / 2);
+        _M(g, _box(2.4, 0.05, 0.5), _am(acc), 0, 0.12, -0.2);
+        _M(g, _box(0.5, 0.05, 0.5), _sm(LP.METAL), 0, 0.12, -1.0);
+        return g;
+    },
+    recon(acc) {         // slim glider
+        const g = new THREE.Group();
+        _M(g, _cyl(0.2, 0.2, 2.6, 8), _sm(LP.LIGHT), 0, 0, 0, Math.PI / 2);
+        _M(g, _cone(0.2, 0.8, 8), _sm(LP.WHITE), 0, 0, 1.7, Math.PI / 2);
+        _M(g, _box(4.4, 0.06, 0.42), _sm(LP.METAL), 0, 0.15, 0.2);
+        _M(g, _box(1.6, 0.05, 0.3), _am(acc), 0, 0.1, -1.3);
+        _M(g, _sph(0.26, 8, 6), _am(acc), 0, -0.18, 0.7);
+        return g;
+    },
+    loiter(acc) {        // HAROP delta wing
+        const g = new THREE.Group();
+        _M(g, _box(0.5, 0.28, 2.4), _sm(LP.DGRAY), 0, 0, 0);
+        _M(g, _cone(0.3, 0.9, 6), _sm(LP.METAL), 0, 0, 1.6, Math.PI / 2);
+        _M(g, _box(2.0, 0.06, 1.1), _am(acc), 1.0, 0.1, -0.5, 0, 0.35, 0);
+        _M(g, _box(2.0, 0.06, 1.1), _am(acc), -1.0, 0.1, -0.5, 0, -0.35, 0);
+        _M(g, _box(0.5, 0.05, 0.5), _sm(LP.METAL), 0, 0.12, -1.2);
+        return g;
+    },
+    jammer(acc) {        // EW pod + whip antenna
+        const g = new THREE.Group();
+        _M(g, _box(0.7, 0.5, 2.4), _sm(LP.LIGHT), 0, 0, 0);
+        _M(g, _box(4.2, 0.08, 0.5), _sm(LP.METAL), 0, 0.25, 0.2);
+        _M(g, _cyl(0.05, 0.05, 1.4, 6), _am(acc), 0, 0.9, -0.6);
+        _M(g, _sph(0.16, 8, 6), _am(acc), 0, 1.6, -0.6);
+        _M(g, _box(1.2, 0.06, 0.4), _sm(LP.DGRAY), 0, 0.05, -1.3);
+        return g;
+    },
+    armed(acc) {         // MQ-9 Reaper
+        const g = new THREE.Group();
+        _M(g, _cyl(0.3, 0.34, 3.0, 8), _sm(LP.LIGHT), 0, 0, 0, Math.PI / 2);
+        _M(g, _sph(0.3, 8, 6), _sm(LP.WHITE), 0, 0.05, 1.6);
+        _M(g, _box(6.4, 0.09, 0.5), _am(acc), 0, 0.18, 0.1);
+        _M(g, _box(1.4, 0.06, 0.35), _sm(LP.METAL), 0.55, 0.3, -1.45, 0, 0, 0.5);
+        _M(g, _box(1.4, 0.06, 0.35), _sm(LP.METAL), -0.55, 0.3, -1.45, 0, 0, -0.5);
+        _M(g, _cyl(0.07, 0.07, 0.8, 6), _sm(LP.DGRAY), 0.25, -0.25, 0.8, Math.PI / 2);
+        _M(g, _box(0.16, 0.16, 1.0), _sm(LP.DARK), 0.55, -0.2, 0.4);
+        _M(g, _box(0.16, 0.16, 1.0), _sm(LP.DARK), -0.55, -0.2, 0.4);
+        return g;
+    },
+    heavy(acc) {         // flying-wing UCAV
+        const g = new THREE.Group();
+        _M(g, _box(0.9, 0.35, 2.6), _sm(LP.DGRAY), 0, 0, 0.3);
+        _M(g, _box(6.2, 0.12, 1.4), _am(acc), 0, 0, -0.3);
+        _M(g, _cone(0.45, 1.2, 6), _sm(LP.METAL), 0, 0, 1.9, Math.PI / 2);
+        _M(g, _box(0.4, 0.5, 0.6), _sm(LP.METAL), 0, 0.15, -1.4);
+        return g;
+    },
+    intercept(acc) {    // missile-hunting dart + side boosters
+        const g = new THREE.Group();
+        _M(g, _cone(0.24, 1.2, 8), _sm(LP.LIGHT), 0, 0, 1.4, Math.PI / 2);
+        _M(g, _cyl(0.24, 0.28, 1.8, 8), _sm(LP.METAL), 0, 0, 0, Math.PI / 2);
+        _M(g, _box(2.6, 0.06, 0.5), _am(acc), 0, 0.1, -0.4);
+        _M(g, _cyl(0.09, 0.09, 0.9, 6), _sm(LP.DGRAY), 0.28, -0.12, -1.0, Math.PI / 2);
+        _M(g, _cyl(0.09, 0.09, 0.9, 6), _sm(LP.DGRAY), -0.28, -0.12, -1.0, Math.PI / 2);
+        return g;
+    },
+};
+function buildDroneModel(key, owner) {
+    const acc = owner === 'player' ? 0x00ff88 : ownerHexColor(owner);
+    const b = DRONE_MODEL_BUILDERS[key] || DRONE_MODEL_BUILDERS.kamikaze;
+    return b(acc);
+}
+
+class Drone {
+    constructor(lat, lon, key, owner, opts = {}) {
+        this.id = ++_id;
+        this.cfg = DCFG[key] || DCFG.kamikaze;
+        this.key = key;
+        this.owner = owner;
+        this.lat = lat; this.lon = lon;
+        this.homeLat = opts.homeLat !== undefined ? opts.homeLat : lat;
+        this.homeLon = opts.homeLon !== undefined ? opts.homeLon : lon;
+        this.hp = this.cfg.hp;
+        this.dead = false;
+        this.fuel = this.cfg.fuel;
+        this.speed = this.cfg.spd * GAME_CONSTANTS.DRONE_SPEED_KM_T;   // km/tick
+        this.mode = 'patrol';
+        this.target = null;                       // {kind, obj}
+        this.angle = Math.random() * Math.PI * 2; // orbit phase
+        this.scanT = this.id % 20;                // stagger acquisition
+        this.reload = 0;
+        this.charges = this.cfg.charges || 0;
+        this.pos = latLonToVec3(lat, lon, EARTH_RADIUS + DRONE_ALT);
+        this.prevPos = this.pos.clone();
+        this.mesh = buildDroneModel(this.key, owner);
+        this._rotors = [];
+        this.mesh.traverse(o => { if (o.name === 'rotor') this._rotors.push(o); });
+        scene.add(this.mesh);
+    }
+    // Default target picker hook — override Drone.ACQUIRE to specialize
+    // (e.g. a navy carrier hunting only warships). Returns candidate list.
+    static ACQUIRE(owner) {
+        const out = [];
+        for (const s of structs) {
+            if (!s.dead && s.owner !== owner && s.owner !== 'neutral') out.push({ kind: 'struct', obj: s });
+        }
+        for (const tc of troopCohorts) {
+            if (!tc.dead && tc.owner !== owner) out.push({ kind: 'cohort', obj: tc });
+        }
+        for (const w of warships) {
+            if (!w.dead && w.owner !== owner) out.push({ kind: 'warship', obj: w });
+        }
+        return out;
+    }
+    _acquire() {
+        const hook = (typeof Drone.ACQUIRE === 'function') ? Drone.ACQUIRE : null;
+        const cands = hook ? hook(this.owner) : [];
+        let best = null, bestD = Infinity;
+        for (const c of cands) {
+            const p = this._posOf(c);
+            if (!p) continue;
+            const d = haversineDist(this.lat, this.lon, p.lat, p.lon);
+            if (d < bestD) { bestD = d; best = c; }
+        }
+        return (best && bestD <= (this.cfg.engageR || 0)) ? best : null;
+    }
+    _posOf(t) {
+        const o = t.obj;
+        if (!o || o.dead) return null;
+        if (t.kind === 'struct') return { lat: o.lat, lon: o.lon };
+        if (t.kind === 'warship') return { lat: o.curLat !== undefined ? o.curLat : (o.lat || 0), lon: o.curLon !== undefined ? o.curLon : (o.lon || 0) };
+        if (t.kind === 'cohort' && o.mesh) { const ll = vec3ToLatLon(o.mesh.position); return { lat: ll.lat, lon: ll.lon }; }
+        return null;
+    }
+    // Great-circle nudge: move km toward (tLat,tLon); true when arrived
+    _nudgeToward(tLat, tLon, km) {
+        const d = haversineDist(this.lat, this.lon, tLat, tLon);
+        if (d <= km || d < 0.5) { this.lat = tLat; this.lon = tLon; return true; }
+        const f = km / d;
+        const a = _droneV1.copy(latLonToVec3(this.lat, this.lon, 1)).normalize();
+        const b = _droneV2.copy(latLonToVec3(tLat, tLon, 1)).normalize();
+        a.lerp(b, f).normalize();
+        const ll = vec3ToLatLon(a);
+        this.lat = ll.lat; this.lon = ll.lon;
+        return false;
+    }
+    // Station keeping: transit to the station when far out, orbit when on it
+    _tickPatrol(km) {
+        const R = this.cfg.patrolR || 50;
+        const dHome = haversineDist(this.lat, this.lon, this.homeLat, this.homeLon);
+        if (dHome > R * 2) { this._nudgeToward(this.homeLat, this.homeLon, km); return; }
+        this.angle += 0.011;
+        const dLat = Math.cos(this.angle) * R / 111;
+        const dLon = Math.sin(this.angle) * R / (111 * Math.max(0.25, Math.cos(this.homeLat * Math.PI / 180)));
+        this._nudgeToward(this.homeLat + dLat, this.homeLon + dLon, km);
+    }
+    _tickCombat() {
+        if (--this.scanT <= 0 || !this.target || !this._posOf(this.target)) {
+            this.scanT = 20;
+            this.target = this._acquire();
+        }
+        if (!this.target) { this._tickPatrol(this.speed); return; }
+        this.mode = 'engage';
+        const t = this._posOf(this.target);
+        const d = haversineDist(this.lat, this.lon, t.lat, t.lon);
+        if (this.key === 'armed') {
+            // MQ-9: standoff orbit around the target + repeated precision hits
+            this.angle += 0.02;
+            const oLat = t.lat + Math.cos(this.angle) * 0.5;
+            const oLon = t.lon + Math.sin(this.angle) * 0.5 / Math.max(0.25, Math.cos(t.lat * Math.PI / 180));
+            this._nudgeToward(oLat, oLon, this.speed);
+            if (this.reload <= 0 && d < 110) {
+                this._strike(this.cfg.dmg * 0.45);
+                this.reload = 100;
+            }
+        } else {
+            // One-way strikers: beeline and detonate on impact
+            this._nudgeToward(t.lat, t.lon, this.speed);
+            if (d < 12) { this._detonate(); return; }
+        }
+    }
+    _strike(dmg) {
+        const p = this._posOf(this.target);
+        if (!p) return;
+        _tracer(this.pos, latLonToVec3(p.lat, p.lon), 0x88ddff);
+        spawnExp(p.lat, p.lon, 3, this.cfg.col);
+        this._applyDamage(dmg);
+        if (conquestGrid && conquestGrid.applyDevastation) {
+            conquestGrid.applyDevastation(p.lat, p.lon, Math.max(20, (this.cfg.rad || 30) * 0.7), 0.35);
+        }
+    }
+    _applyDamage(dmg) {
+        const t = this.target;
+        if (!t || !t.obj || t.obj.dead) return;
+        const o = t.obj;
+        if (t.kind === 'cohort') {
+            o.troops -= Math.floor(dmg * 12 * (this.cfg.troopMul || 1));
+            if (o.troops <= 0 && !o.dead) {
+                o.dead = true;
+                scene.remove(o.mesh);
+                if (o.mesh.material) o.mesh.material.dispose();
+            }
+        } else if (t.kind === 'warship') {
+            // Navy-owned class (read-only from here): use its API when present
+            if (typeof o.hit === 'function') o.hit(dmg);
+            else if (o.hp !== undefined) o.hp = Math.max(0, o.hp - dmg);
+        } else {
+            o.hit(dmg);
+        }
+    }
+    _detonate() {
+        const p = this._posOf(this.target) || { lat: this.lat, lon: this.lon };
+        spawnExp(p.lat, p.lon, Math.max(3, (this.cfg.rad || 40) / 12), this.cfg.col);
+        this._applyDamage(this.cfg.dmg);
+        if (conquestGrid && conquestGrid.applyDevastation) {
+            conquestGrid.applyDevastation(p.lat, p.lon, Math.max(25, (this.cfg.rad || 40) * 0.9), Math.min(1.3, 0.35 + (this.cfg.dmg || 0) / 500));
+        }
+        if (this.owner === myRole) logEvent(`🛸 ${this.cfg.name} أصابت الهدف!`, 'info');
+        this.dead = true;
+        scene.remove(this.mesh);
+        disposeMeshDeep(this.mesh);
+    }
+    _tickInterceptor() {
+        // Mini-SAM battery: reuse the Structure.update scan pattern (ground
+        // range + most-progress-first) then chase-intercept via fireSAM.
+        if (this.charges <= 0 || this.reload > 0) { this._tickPatrol(this.speed * 0.8); return; }
+        if ((this.id + frame) % 6 !== 0) { this._tickPatrol(this.speed * 0.5); return; }
+        let trg = null, bestProg = -1;
+        for (const m of missiles) {
+            if (m.dead || m.owner === this.owner || m.isSAM) continue;
+            if (m.cfg.type === 'stealth' || m.cfg.type === 'hyper') continue;   // same exemptions as ground defenses
+            if (haversineDist(this.lat, this.lon, m.lat, m.lon) >= (this.cfg.engageR || 350)) continue;
+            if (m.progress > bestProg) { bestProg = m.progress; trg = m; }
+        }
+        if (trg) {
+            this._nudgeToward(trg.lat, trg.lon, this.speed);   // scoot to shrink the geometry
+            fireSAM(this, trg);
+            this.charges--;
+            this.reload = GAME_CONSTANTS.DRONE_INTERCEPT_RELOAD;
+            if (this.charges === 0 && this.owner === myRole) logEvent('🛸 صائد الصواريخ نفدت ذخيرته', 'info');
+        } else this._tickPatrol(this.speed * 0.8);
+    }
+    _tickJam() {
+        if ((this.id + frame) % 15 !== 0) return;
+        let n = 0;
+        for (const s of structs) {
+            if (s.dead || s.owner === this.owner) continue;
+            if (!(s.fireRange > 0 || s.radarRange > 0)) continue;
+            if (haversineDist(this.lat, this.lon, s.lat, s.lon) < GAME_CONSTANTS.DRONE_JAM_RADIUS) {
+                s.empT = Math.max(s.empT || 0, 90);
+                n++;
+            }
+        }
+        if (n && Math.random() < 0.01) _empRing(this.lat, this.lon, GAME_CONSTANTS.DRONE_JAM_RADIUS);
+    }
+    _crash() {
+        spawnExp(this.lat, this.lon, 3, '#886644');
+        this.dead = true;
+        scene.remove(this.mesh);
+        disposeMeshDeep(this.mesh);
+    }
+    hit(dmg) {
+        this.hp -= dmg;
+        if (this.hp <= 0 && !this.dead) {
+            spawnExp(this.lat, this.lon, 4, '#ffaa44');
+            this.dead = true;
+            scene.remove(this.mesh);
+            disposeMeshDeep(this.mesh);
+        }
+    }
+    update() {
+        if (this.dead) return;
+        if (--this.fuel <= 0) { this._crash(); return; }
+        if (this.reload > 0) this.reload--;
+        switch (this.cfg.type) {
+            case 'intercept': this._tickInterceptor(); break;
+            case 'recon': this._tickPatrol(this.speed); break;
+            case 'jammer': this._tickPatrol(this.speed); this._tickJam(); break;
+            default: this._tickCombat(); break;
+        }
+        this._updateMesh();
+    }
+    _updateMesh() {
+        this.prevPos.copy(this.pos);
+        this.pos = latLonToVec3(this.lat, this.lon, EARTH_RADIUS + DRONE_ALT);
+        this.mesh.position.copy(this.pos);
+        this.mesh.up.copy(this.pos).normalize();
+        const dir = _droneV1.copy(this.pos).sub(this.prevPos);
+        if (dir.lengthSq() > 0.0001) this.mesh.lookAt(_droneV2.copy(this.pos).add(dir));
+        for (const r of this._rotors) r.rotation.y += 0.55;
+    }
+}
+
+// Generic launcher — THE entry point for other platforms (navy carriers):
+// launchDrone(owner, 'kamikaze', {lat, lon}, {homeLat, homeLon}) → [Drone]
+function launchDrone(owner, key, at, opts = {}) {
+    const cfg = DCFG[key];
+    if (!cfg || !at) return null;
+    const squad = cfg.squad || 1;
+    const out = [];
+    let active = drones.reduce((n, d) => n + (!d.dead && d.owner === owner ? 1 : 0), 0);
+    for (let i = 0; i < squad; i++) {
+        if (active >= GAME_CONSTANTS.DRONE_CAP) break;
+        const j = i === 0 ? 0 : rnd(-0.02, 0.02) * (1 + i);
+        const d = new Drone(at.lat + j, at.lon + j * 0.7, key, owner, opts);
+        d.angle = (i / squad) * Math.PI * 2;   // spread the formation
+        drones.push(d);
+        out.push(d);
+        active++;
+    }
+    return out.length ? out : null;
+}
+window.launchDrone = launchDrone;   // navy agent: call this from your carriers
+
+// TASK-204 launch-point picker — silo/rail from the nearest READY launcher,
+// or a SUBSURFACE pop-up from the nearest owned PORT when the sea approach
+// is meaningfully closer to the target (ports become missile infrastructure).
+function _pickLaunchPoint(loc, owner) {
+    const launchers = structs.filter(s => s.type === 'launcher' && s.owner === owner && s.reload <= 0 && !s.dead);
+    if (!launchers.length) return null;
+    const L = launchers.sort((a, b) => haversineDist(a.lat, a.lon, loc.lat, loc.lon) - haversineDist(b.lat, b.lon, loc.lat, loc.lon))[0];
+    const res = { lat: L.lat, lon: L.lon, style: (L.id % 2 === 0) ? 'silo' : 'rail', launcher: L };
+    const ports = structs.filter(s => s.type === 'port' && s.owner === owner && !s.dead);
+    if (ports.length) {
+        const P = ports.sort((a, b) => haversineDist(a.lat, a.lon, loc.lat, loc.lon) - haversineDist(b.lat, b.lon, loc.lat, loc.lon))[0];
+        const dP = haversineDist(P.lat, P.lon, loc.lat, loc.lon);
+        const dL = haversineDist(L.lat, L.lon, loc.lat, loc.lon);
+        if (dP < dL * GAME_CONSTANTS.SUB_LAUNCH_ADVANTAGE) { res.lat = P.lat; res.lon = P.lon; res.style = 'sub'; }
+    }
+    return res;
 }
 
 // TASK-201: SAM/iron-dome interceptor against AIRCRAFT — same pursuit
@@ -8586,7 +9256,11 @@ function applyOpponentAction(action) {
     
     if (action.type === 'launch') {
         const cfg = MCFG[action.mtype];
-        if (cfg) missiles.push(new Missile(action.lat, action.lon, action.tlat, action.tlon, cfg, oS));
+        if (cfg) missiles.push(new Missile(action.lat, action.lon, action.tlat, action.tlon, cfg, oS, false, action.style || 'silo'));
+    }
+    if (action.type === 'drone_launch') {
+        // TASK-204: remote drone deployment — spawn the same squad locally
+        if (DCFG[action.key]) launchDrone(oS, action.key, { lat: action.lat, lon: action.lon }, { homeLat: action.hlat, homeLon: action.hlon });
     }
     if (action.type === 'build') {
         if (!SDEFS[action.btype]) return;   // guard: unknown/missing build type
@@ -8754,6 +9428,7 @@ function _setMissileMode(on) {
     missileMode = on;
     if (on) {
         // entering cancels other modes
+        if (droneMode) _setDroneMode(false);   // TASK-204: modes are exclusive
         targetingMode = false;
         buildMode = null;
         if (window.__refreshHotbar) window.__refreshHotbar();
@@ -8774,17 +9449,102 @@ function _setMissileMode(on) {
 }
 window.__setMissileMode = _setMissileMode;
 
+// ══════════════════════════════════════════════════════════════════
+// DRONE LAUNCH MODE [N] (TASK-204) — mirror of missile mode: HUD chips
+// for every DCFG type, click the map to deploy a squad at that point.
+// Drones launch from the nearest launcher/base pad and transit to the
+// clicked station before going to work.
+// ══════════════════════════════════════════════════════════════════
+let droneMode = false, selDrone = 'kamikaze', _droneHud = null;
+
+function _setDroneMode(on) {
+    if (on && window.startSpawnPhase) return;
+    droneMode = on;
+    if (on) {
+        if (missileMode) _setMissileMode(false);
+        targetingMode = false;
+        buildMode = null;
+        if (window.__refreshHotbar) window.__refreshHotbar();
+        if (!_droneHud) {
+            _droneHud = document.createElement('div');
+            _droneHud.id = 'droneModeHud';
+            document.body.appendChild(_droneHud);
+        }
+        _droneHud.style.display = 'block';
+        _refreshDroneHud();
+        logEvent(`🛸 وضع الدرونات مفعّل (${DCFG[selDrone].name}) — أنقر نقطة الانتشار`, 'info');
+    } else {
+        if (_droneHud) _droneHud.style.display = 'none';
+    }
+}
+window.__setDroneMode = _setDroneMode;
+
+function _refreshDroneHud() {
+    if (!_droneHud) return;
+    const cfg = DCFG[selDrone];
+    if (!cfg) return;
+    const mine = drones.filter(d => !d.dead && d.owner === myRole).length;
+    const cap = GAME_CONSTANTS.DRONE_CAP;
+    const chips = Object.keys(DCFG).map(k => {
+        const c = DCFG[k];
+        const role = { swarm: 'سرب', kamikaze: 'انتحاري', recon: 'رادار متحرك', loiter: 'كامن', jammer: 'تشويش', armed: 'ضارب', intercept: 'صائدة' }[c.type] || '';
+        return `<div class="mchip${k === selDrone ? ' act' : ''}${pRes < c.cost || mine >= cap ? ' poor' : ''}" data-k="${k}">${c.name}<span>$${c.cost}</span><small style="opacity:.6"> ${role}${c.squad > 1 ? ' ×' + c.squad : ''}</small></div>`;
+    }).join('');
+    _droneHud.innerHTML = `
+        <div class="mtitle">🛸 وضع الدرونات — <b>${cfg.name}</b></div>
+        <div class="mrow">${chips}</div>
+        <div class="mhint">أنقر الخريطة لنشر الدرون في تلك المنطقة · <b>[ ]</b> تبديل النوع · الدرونات: ${mine}/${cap} · تنطلق من أقرب منصة/قاعدة وتتوجه للمحطة</div>`;
+    _droneHud.querySelectorAll('.mchip').forEach(ch => {
+        ch.onclick = () => { _armDrone(ch.dataset.k); };
+    });
+}
+
+function _armDrone(k) {
+    if (!DCFG[k]) return;
+    selDrone = k;
+    _refreshDroneHud();
+}
+
+function _cycleDrone(dir) {
+    const keys = Object.keys(DCFG);
+    let i = keys.indexOf(selDrone);
+    if (i < 0) i = 0;
+    i = (i + dir + keys.length) % keys.length;
+    _armDrone(keys[i]);
+}
+
+// Deploy a squad of the selected drone type at loc (from the nearest pad)
+function launchDroneSquad(loc) {
+    const cfg = DCFG[selDrone];
+    if (!cfg) return false;
+    const mine = drones.filter(d => !d.dead && d.owner === myRole).length;
+    if (mine >= GAME_CONSTANTS.DRONE_CAP) { logEvent(`حد الدرونات الأقصى (${GAME_CONSTANTS.DRONE_CAP}) 🛸`, 'err'); return false; }
+    const pads = structs.filter(s => !s.dead && s.owner === myRole && (s.type === 'launcher' || s.type === 'base'));
+    if (!pads.length) { logEvent('لا توجد منصة إطلاق للدرونات (منصة أو قاعدة)! 🛸', 'err'); return false; }
+    if (pRes < cfg.cost) { logEvent(`موارد غير كافية! تحتاج $${cfg.cost}`, 'err'); return false; }
+    const P = pads.sort((a, b) => haversineDist(a.lat, a.lon, loc.lat, loc.lon) - haversineDist(b.lat, b.lon, loc.lat, loc.lon))[0];
+    pRes -= cfg.cost;
+    spawnExp(P.lat, P.lon, 3, cfg.col);
+    const squad = launchDrone(myRole, selDrone, { lat: P.lat, lon: P.lon }, { homeLat: loc.lat, homeLon: loc.lon });
+    if (isOnline && squad) sendAction({ type: 'drone_launch', key: selDrone, lat: P.lat, lon: P.lon, hlat: loc.lat, hlon: loc.lon });
+    _refreshDroneHud();
+    logEvent(squad ? `🛸 نُشر ${squad.length}× ${cfg.name} باتجاه المحطة` : 'تعذّر نشر الدرون (الحد الأقصى)', squad ? 'info' : 'err');
+    updateHUD();
+    return !!squad;
+}
+
 // Fire a volley at loc from the nearest READY launcher. Returns true if fired.
 // Shared by missile mode (stays active) and the legacy single-shot path.
+// TASK-204: launch platform variety — silo/rail from the launcher, or a
+// SUBSURFACE pop-up from the nearest port when the sea approach is closer.
 function fireMissileVolley(loc) {
     const launchCfg = MCFG[selMissile];
     if (!launchCfg) return false;
     const cost = launchCfg.cost;
     const maxR = getMissileMaxRange(launchCfg);
-    const launchers = structs.filter(s => s.type === 'launcher' && s.owner === myRole && s.reload <= 0 && !s.dead);
-    if (!launchers.length) { logEvent('لا توجد منصة إطلاق جاهزة! 🚀', 'err'); return false; }
-    const L = launchers.sort((a, b) => haversineDist(a.lat, a.lon, loc.lat, loc.lon) - haversineDist(b.lat, b.lon, loc.lat, loc.lon))[0];
-    if (!CheckTargetInRange(L.lat, L.lon, loc.lat, loc.lon, maxR)) {
+    const pick = _pickLaunchPoint(loc, myRole);
+    if (!pick) { logEvent('لا توجد منصة إطلاق جاهزة! 🚀', 'err'); return false; }
+    if (!CheckTargetInRange(pick.lat, pick.lon, loc.lat, loc.lon, maxR)) {
         logEvent('الهدف خارج نطاق الصاروخ المختار!', 'err');
         return false;
     }
@@ -8792,14 +9552,13 @@ function fireMissileVolley(loc) {
     for (let i = 0; i < volleyCount; i++) {
         const delay = i * 1200;
         setTimeout(() => {
-            const lnchrs = structs.filter(s => s.type === 'launcher' && s.owner === myRole && s.reload <= 0 && !s.dead);
-            if (lnchrs.length && pRes >= cost) {
-                const L2 = lnchrs.sort((a, b) => haversineDist(a.lat, a.lon, loc.lat, loc.lon) - haversineDist(b.lat, b.lon, loc.lat, loc.lon))[0];
-                L2.reload = L2.maxReload;
+            const P2 = _pickLaunchPoint(loc, myRole);
+            if (P2 && pRes >= cost) {
+                P2.launcher.reload = P2.launcher.maxReload;
                 pRes -= cost;
                 const { dx, dy } = _missileScatter(launchCfg);
-                missiles.push(new Missile(L2.lat, L2.lon, loc.lat + dx, loc.lon + dy, launchCfg, myRole));
-                if (isOnline) sendAction({ type: 'launch', lat: L2.lat, lon: L2.lon, tlat: loc.lat + dx, tlon: loc.lon + dy, mtype: selMissile });
+                missiles.push(new Missile(P2.lat, P2.lon, loc.lat + dx, loc.lon + dy, launchCfg, myRole, false, P2.style));
+                if (isOnline) sendAction({ type: 'launch', lat: P2.lat, lon: P2.lon, tlat: loc.lat + dx, tlon: loc.lon + dy, mtype: selMissile, style: P2.style });
                 updateHUD();
             }
         }, delay);
@@ -9112,6 +9871,7 @@ window.addEventListener('keydown', e => {
         buildMode = null;
         attackMoveMode = false;
         if (missileMode) _setMissileMode(false);
+        if (droneMode) _setDroneMode(false);   // TASK-204
         document.getElementById('tgtMsg').style.display = 'none';
         if(rangeMarkerMesh) rangeMarkerMesh.visible = false;
         clearSelection();
@@ -9138,14 +9898,25 @@ window.addEventListener('keydown', e => {
         _setMissileMode(!missileMode);
         return;
     }
-    // [ / ]: cycle missile (only in missile mode)
+    // [ / ]: cycle missile (only in missile mode) / drone (drone mode)
     if (missileMode && (e.key === '[' || e.key === ']')) {
         _cycleMissile(e.key === ']' ? 1 : -1);
+        return;
+    }
+    if (droneMode && (e.key === '[' || e.key === ']')) {
+        _cycleDrone(e.key === ']' ? 1 : -1);
         return;
     }
     // X: cycle volley size (only in missile mode)
     if (missileMode && e.code === 'KeyX' && !e.repeat) {
         _cycleVolley();
+        return;
+    }
+
+    // N: DRONE LAUNCH MODE — persistent drone deployment (TASK-204)
+    if (e.code === 'KeyN' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.repeat) {
+        if (window.gameMode !== 'mode1' || window.startSpawnPhase) return;
+        _setDroneMode(!droneMode);
         return;
     }
 
@@ -9418,6 +10189,11 @@ window.addEventListener('click', async e => {
                 const fired = fireMissileVolley(loc);
                 if (fired) _refreshMissileRings();   // rings flip to gray as launchers reload
             }
+            return;
+        }
+        // DRONE MODE (TASK-204): deploy the selected squad at the click
+        if (droneMode) {
+            launchDroneSquad(loc);
             return;
         }
         const pick = _pickOwnUnitAt(loc.lat, loc.lon);
@@ -9711,14 +10487,13 @@ window.addEventListener('click', async e => {
         for(let i=0; i<volleyCount; i++) {
             let delay = i * 1200;
             setTimeout(() => {
-                let lnchrs = structs.filter(s => s.type==='launcher' && s.owner===myRole && s.reload<=0);
-                if(lnchrs.length && pRes >= cost) {
-                    let L2 = lnchrs.sort((a,b)=> haversineDist(a.lat, a.lon, loc.lat, loc.lon) - haversineDist(b.lat, b.lon, loc.lat, loc.lon))[0];
-                    L2.reload = L2.maxReload;
+                const P2 = _pickLaunchPoint(loc, myRole);   // TASK-204: silo/rail/sub launch
+                if(P2 && pRes >= cost) {
+                    P2.launcher.reload = P2.launcher.maxReload;
                     pRes -= cost;
                     const { dx, dy } = _missileScatter(launchCfg);
-                    missiles.push(new Missile(L2.lat, L2.lon, loc.lat + dx, loc.lon + dy, launchCfg, myRole));
-                    if(isOnline) sendAction({ type: 'launch', lat: L2.lat, lon: L2.lon, tlat: loc.lat + dx, tlon: loc.lon + dy, mtype: selMissile });
+                    missiles.push(new Missile(P2.lat, P2.lon, loc.lat + dx, loc.lon + dy, launchCfg, myRole, false, P2.style));
+                    if(isOnline) sendAction({ type: 'launch', lat: P2.lat, lon: P2.lon, tlat: loc.lat + dx, tlon: loc.lon + dy, mtype: selMissile, style: P2.style });
                 }
             }, delay);
         }
@@ -10511,15 +11286,36 @@ function runAI() {
             let mcfg = MCFG['ballistic'];
             let maxR = getMissileMaxRange(mcfg);
             if (dist < maxR && _resOf(riv) >= mcfg.cost) {
-                missiles.push(new Missile(L.lat, L.lon, trg.lat, trg.lon, mcfg, riv.str));
+                missiles.push(new Missile(L.lat, L.lon, trg.lat, trg.lon, mcfg, riv.str, false, (L.id % 2 === 0) ? 'silo' : 'rail'));
                 L.reload = L.maxReload || 300;
                 _spendRes(riv, mcfg.cost);
             } else if (dist < getMissileMaxRange(MCFG['icbm']) && _resOf(riv) >= MCFG['icbm'].cost) {
-                missiles.push(new Missile(L.lat, L.lon, trg.lat, trg.lon, MCFG['icbm'], riv.str));
+                missiles.push(new Missile(L.lat, L.lon, trg.lat, trg.lon, MCFG['icbm'], riv.str, false, 'silo'));
                 L.reload = L.maxReload || 300;
                 _spendRes(riv, MCFG['icbm'].cost);
             }
         }
+      }
+    }
+
+    // 1b. AI DRONE STRIKES (TASK-204): rivals with resources occasionally
+    // send a kamikaze or swarm at a rival structure — drones give the AI
+    // pressure that doesn't need launcher reload cycles.
+    if (frame % Math.max(300, GAME_CONSTANTS.AI_TICK_RATE * 2) === 0) {
+      for (const riv of _rivals()) {
+        if (_resOf(riv) < 300 || Math.random() > 0.3) continue;
+        const myDrones = drones.reduce((n, d) => n + (!d.dead && d.owner === riv.str ? 1 : 0), 0);
+        if (myDrones >= GAME_CONSTANTS.DRONE_CAP - 2) continue;
+        const tgts = structs.filter(s => !s.dead && s.owner !== riv.str && s.owner !== 'neutral');
+        if (!tgts.length) continue;
+        const pads = structs.filter(s => !s.dead && s.owner === riv.str && (s.type === 'launcher' || s.type === 'base'));
+        if (!pads.length) continue;
+        const key = Math.random() < 0.5 ? 'kamikaze' : 'swarm';
+        if (_resOf(riv) < DCFG[key].cost) continue;
+        const T = tgts[Math.floor(Math.random() * tgts.length)];
+        const P = pads[Math.floor(Math.random() * pads.length)];
+        _spendRes(riv, DCFG[key].cost);
+        launchDrone(riv.str, key, { lat: P.lat, lon: P.lon }, { homeLat: T.lat, homeLon: T.lon });
       }
     }
     
@@ -10888,6 +11684,9 @@ function gameFrame() {
     
     // In-place compaction (swap-and-pop) — avoids per-frame array allocation/GC
     _compactAlive(missiles, m => m.update());
+    _compactAlive(drones, d => d.update());          // TASK-204 drone system
+    _updateTransients();                             // tracers / debris / EMP rings
+    _updateCraters();                                // fading impact scars
     for (let p of planes) p.update();
     _compactDead(planes);
     // TASK-201: air-to-air missile tracers
@@ -11163,12 +11962,16 @@ function backToMenu() {
     warships.forEach(w => { if(w.mesh) { scene.remove(w.mesh); disposeMeshDeep(w.mesh); } w.shells.forEach(sh => scene.remove(sh.mesh)); });
     trains.forEach(t => { if(t.mesh) { scene.remove(t.mesh); disposeMeshDeep(t.mesh); } if(t.pathLine) { scene.remove(t.pathLine); disposeMeshDeep(t.pathLine); } });
     troopCohorts.forEach(tc => { if(tc.mesh) { scene.remove(tc.mesh); disposeMeshDeep(tc.mesh); } });
+    drones.forEach(d => { if(d.mesh && !d.dead) { scene.remove(d.mesh); disposeMeshDeep(d.mesh); } });   // TASK-204
+    transients.forEach(_killTransient); transients = [];                                             // TASK-204
+    craterDecals.forEach(c => { scene.remove(c.mesh); if (c.mesh.material) _recycleMat(c.mesh.material); }); craterDecals = [];
     exps.forEach(e => { scene.remove(e); disposeMeshDeep(e); });
     particles.forEach(p => { scene.remove(p); disposeMeshDeep(p); });
     if (window.paintExpansions) window.paintExpansions.forEach(pe => { if(pe.mesh) { scene.remove(pe.mesh); disposeMeshDeep(pe.mesh); } });
     cleanupTerritory();
     structs = []; missiles = []; planes = []; drones = []; exps = []; particles = [];
     tradeShips = []; trains = []; troopCohorts = []; transportShips = []; warships = [];
+    transients = []; craterDecals = [];
     isOnline = false;
     document.getElementById('go')?.classList.remove('show');
     document.getElementById('gc').style.display = 'none';
@@ -11535,15 +12338,14 @@ window.__UI_API = {
         const cost = cfg.cost;
         if (pRes < cost) { logEvent(`موارد غير كافية! تحتاج $${cost}`, 'err'); return; }
         const maxR = getMissileMaxRange(cfg);
-        const launchers = structs.filter(s => s.type === 'launcher' && s.owner === myRole && s.reload <= 0);
-        if (!launchers.length) { logEvent('لا توجد منصة إطلاق جاهزة! 🚀', 'err'); return; }
-        const L = launchers.sort((a, b) => haversineDist(a.lat, a.lon, lat, lon) - haversineDist(b.lat, b.lon, lat, lon))[0];
-        if (!CheckTargetInRange(L.lat, L.lon, lat, lon, maxR)) { logEvent('الهدف خارج نطاق الصاروخ المختار!', 'err'); return; }
-        L.reload = L.maxReload;
+        const pick = _pickLaunchPoint({ lat, lon }, myRole);
+        if (!pick) { logEvent('لا توجد منصة إطلاق جاهزة! 🚀', 'err'); return; }
+        if (!CheckTargetInRange(pick.lat, pick.lon, lat, lon, maxR)) { logEvent('الهدف خارج نطاق الصاروخ المختار!', 'err'); return; }
+        pick.launcher.reload = pick.launcher.maxReload;
         pRes -= cost;
         const { dx, dy } = _missileScatter(cfg);
-        missiles.push(new Missile(L.lat, L.lon, lat + dx, lon + dy, cfg, myRole));
-        if (isOnline) sendAction({ type: 'launch', lat: L.lat, lon: L.lon, tlat: lat + dx, tlon: lon + dy, mtype });
+        missiles.push(new Missile(pick.lat, pick.lon, lat + dx, lon + dy, cfg, myRole, false, pick.style));
+        if (isOnline) sendAction({ type: 'launch', lat: pick.lat, lon: pick.lon, tlat: lat + dx, tlon: lon + dy, mtype, style: pick.style });
         logEvent(`🚀 ${cfg.name} انطلق!`, 'info');
         updateHUD();
     },
@@ -11616,6 +12418,7 @@ const HOTBAR_SLOTS = [
     { key: '9', type: 'iron_dome',  icon: '🟢', label: 'قبة',    tip: 'اعتراض الزخات' },
     { key: '0', type: 'nuke_plant', icon: '☢️', label: 'مفاعل',  tip: 'دخل ضخم متأخر' },
     { key: 'V', type: 'warship',    icon: '🛳️', label: 'مدمرة',  tip: 'انقر ماءً — دورية تدمر سفن الأعداء وتصطاد التجارة' },
+    { key: 'N', type: 'drone',     icon: '🛸', label: 'درون',   tip: 'وضع الدرونات — أنقر الخريطة لنشر أسراب/استطلاع/صائدة صواريخ' },
 ];
 
 function _buildHotbarDom() {
@@ -11633,7 +12436,7 @@ function _buildHotbarDom() {
             <span class="hname">${slot.label || (def.name || slot.type)}</span>
             <span class="hcnt">0</span>
             <span class="hcost">$${def.cost || ''}</span>
-            <div class="htip"><div class="t">${def.name || slot.type} <small>[${slot.key}]</small></div><div class="d">${slot.tip || ''}</div><div class="c"></div></div>`;
+            <div class="htip"><div class="t">${slot.label || def.name || slot.type} <small>[${slot.key}]</small></div><div class="d">${slot.tip || ''}</div><div class="c"></div></div>`;
         el.addEventListener('click', ev => { ev.stopPropagation(); window.__hotbarKey(slot.key); });
         bar.appendChild(el);
     });
@@ -11646,16 +12449,20 @@ window.__refreshHotbar = function () {
     bar.style.display = (mode1 && !window.startSpawnPhase) ? 'flex' : 'none';
     HOTBAR_SLOTS.forEach((slot, i) => {
         const el = bar.children[i];
-        const cost = window.__UI_API.costOf(slot.type);
+        const cost = slot.type === 'drone'
+            ? (DCFG[selDrone] ? DCFG[selDrone].cost : 0)          // TASK-204: drone slot shows selected type cost
+            : window.__UI_API.costOf(slot.type);
         const count = slot.type === 'warship'
             ? warships.reduce((n, w) => n + (!w.dead && w.owner === 'player' ? 1 : 0), 0)
-            : structs.filter(s => s.owner === 'player' && !s.dead && s.type === slot.type).length;
+            : slot.type === 'drone'
+                ? drones.reduce((n, d) => n + (!d.dead && d.owner === 'player' ? 1 : 0), 0)
+                : structs.filter(s => s.owner === 'player' && !s.dead && s.type === slot.type).length;
         const techLocked = TECH_LOCKED_BUILDS.includes(slot.type) && !isTechUnlocked(slot.type, 'build', playerTech);
         el.querySelector('.hcnt').textContent = count;
         el.querySelector('.hcost').textContent = '$' + cost;
         el.querySelector('.htip .c').textContent = '$' + cost;
-        el.classList.toggle('sel', buildMode === slot.type);
-        el.classList.toggle('poor', !techLocked && pRes < cost);
+        el.classList.toggle('sel', buildMode === slot.type || (slot.type === 'drone' && droneMode));
+        el.classList.toggle('poor', !techLocked && slot.type !== 'drone' && pRes < cost);
         el.classList.toggle('locked', !!techLocked);
     });
     const gc = document.getElementById('gc');
@@ -11667,6 +12474,12 @@ window.__hotbarKey = function (key) {
     const slot = HOTBAR_SLOTS.find(s => s.key === key);
     if (!slot) return;
     if (window.startSpawnPhase) return;
+    // TASK-204: drone slot is a MODE, not a build ghost
+    if (slot.type === 'drone') {
+        if (window.gameMode !== 'mode1') return;
+        _setDroneMode(!droneMode);
+        return;
+    }
     const techLocked = TECH_LOCKED_BUILDS.includes(slot.type) && !isTechUnlocked(slot.type, 'build', playerTech);
     if (techLocked) { logEvent('هذا المبنى مقفل — تحتاج بحثاً أولاً 🔒', 'err'); return; }
     if (buildMode === slot.type) {
@@ -11747,3 +12560,155 @@ if (!window.GEO_DATA_ROADS || window.GEO_DATA_ROADS.length === 0) {
 // Expose for GEO_RENDERER
 window.EARTH_RADIUS = EARTH_RADIUS;
 window.latLonToVec3 = latLonToVec3;
+
+// ═══════════════════════════════════════════════════════════════════
+// TASK-204 PROBES (run from the browser console during a live game)
+//   missileAudit() — full warhead balance table (before/after)
+//   droneTest()    — drone spawn → engage → KILL verified (kamikaze)
+//                    + interceptor drone shoots down an incoming missile
+//   samTest()      — radar-chain SAM locks: base range vs chained vs EMP'd
+// ═══════════════════════════════════════════════════════════════════
+window.missileAudit = function () {
+    const BEFORE = {
+        scud: { cost: 90, dmg: 70 }, ballistic: { cost: 130, dmg: 95 }, cruise: { cost: 190, dmg: 90 },
+        cluster: { cost: 240, dmg: 45 }, emp: { cost: 300, dmg: 8 }, tomahawk: { cost: 350, dmg: 120 },
+        thermobaric: { cost: 420, dmg: 240 }, stealth_m: { cost: 480, dmg: 160 }, bunker_bust: { cost: 560, dmg: 380 },
+        hyper: { cost: 650, dmg: 200 }, icbm: { cost: 1000, dmg: 500 }, nuke_tac: { cost: 2000, dmg: 700 },
+    };
+    const ROLE = {
+        scud: 'cheap terror/suppression (shocks reloads)', ballistic: 'workhorse (best dmg/$)',
+        cruise: 'low-flying precise cruiser', cluster: 'ANTI-TROOP (shreds cohorts ×3.2)',
+        emp: 'EW (kills reloads+scans+radar 10s)', tomahawk: 'precision standoff',
+        thermobaric: 'anti-structure + deepest devastation', stealth_m: 'defense penetrator (radar-invisible)',
+        bunker_bust: 'ANTI-TURTLE (×2.6 vs hardened)', hyper: 'uninterceptable sprint',
+        icbm: 'MIRV global saturation ×3', nuke_tac: 'game-ender (+deep EMP)',
+    };
+    const rows = Object.keys(MCFG).map(k => {
+        const c = MCFG[k], b = BEFORE[k] || {};
+        return {
+            type: k, role: ROLE[k] || '',
+            cost: c.cost, dmg: c.dmg, radius: c.rad, speed: c.spd, acc: c.acc,
+            evade: c.samEvade, devMul: c.devMul || 1,
+            dmg_per_gold: +(c.dmg / c.cost).toFixed(3),
+            before_cost_dmg: b.cost != null ? `${b.cost}/${b.dmg}` : '-',
+        };
+    });
+    console.table(rows);
+    logEvent(`[missileAudit] ${rows.length} warhead types — جدول التوازن في الكونسول (before/after)`, 'info');
+    return rows;
+};
+
+window.droneTest = function () {
+    const res = { part1_kamikaze: {}, part2_interceptor: {} };
+    // ── Part 1: kamikaze drone spawns, acquires, strikes, KILLS ──
+    const flak = new Structure(30, 30, 'flak', 'enemy');   // hp 80 < kamikaze dmg 95
+    const drone = new Drone(28.6, 28.6, 'kamikaze', 'player', { homeLat: 28.6, homeLon: 28.6 });
+    res.part1_kamikaze.meshBuilt = !!(drone.mesh && drone.mesh.children.length > 0);
+    // Target-hook design: restrict acquisition to the probe target ONLY
+    // (also proves the hook other platforms will rely on)
+    const origAcquire = Drone.ACQUIRE;
+    Drone.ACQUIRE = () => [{ kind: 'struct', obj: flak }];
+    let engaged = false, steps = 0;
+    try {
+        while (steps++ < 400 && !drone.dead && !flak.dead) {
+            frame++;
+            drone.update();
+            if (drone.mode === 'engage') engaged = true;
+        }
+    } finally { Drone.ACQUIRE = origAcquire; }
+    res.part1_kamikaze = { ...res.part1_kamikaze, engaged, killed: flak.dead, steps, hpBefore: 80, hpAfter: flak.hp };
+    // ── Part 2: interceptor drone vs an incoming enemy missile ──
+    const ix = new Drone(10, 10, 'intercept', 'player', { homeLat: 10, homeLon: 10 });
+    const mCfg = Object.assign({}, MCFG.ballistic, { samEvade: 0 });   // deterministic (no flare dodge)
+    const threat = new Missile(12, 10, -30, 10, mCfg, 'enemy');
+    missiles.push(threat);
+    let fired = false, s2 = 0;
+    while (s2++ < 900 && !threat.dead) {
+        frame++;
+        ix.update();
+        for (const mm of missiles) if (!mm.dead) mm.update();
+        missiles = missiles.filter(mm => !mm.dead);
+        if (missiles.some(x => x.isSAM && x.tgt === threat)) fired = true;
+    }
+    const intercepted = threat.dead && threat.progress < 0.9;
+    res.part2_interceptor = { fired, threatDead: threat.dead, intercepted, progressAtDeath: +threat.progress.toFixed(2), chargesLeft: ix.charges };
+    // ── cleanup (probe objects only) ──
+    const _killMissile = (m) => { if (m && !m.dead) { m.dead = true; scene.remove(m.mesh); disposeMeshDeep(m.mesh); } else if (m && m.mesh && m.mesh.parent) { scene.remove(m.mesh); disposeMeshDeep(m.mesh); } };
+    _killMissile(threat);
+    missiles.forEach(m => { if (m.isSAM && (m.tgt === threat)) _killMissile(m); });
+    missiles = missiles.filter(m => !(m.dead));
+    [drone, ix].forEach(d => { if (!d.dead) { d.dead = true; scene.remove(d.mesh); disposeMeshDeep(d.mesh); } });
+    if (!flak.dead) {
+        flak.dead = true; scene.remove(flak.mesh); scene.remove(flak.selRing);
+        flak.accents.forEach(m => m.dispose());
+        if (flak.selRing && flak.selRing.material) flak.selRing.material.dispose();
+    }
+    const pass = res.part1_kamikaze.engaged && res.part1_kamikaze.killed && res.part2_interceptor.intercepted;
+    console.log('[droneTest]', res);
+    logEvent(`[droneTest] ${pass ? 'PASS ✅' : 'FAIL ❌'} — كاميكازي: اشتبك=${engaged} قتل=${flak.dead} · صائدة: أطلقت=${fired} اعترضت=${intercepted}`, pass ? 'info' : 'err');
+    return res;
+};
+
+window.samTest = function () {
+    const res = {};
+    const sam = new Structure(20, 20, 'sam', 'player');
+    const _cleanupStruct = (s) => { if (!s.dead) { s.dead = true; scene.remove(s.mesh); scene.remove(s.selRing); s.accents.forEach(m => m.dispose()); if (s.selRing && s.selRing.material) s.selRing.material.dispose(); } };
+    const _killMissile = (m) => { if (!m.dead) { m.dead = true; scene.remove(m.mesh); disposeMeshDeep(m.mesh); } };
+    try {
+        // Parked threat at ~111km: outside the 80km base envelope, inside the
+        // radar-chained 176km envelope.
+        const mCfg = Object.assign({}, MCFG.ballistic, { samEvade: 0 });
+        const mkThreat = () => {
+            const m = new Missile(21, 20, 21.5, 20, mCfg, 'enemy');
+            m.progress = 0.3; m.lat = 21.0; m.lon = 20;
+            missiles.push(m);
+            return m;
+        };
+        // A) base range only → must NOT engage at 111km
+        const tA = mkThreat();
+        for (let i = 0; i < 10; i++) { frame++; sam.update(); }
+        res.A_base_noLock = !missiles.some(x => x.isSAM && x.tgt === tA);
+        _killMissile(tA);
+        missiles = missiles.filter(m => !m.dead);
+        // B) radar covering the threat → chain lock → FIRES
+        const radar = new Structure(21.5, 20, 'radar', 'player');
+        const tB = mkThreat();
+        for (let i = 0; i < 10; i++) { frame++; sam.update(); }
+        res.B_chain_lock = missiles.some(x => x.isSAM && x.tgt === tB);
+        missiles.forEach(m => { if (m.isSAM && m.tgt === tB) _killMissile(m); });
+        missiles = missiles.filter(m => !m.dead);
+        _killMissile(tB);
+        // C) EMP'd radar → chain dark → no lock even in chained range
+        sam.reload = 0;
+        radar.empT = 999;
+        const tC = mkThreat();
+        for (let i = 0; i < 10; i++) { frame++; sam.update(); }
+        res.C_emp_dark = !missiles.some(x => x.isSAM && x.tgt === tC);
+        _killMissile(tC);
+        missiles = missiles.filter(m => !m.dead);
+        _cleanupStruct(radar);
+        // D) EMP'd SAM itself → cannot scan at all (even inside base range)
+        sam.reload = 0; sam.empT = 30;
+        const tD = new Missile(20.4, 20, 20.5, 20, mCfg, 'enemy');   // ~44km — well inside 80km
+        tD.progress = 0.3;
+        missiles.push(tD);
+        for (let i = 0; i < 10; i++) { frame++; sam.update(); }
+        res.D_emp_sam_dark = !missiles.some(x => x.isSAM && x.tgt === tD);
+        _killMissile(tD);
+        missiles = missiles.filter(m => !m.dead);
+    } finally {
+        _cleanupStruct(sam);
+    }
+    const pass = res.A_base_noLock && res.B_chain_lock && res.C_emp_dark && res.D_emp_sam_dark;
+    console.log('[samTest]', res);
+    logEvent(`[samTest] ${pass ? 'PASS ✅' : 'FAIL ❌'} — أساسي=${res.A_base_noLock} · سلسلة رادار=${res.B_chain_lock} · رادار EMP=${res.C_emp_dark} · SAM مكهرب=${res.D_emp_sam_dark}`, pass ? 'info' : 'err');
+    return res;
+};
+
+// Quick drone-state inspector (pairs with the existing __ffaProbe)
+window.__ffaProbe = window.__ffaProbe || {};
+window.__ffaProbe.droneCheck = () => drones.map(d => ({
+    key: d.key, owner: d.owner, mode: d.mode, hp: d.hp, fuel: d.fuel,
+    tgt: d.target ? d.target.kind : null, charges: d.charges,
+    pos: [+d.lat.toFixed(2), +d.lon.toFixed(2)], home: [+d.homeLat.toFixed(2), +d.homeLon.toFixed(2)],
+}));
