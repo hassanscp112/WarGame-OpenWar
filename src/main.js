@@ -4,7 +4,7 @@ import { initNewUI, uiToast } from './ui.js';
 import { createWorldRender } from './world/render.js';   // TASK-406: world render layer
 // TASK-402: strategy-pattern hull behaviors (src/naval/) — Warship.update()
 // dispatches through NAVAL_HULLS instead of per-class if/else chains.
-import { NAVAL_HULLS, Torpedo, assignFormation, layMineField, updateMineFields } from './naval/hulls.js';)
+import { NAVAL_HULLS, Torpedo, assignFormation, layMineField, updateMineFields } from './naval/hulls.js';
 window.GEO_DATA_ROADS = [];
 
 // ═══ CONQUEST SYSTEM (Mode 1 — OpenFront-style territory conquest) ═══
@@ -7691,6 +7691,16 @@ class Plane {
                 if (_cas) d *= 0.55;
                 if (d < bestD) { bestD = d; best = t; }
             }
+            // TASK-402 (audit #6 plane-side): enemy HULLS are strike targets
+            // too — wrapped so live position/dead stay current for the pass
+            // steering. Submerged & unlocated subs are invisible from air.
+            for (const w of warships) {
+                if (w.dead || w.owner === this.owner) continue;
+                if (w.hull && w.hull.submerged && !w.detected) continue;
+                let d = haversineDist(this.tlat, this.tlon, w.curLat, w.curLon);
+                if (_cas) d *= 0.75;   // CAS loadouts hit ships hardest after armor
+                if (d < bestD) { bestD = d; best = _shipTarget(w); }
+            }
             this.gndTgt = best;
             if (!best) { this.mode = 'patrol'; return; }   // nothing to strike here
         }
@@ -7732,6 +7742,7 @@ class Plane {
             if (haversineDist(aim.lat, aim.lon, s.lat, s.lon) < R) s.hit(90);
         }
         _tankBlast(aim.lat, aim.lon, R, 90, this.owner);   // TASK-302: armor under the stick
+        _navalBlast(aim.lat, aim.lon, R, 90, this.owner);   // TASK-402 audit #6: hulls under the stick
         for (let i = 0; i < 6; i++) {
             spawnExp(aim.lat + rnd(-0.2, 0.2), aim.lon + rnd(-0.25, 0.25), rnd(3, 6), '#ffaa44');
         }
@@ -7786,6 +7797,7 @@ class Plane {
                 if (haversineDist(t.lat, t.lon, s.lat, s.lon) < 26) s.hit(16);
             }
             _tankBlast(t.lat, t.lon, 26, 16, this.owner);   // TASK-302: sweeping fire vs armor
+            _navalBlast(t.lat, t.lon, 26, 16, this.owner);   // TASK-402 audit #6: sweeping fire vs hulls
             spawnExp(t.lat + rnd(-0.08, 0.08), t.lon + rnd(-0.1, 0.1), 2.5, '#ffaa55');
             if (SFX && SFX.gun) SFX.gun();
             if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(t.lat, t.lon, 15, 0.4);
@@ -8616,6 +8628,34 @@ function _tankBlast(lat, lon, radiusKm, dmg, fromOwner) {
         if (t.dead || t.owner === fromOwner) continue;
         if (haversineDist(lat, lon, t.lat, t.lon) < radiusKm) t.hit(dmg, fromOwner);
     }
+}
+
+// TASK-402 audit #6 (plane-side): area anti-SHIP damage helper — aircraft
+// ordnance finally reaches the fleet. Submerged & unlocated submarines are
+// safe from air (the detection model); everything else eats ×MUL (bombs on
+// decks hit hard, matching Missile.explode's anti-ship precision scale).
+function _navalBlast(lat, lon, radiusKm, dmg, fromOwner) {
+    if (!warships.length) return;
+    const C = GAME_CONSTANTS;
+    for (const w of warships) {
+        if (w.dead || w.owner === fromOwner) continue;
+        if (w.hull && w.hull.submerged && !w.detected) continue;
+        if (haversineDist(lat, lon, w.curLat, w.curLon) < radiusKm) w.hit(dmg * C.AIR_STRIKE_SHIP_MUL);
+    }
+}
+
+// TASK-402 audit #6: live warship wrapper for plane ground-strike targeting
+// (lat/lon/dead/pos stay current through getters so pass steering tracks a
+// sailing hull; hit() applies the anti-ship multiplier like Missile blasts).
+function _shipTarget(w) {
+    return {
+        warship: w, isShip: true,
+        get lat() { return w.curLat; },
+        get lon() { return w.curLon; },
+        get dead() { return w.dead; },
+        get pos() { return w.pos; },
+        hit(dmg) { w.hit(dmg * GAME_CONSTANTS.AIR_STRIKE_SHIP_MUL); },
+    };
 }
 
 // Scratch vectors for tank movement math (tangent-plane stepping)
@@ -10442,9 +10482,13 @@ function applyOpponentAction(action) {
     }
     if (action.type === 'drone_launch') {
         // TASK-204: remote drone deployment — spawn the same squad locally
+        // TASK-402: shipId → tether the mirror swarm to the sender's hull so
+        // it keeps station over a sailing drone carrier (and sinks with it).
         if (DCFG[action.key]) {
             econFuelSpend(oS, GAME_CONSTANTS.ECON_FUEL_COST_DRONE, true);   // TASK-404: mirror their fuel spend
-            launchDrone(oS, action.key, { lat: action.lat, lon: action.lon }, { homeLat: action.hlat, homeLon: action.hlon });
+            const squad = launchDrone(oS, action.key, { lat: action.lat, lon: action.lon }, { homeLat: action.hlat, homeLon: action.hlon });
+            const ship = action.shipId != null ? warships.find(w => !w.dead && w.owner === oS && w.id === action.shipId) : null;
+            if (squad && ship) squad.forEach(d => { d.home = ship; });
         }
     }
     if (action.type === 'build') {
@@ -10464,8 +10508,44 @@ function applyOpponentAction(action) {
         }
     }
     if(action.type === 'spawn_plane') {
+        // TASK-404: mirror their fuel spend
         econFuelSpend(oS, GAME_CONSTANTS.ECON_FUEL_COST_PLANE, true);   // TASK-404: mirror their fuel spend
-        planes.push(new Plane(action.lat, action.lon, PCFG[action.ptype], oS));
+        // TASK-402: shipId → base the fighter on the sender's hull (deck CAP
+        // over a sailing carrier instead of a free-floating mirror).
+        const ship = action.shipId != null ? warships.find(w => !w.dead && w.owner === oS && w.id === action.shipId) : null;
+        planes.push(ship
+            ? new Plane(action.lat, action.lon, PCFG[action.ptype], oS, ship)
+            : new Plane(action.lat, action.lon, PCFG[action.ptype], oS));
+    }
+    // ── TASK-402 naval actions (audits #7/#8): mirror the sender's fleet ──
+    if (action.type === 'warship_spawn') {
+        const hull = GAME_CONSTANTS.HULL_CLASSES[action.hull];
+        if (!hull) return;
+        const port = structs.filter(s => !s.dead && s.owner === oS && s.type === 'port')
+            .sort((a, b) => haversineDist(a.lat, a.lon, action.plat, action.plon) - haversineDist(b.lat, b.lon, action.plat, action.plon))[0];
+        const ship = new Warship(oS, port || { lat: action.plat, lon: action.plon },
+            { lat: action.lat, lon: action.lon }, action.hull);
+        if (action.hull === 'transport' && action.troops > 0) ship.troops = action.troops;   // pool already deducted sender-side
+        warships.push(ship);
+    }
+    if (action.type === 'warship_move') {
+        const w = warships.find(q => !q.dead && q.owner === oS && q.id === action.id);
+        if (w) w.setPatrol({ lat: action.lat, lon: action.lon });
+    }
+    if (action.type === 'warship_invade') {
+        const w = warships.find(q => !q.dead && q.owner === oS && q.id === action.id);
+        if (w) w._orderInvasion({ lat: action.lat, lon: action.lon });
+    }
+    if (action.type === 'naval_mine') {
+        layMineField(NAVAL_CTX, oS, { lat: action.lat, lon: action.lon });
+    }
+    if (action.type === 'torpedo') {
+        const shooter = warships.find(q => !q.dead && q.owner === oS && q.id === action.sid);
+        let obj = null;
+        if (action.kind === 'warship') obj = warships.find(q => !q.dead && q.id === action.tid);
+        else if (action.kind === 'transport') obj = transportShips.find(q => !q.dead && q.id === action.tid);
+        else if (action.kind === 'trade') obj = tradeShips.find(q => !q.dead && q.id === action.tid);
+        if (shooter && obj) torpedoes.push(new Torpedo(oS, shooter, { kind: action.kind, obj }, NAVAL_CTX));
     }
     if (action.type === 'tank_spawn') {
         // TASK-302: remote armor deployment — mirror the division locally
@@ -10713,6 +10793,7 @@ function _setMissileMode(on) {
     if (on) {
         // entering cancels other modes
         if (droneMode) _setDroneMode(false);   // TASK-204: modes are exclusive
+        if (mineMode) _setMineMode(false);     // TASK-402: modes are exclusive
         targetingMode = false;
         buildMode = null;
         if (window.__refreshHotbar) window.__refreshHotbar();
@@ -10746,6 +10827,7 @@ function _setDroneMode(on) {
     droneMode = on;
     if (on) {
         if (missileMode) _setMissileMode(false);
+        if (mineMode) _setMineMode(false);     // TASK-402: modes are exclusive
         targetingMode = false;
         buildMode = null;
         if (window.__refreshHotbar) window.__refreshHotbar();
@@ -10762,6 +10844,29 @@ function _setDroneMode(on) {
     }
 }
 window.__setDroneMode = _setDroneMode;
+
+// ══════════════════════════════════════════════════════════════════
+// NAVAL MINE MODE [J] (TASK-402) — click water to deploy a minefield
+// ($MINE_COST, cap MINE_CAP active fields). Mirrors to the peer as
+// 'naval_mine'. Exclusive with missile/drone modes.
+// ══════════════════════════════════════════════════════════════════
+function _setMineMode(on) {
+    if (on && window.startSpawnPhase) return;
+    mineMode = on;
+    if (missileMode && on) _setMissileMode(false);
+    if (droneMode && on) _setDroneMode(false);
+    if (on) {
+        targetingMode = false;
+        buildMode = null;
+    }
+    if (window.__refreshHotbar) window.__refreshHotbar();
+    if (on) {
+        const C = GAME_CONSTANTS;
+        const active = mineFields.filter(f => !f.dead && f.owner === myRole).length;
+        logEvent(`💣 وضع الألغام البحرية — انقر نقطة مائية لنشر حقل ($${C.MINE_COST}، ${active}/${C.MINE_CAP} نشط) [J]`, 'info');
+    }
+}
+window.__setMineMode = _setMineMode;
 
 function _refreshDroneHud() {
     if (!_droneHud) return;
@@ -11218,6 +11323,7 @@ window.addEventListener('keydown', e => {
         if (droneMode) _setDroneMode(false);   // TASK-204
         const _mk = document.getElementById('econMkt');   // TASK-404: close the black market
         if (_mk) _mk.classList.remove('open');
+        if (mineMode) _setMineMode(false);     // TASK-402
         document.getElementById('tgtMsg').style.display = 'none';
         if(rangeMarkerMesh) rangeMarkerMesh.visible = false;
         clearSelection();
@@ -11295,6 +11401,25 @@ window.addEventListener('keydown', e => {
     if (e.code === 'KeyL' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.repeat) {
         if (window.gameMode !== 'mode1' || window.startSpawnPhase) return;
         toggleTradeLanes();
+        return;
+    }
+
+    // K: FLEET FORMATION STANCE (TASK-402) — free / line / escort-wedge.
+    // Group move orders spread the fleet per the stance; arrived hulls hold
+    // station instead of wandering (see Warship.update + assignFormation).
+    if (e.code === 'KeyK' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.repeat) {
+        if (window.gameMode !== 'mode1' || window.startSpawnPhase) return;
+        fleetStanceIdx = (fleetStanceIdx + 1) % GAME_CONSTANTS.FLEET_STANCES.length;
+        const st = GAME_CONSTANTS.FLEET_STANCES[fleetStanceIdx];
+        const names = { free: 'حر — كل سفينة دوريتها الخاصة', line: 'خط أمامي — الرؤوس في المنتصف والحراس على الأجنحة', wedge: 'إسفين حراسة — الحراس في المقدمة والرؤوس في العمق' };
+        logEvent(`⚓ تشكيل الأسطول: ${names[st] || st} [K]`, 'info');
+        return;
+    }
+
+    // J: NAVAL MINE MODE (TASK-402) — click water to deploy a minefield
+    if (e.code === 'KeyJ' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.repeat) {
+        if (window.gameMode !== 'mode1' || window.startSpawnPhase) return;
+        _setMineMode(!mineMode);
         return;
     }
 
@@ -11571,6 +11696,21 @@ window.addEventListener('click', async e => {
             launchDroneSquad(loc);
             return;
         }
+        // NAVAL MINE MODE (TASK-402): click WATER to lay a minefield
+        if (mineMode) {
+            if (isLand(loc.lat, loc.lon)) { logEvent('الألغام البحرية تُنشر في الماء — انقر نقطة مائية!', 'err'); return; }
+            const MC = GAME_CONSTANTS;
+            const active = mineFields.filter(f => !f.dead && f.owner === myRole).length;
+            if (active >= MC.MINE_CAP) { logEvent(`الحد الأقصى لحقول الألغام نشط (${MC.MINE_CAP})! 💣`, 'err'); return; }
+            if (pRes < MC.MINE_COST) { logEvent('لا توجد موارد كافية لنشر الألغام!', 'err'); return; }
+            pRes -= MC.MINE_COST;
+            layMineField(NAVAL_CTX, myRole, loc);
+            if (isOnline) sendAction({ type: 'naval_mine', lat: loc.lat, lon: loc.lon });
+            logEvent(`💣 نُشر حقل ألغام بحري ($${MC.MINE_COST}) — يُسلّح خلال ٣ ثوانٍ`, 'info');
+            if (window.__refreshHotbar) window.__refreshHotbar();
+            updateHUD();
+            return;
+        }
         const pick = _pickOwnUnitAt(loc.lat, loc.lon);
         if (pick) {
             if (!e.shiftKey && !pick.selected) clearSelection();
@@ -11591,15 +11731,29 @@ window.addEventListener('click', async e => {
                 const invaders = selShips.filter(w => w.hullClass === 'transport' && w.troops > 0);
                 const shore = findNearestShoreTile(loc.lat, loc.lon);
                 if (invaders.length && shore) {
-                    invaders.forEach(w => w._orderInvasion(shore));
+                    invaders.forEach(w => {
+                        w._orderInvasion(shore);
+                        // AUDIT #7/#8: mirror the beach order to the peer
+                        if (isOnline) sendAction({ type: 'warship_invade', id: w.id, lat: shore.lat, lon: shore.lon });
+                    });
                     logEvent(`🚢 اتجهت ${invaders.length} ناقلة إنزال نحو الساحل المعادي!`, 'info');
                     return;
                 }
             }
         }
         if (selShips.length && !isLand(loc.lat, loc.lon)) {
-            selShips.forEach(w => w.setPatrol(loc));
-            logEvent(`⛵ اتجهت ${selShips.length} مدمرة إلى نقطة الدورية الجديدة`, 'info');
+            // TASK-402: group orders respect the fleet stance — line/wedge
+            // spread the fleet into formation slots around the click point.
+            assignFormation(NAVAL_CTX, myRole, loc.lat, loc.lon, selShips);
+            selShips.forEach(w => {
+                if (!isOnline) return;
+                // AUDIT #7/#8: mirror each hull's FORMED destination (not the
+                // raw click — formation slots differ per ship).
+                const wp = w.waypoints && w.waypoints.length ? w.waypoints[w.waypoints.length - 1] : loc;
+                sendAction({ type: 'warship_move', id: w.id, lat: wp.lat, lon: wp.lon });
+            });
+            const st = GAME_CONSTANTS.FLEET_STANCES[fleetStanceIdx];
+            logEvent(`⛵ اتجهت ${selShips.length} سفينة إلى نقطة الدورية الجديدة${st !== 'free' ? ` (تشكيل: ${st})` : ''}`, 'info');
             return;
         }
         // TASK-302: tank division orders — land click = march order (the
@@ -11718,9 +11872,11 @@ window.addEventListener('click', async e => {
                 return;
             }
             if (pRes < hull.cost) { document.getElementById('bldMsg').textContent = 'لا توجد موارد كافية!'; return; }
-            const mineSame = warships.reduce((n, w) => n + (!w.dead && w.owner === 'player' && w.hullClass === warshipBuildClass ? 1 : 0), 0);
+            const mineSame = warships.reduce((n, w) => n + (!w.dead && w.owner === myRole && w.hullClass === warshipBuildClass ? 1 : 0), 0);
             if (mineSame >= hull.cap) { document.getElementById('bldMsg').textContent = `الحد الأقصى لـ${hull.name} نشط (${hull.cap})! ⚓`; return; }
-            const port = structs.filter(s => !s.dead && s.owner === 'player' && s.type === 'port')
+            // AUDIT #7: the GUEST's hulls must be 'enemy'-owned (myRole), not
+            // hardcoded 'player' — they used to flip sides online.
+            const port = structs.filter(s => !s.dead && s.owner === myRole && s.type === 'port')
                 .sort((a, b) => haversineDist(a.lat, a.lon, loc.lat, loc.lon) - haversineDist(b.lat, b.lon, loc.lat, loc.lon))[0];
             if (!port) { document.getElementById('bldMsg').textContent = 'تحتاج ميناء لنشر الأسطول! ⚓'; return; }
             // Invasion transports embark troops at purchase
@@ -11729,9 +11885,12 @@ window.addEventListener('click', async e => {
                 if (pTroops * pct < 50) { document.getElementById('bldMsg').textContent = 'لا توجد قوات كافية للإنزال!'; return; }
             }
             pRes -= hull.cost;
-            const ship = new Warship('player', port, { lat: loc.lat, lon: loc.lon }, warshipBuildClass);
+            const ship = new Warship(myRole, port, { lat: loc.lat, lon: loc.lon }, warshipBuildClass);
             warships.push(ship);
             if (warshipBuildClass === 'transport') ship._embarkTroops((window.troopAttackPct || 50) / 100);
+            // AUDIT #7/#8: mirror the hull to the online peer (never happened
+            // before — the guest's fleet was invisible to the host).
+            if (isOnline) sendAction({ type: 'warship_spawn', lat: loc.lat, lon: loc.lon, plat: port.lat, plon: port.lon, hull: warshipBuildClass, troops: ship.troops || 0 });
             logEvent(`⚓ ${hull.name} انطلقت من الميناء! ($${hull.cost})`, 'info');
             buildMode = null;
             document.getElementById('bldMsg').textContent = 'جاهز';
@@ -12193,6 +12352,14 @@ function initWorld(difficulty, pCountryKey='usa', eCountryKey='random', gameMode
     structs = []; missiles = []; planes = []; drones = []; aamMissiles = []; exps = []; particles = [];
     tradeShips = []; trains = []; troopCohorts = []; transportShips = []; warships = [];
 tanks = [];   // TASK-302
+    // TASK-402: naval deep-pass state — torpedoes, minefields, sinking
+    // animations, and the mine mode must reset with the world.
+    torpedoes.forEach(tp => { if (tp.mesh) { scene.remove(tp.mesh); disposeMeshDeep(tp.mesh); } });
+    mineFields.forEach(f => { if (f.mesh) { scene.remove(f.mesh); disposeMeshDeep(f.mesh); } });
+    navalSinking.forEach(sk => { scene.remove(sk.mesh); disposeMeshDeep(sk.mesh); });   // animator-owned hull meshes
+    torpedoes = []; mineFields = []; navalSinking = [];
+    if (mineMode) _setMineMode(false);
+    fleetStanceIdx = 0;
     conquestGrid = null; activeAttacks = [];   // reset conquest system for new game
 
     // Build the conquest grid early so the flat land/water map is visible during
@@ -14180,8 +14347,9 @@ function runAI() {
             // Weighted class pick (carrier needs an escort screen first)
             const escorts = warships.reduce((n, w) => n + (!w.dead && w.owner === riv.str && w.hullClass === 'escort' ? 1 : 0), 0);
             const roll = Math.random();
-            let ck = roll < 0.30 ? 'destroyer'
-                : roll < 0.58 ? 'escort'
+            let ck = roll < 0.28 ? 'destroyer'
+                : roll < 0.50 ? 'escort'
+                : roll < 0.62 ? 'submarine'   // TASK-402: commerce-raiding boats
                 : roll < 0.74 ? 'missile'
                 : roll < 0.84 ? 'drone'
                 : roll < 0.92 ? (myHulls >= 2 ? 'carrier' : 'destroyer')
@@ -14757,6 +14925,13 @@ function backToMenu() {
     tradeShips = []; trains = []; troopCohorts = []; transportShips = []; warships = [];
     tanks = [];   // TASK-302
     transients = []; craterDecals = [];
+    // TASK-402: naval deep-pass state — torpedoes, minefields, sinking hulls
+    torpedoes.forEach(tp => { if (tp.mesh) { scene.remove(tp.mesh); disposeMeshDeep(tp.mesh); } });
+    mineFields.forEach(f => { if (f.mesh) { scene.remove(f.mesh); disposeMeshDeep(f.mesh); } });
+    navalSinking.forEach(sk => { scene.remove(sk.mesh); disposeMeshDeep(sk.mesh); });
+    torpedoes = []; mineFields = []; navalSinking = [];
+    if (mineMode) _setMineMode(false);
+    fleetStanceIdx = 0;
     isOnline = false;
     document.getElementById('go')?.classList.remove('show');
     document.getElementById('gc').style.display = 'none';
@@ -15211,7 +15386,7 @@ window.__UI_API = {
 //  V cycles NAVY HULL CLASSES (TASK-202): first press arms the slot with
 //  the current hull, each further press switches to the next class.
 // ════════════════════════════════════════════════════════════════════════
-const HULL_ORDER = ['destroyer', 'escort', 'missile', 'drone', 'carrier', 'transport'];
+const HULL_ORDER = ['destroyer', 'escort', 'submarine', 'missile', 'drone', 'carrier', 'transport'];   // TASK-402: submarine joins the V cycle
 let warshipBuildClass = 'destroyer';
 // TASK-302: tank division classes cycle on repeated H while the slot is armed
 const TANK_ORDER = ['light', 'medium', 'heavy'];
@@ -15229,7 +15404,8 @@ const HOTBAR_SLOTS = [
     { key: '8', type: 'airport',    icon: '🛫', label: 'مطار',   tip: 'إنتاج الطائرات' },
     { key: '9', type: 'iron_dome',  icon: '🟢', label: 'قبة',    tip: 'اعتراض الزخات' },
     { key: '0', type: 'nuke_plant', icon: '☢️', label: 'مفاعل',  tip: 'دخل ضخم متأخر' },
-    { key: 'V', type: 'warship',    icon: '🛳️', label: 'أسطول',  tip: 'V للتبديل: مدمرة/فرقاطة/طراد/درون/حاملة/إنزال — انقر ماءً للنشر' },
+    { key: 'V', type: 'warship',    icon: '🛳️', label: 'أسطول',  tip: 'V للتبديل: مدمرة/فرقاطة/غواصة/طراد/درون/حاملة/إنزال — انقر ماءً للنشر' },
+    { key: 'J', type: 'mine',       icon: '💣', label: 'ألغام',  tip: 'وضع الألغام البحرية [J] — انقر ماءً لنشر حقل ألغام يفجّر سفن العدو وناقلات إنزاله' },
     { key: 'N', type: 'drone',     icon: '🛸', label: 'درون',   tip: 'وضع الدرونات — أنقر الخريطة لنشر أسراب/استطلاع/صائدة صواريخ' },
     { key: 'H', type: 'tank',      icon: '🚜', label: 'مدرعات',  tip: 'H للتبديل: استطلاع/قتال/اختراق — انقر أرضاً لنشر الفرقة من أقرب مصنع حربي' },
 ];
@@ -15265,7 +15441,9 @@ window.__refreshHotbar = function () {
         const el = bar.children[i];
         const cost = slot.type === 'drone'
             ? (DCFG[selDrone] ? DCFG[selDrone].cost : 0)          // TASK-204: drone slot shows selected type cost
-            : window.__UI_API.costOf(slot.type);
+            : slot.type === 'mine'
+                ? GAME_CONSTANTS.MINE_COST                       // TASK-402: minefield deploy cost
+                : window.__UI_API.costOf(slot.type);
         let count;
         if (slot.type === 'warship') {
             count = warships.reduce((n, w) => n + (!w.dead && w.owner === 'player' && w.hullClass === warshipBuildClass ? 1 : 0), 0);
@@ -15274,6 +15452,10 @@ window.__refreshHotbar = function () {
             el.querySelector('.hicon').textContent = hull.icon;
             el.querySelector('.hname').textContent = hull.name;
             el.querySelector('.hcnt').textContent = `${count}/${hull.cap}`;
+        } else if (slot.type === 'mine') {
+            // TASK-402: live minefield count vs cap
+            const fields = mineFields.filter(f => !f.dead && f.owner === 'player').length;
+            el.querySelector('.hcnt').textContent = `${fields}/${GAME_CONSTANTS.MINE_CAP}`;
         } else if (slot.type === 'tank') {
             // TASK-302: live slot = the armed division class (H cycling)
             const cfg = TCFG[tankBuildClass];
@@ -15291,7 +15473,7 @@ window.__refreshHotbar = function () {
         const techLocked = TECH_LOCKED_BUILDS.includes(slot.type) && !isTechUnlocked(slot.type, 'build', playerTech);
         el.querySelector('.hcost').textContent = '$' + cost;
         el.querySelector('.htip .c').textContent = '$' + cost;
-        el.classList.toggle('sel', buildMode === slot.type || (slot.type === 'drone' && droneMode));
+        el.classList.toggle('sel', buildMode === slot.type || (slot.type === 'drone' && droneMode) || (slot.type === 'mine' && mineMode));
         el.classList.toggle('poor', !techLocked && slot.type !== 'drone' && pRes < cost);
         el.classList.toggle('locked', !!techLocked);
     });
@@ -15308,6 +15490,12 @@ window.__hotbarKey = function (key) {
     if (slot.type === 'drone') {
         if (window.gameMode !== 'mode1') return;
         _setDroneMode(!droneMode);
+        return;
+    }
+    // TASK-402: mine slot is a MODE too — J toggles the deploy cursor
+    if (slot.type === 'mine') {
+        if (window.gameMode !== 'mode1') return;
+        _setMineMode(!mineMode);
         return;
     }
     // V CYCLES HULL CLASSES while the fleet slot is armed (TASK-202)
@@ -15934,6 +16122,197 @@ window.navalBattleTest = async function () {
     logEvent(R.pass ? '🧪 اختبار البحرية: نجح ✅' : '🧪 اختبار البحرية: فشل ❌ — انظر الكونسول', R.pass ? 'info' : 'err');
     return R;
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+//  NAVAL DEEP TEST (TASK-402 probe) — window.navalDeepTest()
+//  Verifies the deep-pass systems deterministically (pumps gameFrame
+//  directly — hidden-page safe, no RAF dependency):
+//    1. FLEET AA (audit #6)  — enemy plane + drone near a destroyer get shredded
+//    2. SUB+TORPEDO          — sub fires, enemy hull takes torpedo damage,
+//                              boat stays undetected with no sonar around
+//    3. SONAR                — an ASW escort's ping reveals the submerged boat
+//    4. MINES                — an enemy hull sailing into a field detonates it
+//    5. FORMATIONS           — line/wedge stances spread distinct waypoints
+//    6. SHORE BOMBARDMENT    — gun hulls shell a coastal structure (grid-ready games)
+//    7. SYNC RECEIVERS (#7/8)— warship_spawn/move/invade, naval_mine, torpedo,
+//                              shipId-based plane basing all mirror locally
+//    8. SUB BUILDABLE        — 'submarine' rides the V hull cycle
+//  Verdict lands in window.__navalDeepResult. Run from the console in mode 1.
+// ═══════════════════════════════════════════════════════════════════════
+window.navalDeepTest = async function () {
+    const log = (m) => console.log('%c[NAVAL-DEEP] ' + m, 'color:#ffaa33;font-weight:bold');
+    if (!scene || gOver) { log('Start a game first (mode 1).'); return; }
+    logEvent('🧪 اختبار البحرية العميق بدأ — راقب الكونسول', 'info');
+    const C = GAME_CONSTANTS;
+    const R = { t: 0, checks: {}, notes: [], done: false, pass: false };
+    window.__navalDeepResult = R;
+
+    const pump = async (n, obs) => {
+        for (let i = 0; i < n; i++) {
+            gameFrame();
+            if (obs) obs();
+            if (i % 300 === 299) await new Promise(r => setTimeout(r, 0));
+        }
+        R.t += n / 60;
+    };
+    const deepClean = () => {
+        clearSelection();
+        for (const w of warships) if (!w.dead) w._sink();
+        for (const d of drones) if (!d.dead) d._crash();
+        for (const p of planes) if (!p.dead) { p.dead = true; if (p.mesh) { scene.remove(p.mesh); disposeMeshDeep(p.mesh); } if (p.selRing) { scene.remove(p.selRing); disposeMeshDeep(p.selRing); } }
+        for (const tp of torpedoes) tp._fizzle(NAVAL_CTX, true);
+        for (const f of mineFields) f._expire(NAVAL_CTX, true);
+        warships.length = 0; drones.length = 0; planes.length = 0;
+    };
+    const fakePort = (ll) => ({ lat: ll.lat, lon: ll.lon });
+
+    // ═══ 1+2. FLEET AA + SUBMARINE warfare (shared theater, mid-Pacific) ═══
+    // NOTE: the torpedo victim is a MISSILE cruiser — destroyers/escorts carry
+    // ASW sonar (170-260km) and would legitimately locate the boat; the
+    // subHidden check needs a sonar-free enemy.
+    deepClean();
+    const A = { lat: 5, lon: -140 };
+    const dd = new Warship('player', fakePort(A), A, 'destroyer');
+    const sub = new Warship('player', fakePort({ lat: 3.4, lon: -139 }), { lat: 3.4, lon: -139 }, 'submarine');
+    const eDd = new Warship('enemy', fakePort({ lat: 3.0, lon: -139 }), { lat: 3.0, lon: -139 }, 'missile');
+    warships.push(dd, sub, eDd);
+    const ePlane = new Plane(5.15, -140.1, PCFG['fighter'], 'enemy');
+    ePlane.mode = 'patrol'; ePlane.tlat = 5.2; ePlane.tlon = -140.2;
+    planes.push(ePlane);
+    const droneSquad = launchDrone('enemy', 'nano', { lat: 5.1, lon: -139.9 }, { homeLat: 5.1, homeLon: -139.9 });
+    log(`theater up: dd@player sub@player eDd@enemy plane+${droneSquad ? droneSquad.length : 0} drones@enemy`);
+    R._sawTorpedo = false; R._sawReveal = false; R._sawSonarDetect = false;
+    await pump(2400, () => {
+        if (torpedoes.length > 0) R._sawTorpedo = true;
+        if (sub._revealT > 0) R._sawReveal = true;
+        if (sub._detectedT > 0) R._sawSonarDetect = true;   // sonar lock (not the firing datum)
+    });
+    R.checks.aa = (ePlane.dead || ePlane.hp < ePlane.cfg.hp - 1) ||
+                  (droneSquad || []).some(d => d.dead || d.hp < d.cfg.hp - 1);
+    R.checks.subFire = (R._sawTorpedo || R._sawReveal) && (eDd.hp < eDd.maxHp - 1 || eDd.dead);
+    // hidden = NO SONAR LOCK before any ASW escort exists (the firing sub's
+    // own flaming-datum reveal (_revealT) is expected and legitimate).
+    R.checks.subHidden = !R._sawSonarDetect;
+    log(`AA=${R.checks.aa} subFire=${R.checks.subFire} subHidden=${R.checks.subHidden} (plane hp ${ePlane.dead ? 'dead' : ePlane.hp}/${ePlane.cfg.hp}, eDd ${eDd.hp}/${eDd.maxHp})`);
+
+    // ═══ 3. SONAR — an ASW escort lights the boat up ═══
+    const asw = new Warship('enemy', fakePort({ lat: 3.42, lon: -139 }), { lat: 3.42, lon: -139 }, 'escort');
+    warships.push(asw);
+    await pump(400);
+    R.checks.sonar = sub.detected === true;
+    log(`sonar=${R.checks.sonar} (sub.detected=${sub.detected})`);
+
+    // ═══ 4. MINES — enemy hull sails into the field (isolated Indian Ocean
+    // theater — later-test fleets must not lure the victim off course) ═══
+    const M = { lat: -15, lon: 100 };
+    const field = layMineField(NAVAL_CTX, 'player', M);
+    const victim = new Warship('enemy', fakePort({ lat: -13.8, lon: 100 }), { lat: -13.8, lon: 100 }, 'destroyer');
+    warships.push(victim);
+    await pump(220);            // let the field ARM first (a pre-arming arrival
+    victim.setPatrol(M);        // would wander off in 60km+ patrol jumps)
+    await pump(1500);
+    R.checks.mines = victim.hp < victim.maxHp - 1 || victim.dead || field.dead || field.charges < C.MINE_CHARGES;
+    log(`mines=${R.checks.mines} (victim ${victim.hp}/${victim.maxHp}${victim.dead ? ' SUNK' : ''}, field charges ${field.charges}/${C.MINE_CHARGES}${field.dead ? ' SPENT' : ''})`);
+
+    // ═══ 5. FORMATIONS — line + wedge spread distinct slots ═══
+    const keepStance = fleetStanceIdx;
+    const squad = [];
+    for (let i = 0; i < 5; i++) {
+        const s = new Warship('player', fakePort(A), { lat: A.lat + i * 0.1, lon: A.lon }, i === 0 ? 'carrier' : (i < 3 ? 'escort' : 'destroyer'));
+        warships.push(s); squad.push(s);
+    }
+    fleetStanceIdx = 1;   // line
+    const lineStance = assignFormation(NAVAL_CTX, 'player', -12, -141, squad);
+    const linePts = new Set(squad.map(s => s.waypoints ? s.waypoints[s.waypoints.length - 1].lat.toFixed(2) + ',' + s.waypoints[s.waypoints.length - 1].lon.toFixed(2) : 'none'));
+    fleetStanceIdx = 2;   // wedge
+    const wedgeStance = assignFormation(NAVAL_CTX, 'player', -12, -142, squad);
+    const wedgePts = new Set(squad.map(s => s.waypoints ? s.waypoints[s.waypoints.length - 1].lat.toFixed(2) + ',' + s.waypoints[s.waypoints.length - 1].lon.toFixed(2) : 'none'));
+    fleetStanceIdx = keepStance;
+    R.checks.formation = lineStance === 'line' && wedgeStance === 'wedge' && linePts.size >= 4 && wedgePts.size >= 4;
+    log(`formation=${R.checks.formation} (line ${lineStance}:${linePts.size} slots, wedge ${wedgeStance}:${wedgePts.size} slots)`);
+
+    // ═══ 6. SHORE BOMBARDMENT — gun hull shells a coastal structure ═══
+    if (conquestGrid && conquestGrid._maskReady) {
+        // geography-robust: scan random points for LAND, then snap to its shore
+        let shore = null;
+        for (let i = 0; i < 400 && !shore; i++) {
+            const t = { lat: (Math.random() * 140 - 70), lon: (Math.random() * 340 - 170) };
+            if (isLand(t.lat, t.lon)) shore = findNearestShoreTile(t.lat, t.lon, 8);
+        }
+        if (shore) {
+            // park the shooter in the nearest water to the shore tile — GRID
+            // water (the shore cell came from the grid; GeoJSON isLand can
+            // disagree near rasterized coasts, so ask the grid first).
+            let water = null;
+            for (let r = 0.15; r <= 2.2 && !water; r += 0.15) {
+                for (let a = 0; a < 12; a++) {
+                    const t = { lat: shore.lat + r * Math.cos(a), lon: shore.lon + r * Math.sin(a) / Math.max(0.2, Math.cos(shore.lat * Math.PI / 180)) };
+                    if (getPixelOwner(t.lat, t.lon) === 'water' || !isLand(t.lat, t.lon)) { water = t; break; }
+                }
+            }
+            if (water) {
+                const shoreDd = new Warship('player', fakePort(water), water, 'destroyer');
+                warships.push(shoreDd);
+                const st = new Structure(shore.lat, shore.lon, 'city', 'enemy');
+                structs.push(st);
+                await pump(1500);
+                R.checks.shore = st.hp < st.maxHp - 1 || st.dead;
+                log(`shore=${R.checks.shore} (city ${st.hp}/${st.maxHp}${st.dead ? ' DESTROYED' : ''}, range ${haversineDist(water.lat, water.lon, shore.lat, shore.lon).toFixed(0)}km)`);
+                if (!st.dead) { st.dead = true; if (st.mesh) scene.remove(st.mesh); if (st.selRing) { scene.remove(st.selRing); } }
+            } else { R.checks.shore = 'skipped (no water near shore)'; log(R.checks.shore); }
+        } else { R.checks.shore = 'skipped (no shore tile)'; log(R.checks.shore); }
+    } else { R.checks.shore = 'skipped (grid not ready)'; log(R.checks.shore); }
+
+    // ═══ 7. SYNC RECEIVERS — applyOpponentAction mirrors the peer's fleet ═══
+    deepClean();
+    applyOpponentAction({ type: 'warship_spawn', lat: 2, lon: -130, plat: 2, plon: -130, hull: 'escort', troops: 0 });
+    const mirror = warships.find(w => !w.dead && w.owner === 'enemy');
+    R.checks.syncSpawn = !!mirror;
+    if (mirror) {
+        applyOpponentAction({ type: 'warship_move', id: mirror.id, lat: 4, lon: -133 });
+        R.checks.syncMove = mirror.patrolLat === 4 && Math.abs(mirror.patrolLon - -133) < 0.01;
+    } else R.checks.syncMove = false;
+    applyOpponentAction({ type: 'naval_mine', lat: 1, lon: -131 });
+    R.checks.syncMine = mineFields.some(f => !f.dead && f.owner === 'enemy');
+    const eSub = new Warship('enemy', fakePort({ lat: 1.5, lon: -131 }), { lat: 1.5, lon: -131 }, 'submarine');
+    warships.push(eSub);
+    const pTgt = new Warship('player', fakePort({ lat: 1.3, lon: -131 }), { lat: 1.3, lon: -131 }, 'destroyer');
+    warships.push(pTgt);
+    applyOpponentAction({ type: 'torpedo', lat: eSub.curLat, lon: eSub.curLon, kind: 'warship', tid: pTgt.id, sid: eSub.id });
+    R.checks.syncTorp = torpedoes.length > 0;
+    const eCar = new Warship('enemy', fakePort({ lat: 1.8, lon: -131 }), { lat: 1.8, lon: -131 }, 'carrier');
+    warships.push(eCar);
+    applyOpponentAction({ type: 'spawn_plane', lat: eCar.curLat, lon: eCar.curLon, ptype: 'fighter', shipId: eCar.id });
+    R.checks.syncWing = planes.some(p => !p.dead && p.baseStruct === eCar);
+    log(`sync spawn=${R.checks.syncSpawn} move=${R.checks.syncMove} mine=${R.checks.syncMine} torpedo=${R.checks.syncTorp} wing=${R.checks.syncWing}`);
+
+    // ═══ 8. SUB BUILDABLE ═══
+    R.checks.subBuildable = HULL_ORDER.includes('submarine') && !!C.HULL_CLASSES.submarine;
+    log(`subBuildable=${R.checks.subBuildable}`);
+
+    deepClean();
+    R.done = true;
+
+    const bool = (v) => v === true;
+    const checks = [
+        ['FLEET AA (audit #6)', bool(R.checks.aa)],
+        ['SUB torpedo attack', bool(R.checks.subFire)],
+        ['SUB hidden w/o sonar', bool(R.checks.subHidden)],
+        ['SONAR reveals sub', bool(R.checks.sonar)],
+        ['MINES detonate', bool(R.checks.mines)],
+        ['FORMATIONS line/wedge', bool(R.checks.formation)],
+        ['SHORE bombardment', R.checks.shore === true || String(R.checks.shore).startsWith('skipped')],
+        ['SYNC receivers (#7/#8)', bool(R.checks.syncSpawn && R.checks.syncMove && R.checks.syncMine && R.checks.syncTorp && R.checks.syncWing)],
+        ['SUB buildable (V cycle)', bool(R.checks.subBuildable)],
+    ];
+    let ok = 0;
+    for (const [name, pass] of checks) { if (pass) ok++; log(`${pass ? '✅' : '❌'} ${name}`); }
+    R.pass = ok === checks.length;
+    log(`RESULT: ${R.pass ? 'PASS' : 'FAIL'} (${ok}/${checks.length} checks) — window.__navalDeepResult`);
+    logEvent(R.pass ? '🧪 اختبار البحرية العميق: نجح ✅' : '🧪 اختبار البحرية العميق: فشل ❌ — انظر الكونسول', R.pass ? 'info' : 'err');
+    return R;
+};
+
 
 // ═══════════════════════════════════════════════════════════════════════
 //  TASK-302: TANK SYSTEM PROBES

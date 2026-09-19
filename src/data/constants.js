@@ -343,6 +343,7 @@ export const GAME_CONSTANTS = {
   FLEET_AA_CHANCE_MIN: 0.15,
   FLEET_AA_DRONE_CHANCE: 0.85,      // drones loiter slow — flak shreds them
   SONAR_HELICOPTER_KM: 260,         // helis reveal submerged subs inside this radius
+  AIR_STRIKE_SHIP_MUL: 1.8,         // TASK-402 audit #6: aircraft ordnance vs hulls (bombs on decks hit hard)
   SUB_DETECT_FRAMES: 300,           // sonar contact persistence (~5s)
   SUB_REVEAL_FRAMES: 480,           // flaming-datum reveal after firing torpedoes (~8s)
   SHORE_BOMBARD_RANGE_KM: 260,      // gun hulls auto-shell enemy coastal structures inside this

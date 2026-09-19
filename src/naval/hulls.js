@@ -238,6 +238,9 @@ function vls(s, ctx) {
     let trg = null, bestD = s.hull.targetRange;
     for (const w of ctx.warships) {
         if (w.dead || w.owner === s.owner) continue;
+        // TASK-402 detection model: a submerged & unlocated submarine is
+        // invisible — VLS cells don't waste shots on sonar ghosts.
+        if (w.hull.submerged && !w.detected) continue;
         const d = ctx.haversineDist(s.curLat, s.curLon, w.curLat, w.curLon);
         if (d < bestD) { bestD = d; trg = { lat: w.curLat, lon: w.curLon }; }
     }
@@ -312,7 +315,7 @@ function fireTorpedo(s, ctx) {
     if (ctx.isOnline && s.owner !== ctx.myRole) return;
     ctx.torpedoes.push(new Torpedo(s.owner, s, { kind: t.kind, obj: t.obj }, ctx));
     if (s.owner === ctx.myRole && ctx.isOnline) {
-        ctx.sendAction({ type: 'torpedo', lat: s.curLat, lon: s.curLon, kind: t.kind, tid: t.obj.id });
+        ctx.sendAction({ type: 'torpedo', lat: s.curLat, lon: s.curLon, kind: t.kind, tid: t.obj.id, sid: s.id });
     }
     s.fireCd = s.hull.torpedoCd || 170;
     s._revealT = GAME_CONSTANTS.SUB_REVEAL_FRAMES;   // flaming datum
