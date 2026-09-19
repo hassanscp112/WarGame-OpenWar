@@ -1,6 +1,6 @@
 import { MCFG, MTAGS, PCFG, DCFG, GAME_CONSTANTS, WORLD_CITIES, SDEFS, ITEM_ICONS, TECH_TREE, BOT_COUNTRIES, BOTS_MAX } from './data/constants.js';
 import { ConquestGrid, ConquestAttack, CONQUEST_CFG, registerOwner, clearRegisteredOwners, setBiomeFlatMode, setBiomeBandColor, getBiomeBandColor, getBiomeBands, attackLogic, attackTilesPerTickCtx } from './core/conquest.js';
-import { initNewUI } from './ui.js';
+import { initNewUI, uiToast } from './ui.js';
 window.GEO_DATA_ROADS = [];
 
 // ═══ CONQUEST SYSTEM (Mode 1 — OpenFront-style territory conquest) ═══
@@ -3981,6 +3981,9 @@ function spawnTradeShipsForActivePorts() {
     }
     let ports = structs.filter(s => s.type === 'port' && !s.dead);
     ports.forEach(port => {
+        // TASK-301 BLOCKADE: enemy warships parked nearby seal this port —
+        // no trade ships may sail from it while blocked.
+        if (isPortBlockaded(port)) return;
         // OpenFront tradeShipSpawnRate(): sigmoid decay on the GLOBAL ship count
         // + a per-port pity counter that raises the chance after each failed
         // attempt. P(spawn per check) ≈ baseRate·(rejections+1)/20.
@@ -9004,11 +9007,19 @@ function updateSelectionPanel() {
             himars: 'HIMARS', ciws: 'CIWS', iron_dome: 'القبة الحديدية', nuke_plant: 'مفاعل نووي'
         };
         const structInfo = {
-            city:     () => [{ k: 'حد القوات', v: `+${(GAME_CONSTANTS.CITY_TROOP_INCREASE||25000).toLocaleString('en')}` },
-                             { k: 'الدور', v: 'يرفع سقف قواتك' }],
-            port:     () => [{ k: 'التجارة', v: 'يولّد سفن تجارية 💰' }, { k: 'المدى', v: 'يحتاج ميناء الطرف الآخر' }],
-            factory:  () => [{ k: 'الدخل', v: `+$${((GAME_CONSTANTS.INCOME_FACTORY||0.08)*60).toFixed(1)}/ث` },
-                             { k: 'السكك', v: 'يشغّل القطارات مع المدن/الموانئ' }],
+            city:     (u) => { const rows = [{ k: 'حد القوات', v: `+${(GAME_CONSTANTS.CITY_TROOP_INCREASE||25000).toLocaleString('en')}` },
+                             { k: 'الدور', v: 'يرفع سقف قواتك' }];
+                             const syn = structSynergyInfo(u); if (syn && syn.links > 0) rows.push({ k: 'التآزر', v: syn.label });
+                             return rows; },
+            port:     (u) => { const rows = [{ k: 'التجارة', v: 'يولّد سفن تجارية 💰' }, { k: 'المدى', v: 'يحتاج ميناء الطرف الآخر' }];
+                             const syn = structSynergyInfo(u); if (syn) rows.push({ k: 'التآزر', v: syn.label });
+                             rows.push({ k: 'الحصار', v: u._blockaded ? '⛔ محاصر — تجارة متوقفة' : '✅ مفتوح' });
+                             return rows; },
+            factory:  (u) => { const syn = structSynergyInfo(u) || { links: 0, label: '—' };
+                             const rate = (GAME_CONSTANTS.INCOME_FACTORY||0.08) * 60 * (1 + syn.links * (GAME_CONSTANTS.SYNERGY_FACTORY_CITY||0.3));
+                             return [{ k: 'الدخل', v: `+$${rate.toFixed(1)}/ث` },
+                             { k: 'التآزر', v: syn.label },
+                             { k: 'السكك', v: 'يشغّل القطارات مع المدن/الموانئ' }]; },
             airport:  () => [{ k: 'الإنتاج', v: 'طائرات من هذا المطار ✈️' }],
             launcher: () => [{ k: 'الوظيفة', v: 'إطلاق الصواريخ 🚀' }],
             radar:    () => [{ k: 'الوظيفة', v: 'كشف مبكر +SAM' }],
@@ -9025,7 +9036,7 @@ function updateSelectionPanel() {
         document.getElementById('selHp').style.width = hpPct + '%';
         let statsHtml = `<div class="sstat"><span>HP</span><span>${Math.ceil(unit.hp)}/${unit.maxHp || unit.cfg?.hp || '?'}</span></div>`;
         if (unit.type && structInfo[unit.type]) {
-            structInfo[unit.type]().forEach(row => {
+            structInfo[unit.type](unit).forEach(row => {
                 statsHtml += `<div class="sstat"><span>${row.k}</span><span>${row.v}</span></div>`;
             });
         } else if (unit.fuel !== undefined) {
@@ -9991,6 +10002,7 @@ function initWorld(difficulty, pCountryKey='usa', eCountryKey='random', gameMode
     }
     
     frame = 0; gOver = false; buildMode = null; targetingMode = false;
+    econResetState();               // TASK-301: milestone/multiplier state for the new game
     lastHUD = 0; _id = 0;
     _lastRAF = 0; _frameAcc = 0;      // reset the fixed-timestep accumulator
     controlGroups = {};               // stale control groups must not select new units
@@ -10177,6 +10189,7 @@ function updateLeaderboard() {
 function updateHUD() {
     if(!document.getElementById('pGold')) return;
     document.getElementById('pGold').textContent = Math.floor(pRes);
+    if (!window.__econTipInit) initEconTooltip();   // TASK-301: lazy wire the income tooltip
     
     if(document.getElementById('pTroops')) {
         // Show current / max so the player always knows troop headroom
@@ -10245,52 +10258,458 @@ function updateHUD() {
     updateLeaderboard();
 }
 
-function calcIncome(side) {
-    if(window.startSpawnPhase) return { income: 0, upkeep: 0, net: 0 };
+// ══════════════════════════════════════════════════════════════════════
+// TASK-301 — ECONOMY DEPTH
+//   1. War upkeep      — standing armies (home + cohorts in the field)
+//                        above WAR_UPKEEP_FREE_TROOPS drain gold/sec.
+//   2. Port blockade   — enemy warship within BLOCKADE_RADIUS_KM of a port
+//                        seals it: no trade ships spawn (READ-ONLY warships[]
+//                        scan — the navy agent owns the Warship class).
+//   3. Synergy         — factory↔city (+30%/link, cap 3) and port↔city
+//                        (+gold/s throughput per link) adjacency bonuses.
+//   4. Milestones      — one-time territory/army bonuses (all sides).
+//   Pure math lives in econRatesFromSnapshot() so economyTest() can replay
+//   the exact same formulas on synthetic balance scenarios.
+// ══════════════════════════════════════════════════════════════════════
+const econState = { milestones: {}, incomeMul: {} };
+let _econScan = { frame: -1, sideData: {} };
+
+function econResetState() {
+    econState.milestones = {};
+    econState.incomeMul = {};
+    window.__econBreakdown = null;
+    _econScan = { frame: -1, sideData: {} };
+}
+
+function troopsOf(side) {
+    if (side === 'player') return pTroops;
+    if (side === 'enemy') return eTroops;
+    const b = bots.find(x => x.str === side);
+    return b ? b.troops : 0;
+}
+// Standing army = home pool + cohorts marching in the field (they eat too).
+function armyOf(side) {
+    let t = troopsOf(side);
+    for (const c of troopCohorts) if (!c.dead && c.owner === side) t += c.troops;
+    return t;
+}
+function econResAdd(side, amt) {
+    if (side === 'player') pRes += amt;
+    else if (side === 'enemy') eRes += amt;
+    else { const b = bots.find(x => x.str === side); if (b) b.res += amt; }
+}
+
+// BLOCKADE — read-only scan of the warships[] array (navy agent's class).
+function isPortBlockaded(port) {
+    const R = GAME_CONSTANTS.BLOCKADE_RADIUS_KM;
+    for (const w of warships) {
+        if (w.dead || w.owner === port.owner) continue;
+        if (haversineDist(w.lat, w.lon, port.lat, port.lon) <= R) return true;
+    }
+    return false;
+}
+
+// Per-frame cached scan: synergy links + blockade state, per side. Called from
+// calcIncome (econ tick + HUD) — one scan per frame shared by all callers.
+function econScanFrame() {
+    if (_econScan.frame === frame) return _econScan;
+    _econScan.frame = frame;
+    _econScan.sideData = {};
+    const sides = ['player'];
+    if (bots.length === 0) sides.push('enemy');
+    for (const b of bots) if (b.alive) sides.push(b.str);
+    const R = GAME_CONSTANTS.SYNERGY_RANGE_KM;
+    const mode2 = window.gameMode !== 'mode1';
+    for (const side of sides) {
+        const factories = [], ports = [];
+        let cities = [];
+        structs.forEach(s => {
+            if (s.owner !== side || s.dead) return;
+            if (s.type === 'factory') factories.push(s);
+            else if (s.type === 'port') ports.push(s);
+            else if (s.type === 'city') cities.push(s);
+        });
+        if (mode2 && cityNodes) cityNodes.forEach(c => { if (c.owner === side) cities.push(c); });
+        const factoryLinks = factories.map(f => cities.reduce(
+            (n, c) => n + (haversineDist(f.lat, f.lon, c.lat, c.lon) <= R ? 1 : 0), 0));
+        let pcLinks = 0;
+        for (const p of ports) for (const c of cities)
+            if (haversineDist(p.lat, p.lon, c.lat, c.lon) <= R) pcLinks++;
+        let blockaded = 0;
+        for (const p of ports) {
+            const nowBlk = isPortBlockaded(p);
+            if (nowBlk !== !!p._blockaded) {           // state change → notify
+                p._blockaded = nowBlk;
+                if (side === 'player' && !window.startSpawnPhase) {
+                    if (nowBlk) {
+                        uiToast('⛔ ميناؤك تحت الحصار البحري — التجارة متوقفة!', 'err', 3200);
+                        logEvent('⛔ سفن حربية معادية تحاصر ميناءك — إرسال التجارة متوقفة', 'err');
+                    } else {
+                        uiToast('✅ فُكّ الحصار عن مينائك — تستأنف التجارة', 'info', 3200);
+                        logEvent('✅ فُكّ الحصار البحري عن مينائك — تستأنف التجارة', 'info');
+                    }
+                }
+            }
+            if (nowBlk) blockaded++;
+        }
+        _econScan.sideData[side] = { factoryLinks, pcLinks, blockaded };
+    }
+    return _econScan;
+}
+
+// PURE per-SECOND economy math from a state snapshot. Shared by calcIncome()
+// (live game) and economyTest() (balance simulations) so they can never drift.
+function econRatesFromSnapshot(snap) {
     const C = GAME_CONSTANTS;
-    let income = 0;
-    let upkeep = 0;
-    
-    // Structure income
+    const base = (snap.base || 0) * C.INCOME_BASE * 60;
     let factories = 0;
+    (snap.factoryLinks || []).forEach(links => {
+        factories += C.INCOME_FACTORY * 60 * (1 + Math.min(3, links) * C.SYNERGY_FACTORY_CITY);
+    });
+    const nuke = (snap.nukePlants || 0) * C.INCOME_NUKE_PLANT * 60;
+    const airports = (snap.airports || 0) * C.INCOME_AIRPORT * 60;
+    const territory = (snap.cells || 0) * C.TERRITORY_INCOME_PER_CELL;
+    const cities = snap.cityIncome || 0;
+    const synergy = (snap.portCityLinks || 0) * C.SYNERGY_PORT_CITY_INCOME;
+    const subtotal = base + factories + nuke + airports + territory + cities + synergy;
+    const factoryMul = 1 + (snap.factoryLinks ? snap.factoryLinks.length : 0) * C.FACTORY_MULTIPLIER;
+    const milestoneMul = snap.milestoneMul || 1;
+    const income = subtotal * factoryMul * milestoneMul;
+    const buildings = (snap.upkeepBuildings || 0) * C.UPKEEP_BUILDING * 60;
+    const planes = (snap.planes || 0) * C.UPKEEP_PLANE * 60;
+    const armyExcess = Math.max(0, (snap.troops || 0) - C.WAR_UPKEEP_FREE_TROOPS);
+    const army = armyExcess / 1000 * C.WAR_UPKEEP_PER_K;
+    const upkeep = buildings + planes + army;
+    return {
+        income, upkeep, net: income - upkeep,
+        parts: { base, factories, nuke, airports, territory, cities, synergy,
+                 factoryMul, milestoneMul, buildings, planes, army, armyExcess }
+    };
+}
+
+function calcIncome(side) {
+    if(window.startSpawnPhase) return { income: 0, upkeep: 0, net: 0, details: null };
+    const C = GAME_CONSTANTS;
+    const scan = econScanFrame().sideData[side] || { factoryLinks: [], pcLinks: 0, blockaded: 0 };
+    let nBase=0, nNuke=0, nAir=0, nUpkeepB=0;
     structs.forEach(s => {
         if(s.owner !== side || s.dead) return;
         switch(s.type) {
-            case 'base':       income += C.INCOME_BASE; break;
-            case 'factory':    income += C.INCOME_FACTORY; factories++; break;
-            case 'nuke_plant': income += C.INCOME_NUKE_PLANT; break;
-            case 'airport':    income += C.INCOME_AIRPORT; break;
+            case 'base':       nBase++; break;
+            case 'nuke_plant': nNuke++; break;
+            case 'airport':    nAir++; break;
+            case 'factory':    break;   // income computed via synergy links below
             default:
-                if(SDEFS[s.type] && SDEFS[s.type].cost > 0) upkeep += C.UPKEEP_BUILDING;
+                if(SDEFS[s.type] && SDEFS[s.type].cost > 0) nUpkeepB++;
                 break;
         }
     });
-    
-    // Mode 1: territory income — driven by the CONQUEST GRID. (The legacy
-    // playerCoordinates list was never populated by ConquestAttack, so the old
-    // coord-based income paid zero forever.) ~0.05/s per old painted circle
-    // (~210 cells) ≈ same order of magnitude per cell.
-    if(window.gameMode === 'mode1') {
-        if (conquestGrid && conquestGrid._maskReady) {
-            income += conquestGrid.countCells(side) * (C.TERRITORY_INCOME_PER_CELL / 60); // per-frame rate
-        }
-    } else {
-        // City income from territory system (only for Mode 2)
-        if(cityNodes) {
-            cityNodes.forEach(c => {
-                if(c.owner === side) income += (c.income || C.INCOME_CITY);
-            });
+    const mode1 = window.gameMode === 'mode1';
+    const cells = (mode1 && conquestGrid && conquestGrid._maskReady) ? conquestGrid.countCells(side) : 0;
+    let cityIncome = 0;
+    if (!mode1 && cityNodes) {
+        cityNodes.forEach(c => { if(c.owner === side) cityIncome += (c.income || C.INCOME_CITY) * 60; });
+    }
+    const planesN = planes.filter(p => p.owner === side && !p.dead).length;
+    const snap = {
+        base: nBase, nukePlants: nNuke, airports: nAir,
+        factoryLinks: scan.factoryLinks,
+        cells, cityIncome,
+        portCityLinks: scan.pcLinks,
+        milestoneMul: econState.incomeMul[side] || 1,
+        planes: planesN, upkeepBuildings: nUpkeepB,
+        troops: armyOf(side),
+    };
+    const r = econRatesFromSnapshot(snap);          // per-second rates
+    if (side === 'player') {
+        window.__econBreakdown = {
+            income: r.income, upkeep: r.upkeep, net: r.net, parts: r.parts,
+            troops: snap.troops, cells, planes: planesN,
+            factories: scan.factoryLinks.length, portCityLinks: scan.pcLinks,
+            blockadedPorts: scan.blockaded, at: frame,
+        };
+    }
+    // API contract: per-FRAME rates (callers multiply by the tick interval)
+    return { income: r.income / 60, upkeep: r.upkeep / 60, net: r.net / 60, details: r.parts };
+}
+
+// Milestones — checked once per second for every living side. Rewards are
+// instant gold (econResAdd) and/or a permanent income multiplier.
+function econMilestoneTick() {
+    if (window.startSpawnPhase || gOver) return;
+    const C = GAME_CONSTANTS;
+    const sides = ['player'];
+    if (bots.length === 0) sides.push('enemy');
+    for (const b of bots) if (b.alive) sides.push(b.str);
+    const mode1 = window.gameMode === 'mode1';
+    for (const side of sides) {
+        const reached = econState.milestones[side] || (econState.milestones[side] = new Set());
+        let cells = 0;
+        if (mode1 && conquestGrid && conquestGrid._maskReady) cells = conquestGrid.countCells(side);
+        else cells = (cityNodes ? cityNodes.filter(c => c.owner === side).length : 0) * 800; // mode-2 equivalent
+        const troops = armyOf(side);
+        for (const m of C.ECON_MILESTONES) {
+            if (reached.has(m.id)) continue;
+            const okCells = m.cells && cells >= m.cells;
+            const okTroops = m.troops && troops >= m.troops;
+            if (!okCells && !okTroops) continue;
+            reached.add(m.id);
+            if (m.rewardGold) econResAdd(side, m.rewardGold);
+            if (m.incomeMul) econState.incomeMul[side] = (econState.incomeMul[side] || 1) * m.incomeMul;
+            if (side === 'player') {
+                const bonus = m.rewardGold ? ` +$${m.rewardGold}` : (m.incomeMul ? ` دخل +${Math.round((m.incomeMul - 1) * 100)}%` : '');
+                uiToast(`${m.icon} إنجاز: ${m.name}!${bonus}`, 'warn', 3400);
+                logEvent(`${m.icon} إنجاز اقتصادي: ${m.name}${bonus}`, 'info');
+            }
         }
     }
-    
-    // Factory multiplier
-    income *= (1 + factories * C.FACTORY_MULTIPLIER);
-    
-    // Plane upkeep
-    let planeCount = planes.filter(p => p.owner === side && !p.dead).length;
-    upkeep += planeCount * C.UPKEEP_PLANE;
-    
-    return { income, upkeep, net: income - upkeep };
+}
+
+// ── Income breakdown tooltip (hover the 💰 / 📈 counters) ──────────────
+// Synergy info for one structure (selection panel rows, TASK-301).
+function structSynergyInfo(s) {
+    if (!s || s.owner == null) return null;
+    const R = GAME_CONSTANTS.SYNERGY_RANGE_KM;
+    const mode2 = window.gameMode !== 'mode1';
+    const cities = structs.filter(x => x.owner === s.owner && !x.dead && x.type === 'city');
+    if (mode2 && cityNodes) cityNodes.forEach(c => { if (c.owner === s.owner) cities.push(c); });
+    const near = (a, b) => haversineDist(a.lat, a.lon, b.lat, b.lon) <= R;
+    if (s.type === 'factory') {
+        const links = Math.min(3, cities.reduce((n, c) => n + (near(s, c) ? 1 : 0), 0));
+        return { links, label: `مدن مرتبطة ×${links} (+${Math.round(links * GAME_CONSTANTS.SYNERGY_FACTORY_CITY * 100)}% دخل)` };
+    }
+    if (s.type === 'port') {
+        const links = cities.reduce((n, c) => n + (near(s, c) ? 1 : 0), 0);
+        return { links, label: links ? `مدن مرتبطة ×${links} (+$${(links * GAME_CONSTANTS.SYNERGY_PORT_CITY_INCOME).toFixed(2)}/ث)` : 'لا مدن قريبة' };
+    }
+    if (s.type === 'city') {
+        const facts = structs.filter(x => x.owner === s.owner && !x.dead && x.type === 'factory' && near(s, x)).length;
+        const prts = structs.filter(x => x.owner === s.owner && !x.dead && x.type === 'port' && near(s, x)).length;
+        return { links: facts + prts, label: `روابط تآزر: 🏭×${facts} 🚢×${prts}` };
+    }
+    return null;
+}
+let _econTipTimer = null;
+function renderEconTooltip(tip) {
+    const b = window.__econBreakdown;
+    if (!b) { tip.innerHTML = '<div class="etRow">لا توجد بيانات اقتصادية بعد</div>'; return; }
+    const P = b.parts;
+    const fmt = v => (v >= 0 ? '+' : '') + v.toFixed(1);
+    const myShips = tradeShips.reduce((n, ts) => n + (ts.dead || ts.owner !== 'player' ? 0 : 1), 0);
+    const tradeEst = myShips * GAME_CONSTANTS.TRADE_SHIP_BASE_GOLD / 90;   // ≈ payout / avg voyage
+    const earned = (econState.milestones.player || new Set());
+    const chips = GAME_CONSTANTS.ECON_MILESTONES
+        .filter(m => earned.has(m.id))
+        .map(m => `${m.icon} ${m.name}`).join(' · ') || '—';
+    const rows = [];
+    const row = (k, v, cls) => rows.push(`<div class="etRow${cls ? ' ' + cls : ''}"><span>${k}</span><span>${v}</span></div>`);
+    row('🏛️ القاعدة', fmt(P.base));
+    row('🗺️ الأراضي', fmt(P.territory) + ` (${b.cells.toLocaleString('en')} خلية)`);
+    if (P.factories) row('🏭 المصانع', fmt(P.factories) + ` (${b.factories})`);
+    if (P.nuke) row('☢️ نووي', fmt(P.nuke));
+    if (P.airports) row('🛫 المطارات', fmt(P.airports));
+    if (P.cities) row('🏙️ المدن', fmt(P.cities));
+    if (P.synergy) row('🤝 ميناء-مدينة', fmt(P.synergy) + ` (×${b.portCityLinks})`);
+    row('🚢 التجارة (تقديري)', '≈' + tradeEst.toFixed(1) + ` (${myShips} سفينة)`, 'etTrade');
+    if (P.factoryMul > 1) row('⚙️ مضاعف المصانع', '×' + P.factoryMul.toFixed(2));
+    if (P.milestoneMul > 1) row('🏆 إنجازات', '×' + P.milestoneMul.toFixed(2), 'etMile');
+    rows.push('<div class="etSep"></div>');
+    row('🎖️ الجيش' + (P.armyExcess > 0 ? ` (${Math.round(P.armyExcess / 1000)}k فائض)` : ' (مجاني)'), (P.army > 0 ? '-' : '+') + Math.abs(P.army).toFixed(1), P.army > 0 ? 'etDrain' : '');
+    row('✈️ الطائرات', '-' + P.planes.toFixed(1), 'etDrain');
+    row('🏗️ المباني', '-' + P.buildings.toFixed(1), 'etDrain');
+    rows.push(`<div class="etNet${b.net >= 0 ? '' : ' etNeg'}">الصافي ${fmt(b.net)}/ث</div>`);
+    if (b.blockadedPorts > 0) rows.push(`<div class="etBlk">⛔ موانئ تحت الحصار: ${b.blockadedPorts}</div>`);
+    rows.push(`<div class="etMiles">🏆 ${chips}</div>`);
+    tip.innerHTML = rows.join('');
+}
+function initEconTooltip() {
+    window.__econTipInit = true;
+    const tip = document.createElement('div');
+    tip.id = 'econTip';
+    document.body.appendChild(tip);
+    const attach = (el) => {
+        if (!el) return;
+        el.addEventListener('mouseenter', () => {
+            renderEconTooltip(tip);
+            tip.classList.add('show');
+            if (_econTipTimer) clearInterval(_econTipTimer);
+            _econTipTimer = setInterval(() => renderEconTooltip(tip), 1000);
+        });
+        el.addEventListener('mouseleave', () => {
+            tip.classList.remove('show');
+            if (_econTipTimer) { clearInterval(_econTipTimer); _econTipTimer = null; }
+        });
+    };
+    const gold = document.getElementById('pGold');   if (gold) attach(gold.closest('.stat') || gold);
+    const inc  = document.getElementById('pIncome'); if (inc)  attach(inc.closest('.stat') || inc);
+}
+
+// ── TASK-301 PROBE: economyTest() ─────────────────────────────────────
+// Console probe. economyTest()      → unit checks + live snapshot + balance sim.
+// economyTest(followSec)            → same, plus a scheduled re-run after
+//                                      followSec seconds (call economyTest(120)
+//                                      at game start → t=2min row; economyTest(300) → 5min).
+// Simulation assumptions are printed with the results — tune the schedule
+// constants in _econSimulateNeutral() if live play drifts.
+window.economyTest = function(followSec) {
+    const C = GAME_CONSTANTS;
+    const out = { when: new Date().toISOString(), followSec: followSec || 0, checks: [], live: null, sim: null, pass: true };
+    const chk = (name, ok, info) => {
+        out.checks.push({ name, ok, info: info == null ? '' : String(info) });
+        if (!ok) out.pass = false;
+        console.log(`${ok ? '✅' : '❌'} [ECON] ${name}${info != null ? ' — ' + info : ''}`);
+    };
+
+    // ── A. unit checks on the pure math (econRatesFromSnapshot) ──
+    {
+        const r0 = econRatesFromSnapshot({ base: 1 });
+        chk('base income = INCOME_BASE×60', Math.abs(r0.parts.base - C.INCOME_BASE * 60) < 1e-9, r0.parts.base.toFixed(2) + '/s');
+        const r1 = econRatesFromSnapshot({ factoryLinks: [1] });
+        chk('factory↔city synergy +30%', Math.abs(r1.parts.factories - C.INCOME_FACTORY * 60 * 1.3) < 1e-9, r1.parts.factories.toFixed(2) + '/s');
+        const r4 = econRatesFromSnapshot({ factoryLinks: [9] });
+        chk('factory synergy capped at 3 links', Math.abs(r4.parts.factories - C.INCOME_FACTORY * 60 * (1 + 3 * C.SYNERGY_FACTORY_CITY)) < 1e-9);
+        const r2 = econRatesFromSnapshot({ troops: C.WAR_UPKEEP_FREE_TROOPS + 10000 });
+        chk('war upkeep: 10k excess troops', Math.abs(r2.parts.army - 10 * C.WAR_UPKEEP_PER_K) < 1e-9, r2.parts.army.toFixed(2) + '/s');
+        const r3 = econRatesFromSnapshot({ troops: C.WAR_UPKEEP_FREE_TROOPS });
+        chk('army at free threshold costs 0', r3.parts.army === 0);
+        const r5 = econRatesFromSnapshot({ base: 1, factoryLinks: [0, 0], milestoneMul: 1.1 });
+        chk('milestone × factory multipliers stack', Math.abs(r5.income - C.INCOME_BASE * 60 * (1 + 2 * C.FACTORY_MULTIPLIER) * 1.1) < 1e-9);
+        const r6 = econRatesFromSnapshot({ portCityLinks: 2 });
+        chk('port↔city throughput income', Math.abs(r6.parts.synergy - 2 * C.SYNERGY_PORT_CITY_INCOME) < 1e-9, r6.parts.synergy.toFixed(2) + '/s');
+    }
+    // milestone defs integrity
+    {
+        const ids = new Set();
+        let sane = true;
+        for (const m of C.ECON_MILESTONES) {
+            if (!m.id || ids.has(m.id) || (!m.cells && !m.troops)) sane = false;
+            if (m.incomeMul != null && m.incomeMul < 1) sane = false;
+            ids.add(m.id);
+        }
+        chk('milestone defs sane (unique ids, thresholds, mul ≥ 1)', sane, [...ids].join(','));
+    }
+    // blockade distance logic — synthetic warship pushed & popped synchronously
+    // (no frame can interleave; the real warships[] is untouched afterwards)
+    {
+        const fakePort = { lat: 30, lon: 30, owner: 'player' };
+        const fakeShip = { dead: false, owner: 'enemy', lat: 30, lon: 30 };
+        warships.push(fakeShip);
+        const near = isPortBlockaded(fakePort);
+        fakeShip.lon = 40;                    // ≈1040km away — outside radius
+        const far = isPortBlockaded(fakePort);
+        fakeShip.lon = 30; fakeShip.owner = 'player';   // own ship never blocks
+        const own = isPortBlockaded(fakePort);
+        warships.pop();
+        chk('blockade: near✓ far✗ own✗', near === true && far === false && own === false, `R=${C.BLOCKADE_RADIUS_KM}km`);
+    }
+
+    // ── B. live snapshot (if a game is running) ──
+    if (window.__econBreakdown) {
+        const b = window.__econBreakdown;
+        out.live = {
+            t_sec: Math.round(b.at / 60), cells: b.cells, troops: Math.round(b.troops),
+            income: +b.income.toFixed(2), upkeep: +b.upkeep.toFixed(2), net: +b.net.toFixed(2),
+            factories: b.factories, planes: b.planes, blockadedPorts: b.blockadedPorts,
+            milestones: [...(econState.milestones.player || [])],
+        };
+        console.log('📊 [ECON] LIVE t=' + out.live.t_sec + 's', JSON.parse(JSON.stringify(out.live)));
+    }
+
+    // ── C. balance simulation (typical neutral game through the REAL math) ──
+    out.sim = _econSimulateNeutral();
+    const fmtMin = s => s == null ? 'never' : (s / 60).toFixed(1) + 'min';
+    console.log(`🎯 [ECON] SIM: $3000 treasury @ ${fmtMin(out.sim.t3000)} · full nuke program ($4000) @ ${fmtMin(out.sim.tNuke)} — target window 8–12 min (nuke)`);
+    console.table(out.sim.marks.map(m => ({ t_min: m.t / 60, net_ps: +m.net.toFixed(1), gold: m.gold })));
+
+    if (followSec > 0) {
+        console.log(`⏱️ [ECON] economyTest will re-snapshot in ${followSec}s...`);
+        setTimeout(() => window.economyTest(0), followSec * 1000);
+    }
+    window.__econTestLog = (window.__econTestLog || []).concat([{ at: out.when, live: out.live, tNuke: out.sim.tNuke }]);
+    return out;
+};
+
+// Balance simulation: replays a typical neutral game through the REAL economy
+// formulas (econRatesFromSnapshot) and reports when the treasury first holds
+// `target` spare gold AFTER typical spending. Assumptions (calibrated vs the
+// game's actual growth recurrences — see scripts/econ_growth_calibration.mjs):
+//   • troops hit the calcMaxTroops ceiling within ~2 min (10 ticks/s growth is
+//     explosive), so T(t) ≈ 2*(cells^0.6*1000+50000) + cities*25000
+//   • cells grow ~22/s (live-measured conquest rates, soft land ceiling 9000)
+//   • structures: city@2m, port@3m, factory@5m, city@7m, factory@9m, port@11m
+//     (+ launcher + SAM + 2 planes + techs + missiles — full lump schedule below)
+//   • spendFraction of net is re-invested into missiles/tech/units
+//   • trade: +2.5/s per port (×0.85 average blockade pressure after 6 min)
+function _econSimulateNeutral(opts) {
+    const C = GAME_CONSTANTS;
+    const o = Object.assign({
+        startGold: C.STARTING_RES_OFFLINE,
+        spendFraction: 0.35,
+        cellsK: 22,                // ≈ cells/sec conquest (calibrated vs live)
+        landCap: 9000,             // soft neutral-land ceiling for expansion
+        horizonSec: 900,           // 15 min
+    }, opts || {});
+    const maxTroopsAt = (cells, cities) =>
+        2 * (Math.pow(Math.max(1, cells), 0.6) * 1000 + 50000) + cities * C.CITY_TROOP_INCREASE;
+    // Lump gold sinks (t_sec, cost) — typical neutral-game purchases.
+    const lumps = [
+        [30, 180], [60, 300], [120, 500], [180, 400], [240, 450], [300, 600],
+        [360, 400], [420, 750], [480, 450], [540, 900], [600, 800], [660, 600],
+        [720, 570], [780, 350], [840, 750], [900, 1125],
+    ];
+    // Online state by time (matches the lump schedule above).
+    const citiesAt   = t => (t >= 120 ? 1 : 0) + (t >= 420 ? 1 : 0);
+    const factoriesAt = t => (t >= 300 ? 1 : 0) + (t >= 540 ? 1 : 0);
+    const portsAt    = t => (t >= 180 ? 1 : 0) + (t >= 660 ? 1 : 0);
+    const planesAt   = t => 2 + (t >= 480 ? 1 : 0);
+    const upkBAt     = t => 1 + citiesAt(t) + portsAt(t) + (t >= 240 ? 1 : 0);  // launcher+city+port+SAM
+
+    let gold = o.startGold;
+    let incomeMul = 1;
+    const reached = new Set();
+    let t3000 = null, tNuke = null;
+    const marks = [];
+    // Logistic territory growth (matches the calibrated recurrence
+    // cells' = cellsK*(1-cells/landCap)): closed form.
+    const cellsAtT = t => o.landCap - (o.landCap - 900) * Math.exp(-o.cellsK * t / o.landCap);
+    for (let t = 0; t <= o.horizonSec; t++) {
+        const cells = cellsAtT(t);
+        const troops = maxTroopsAt(cells, citiesAt(t));   // growth is explosive → at cap
+        const nCities = citiesAt(t), nFact = factoriesAt(t);
+        const factoryLinks = [];
+        for (let i = 0; i < nFact; i++) factoryLinks.push(Math.min(3, nCities));
+        const snap = {
+            base: 1, nukePlants: 0, airports: 1,
+            factoryLinks,
+            cells, cityIncome: 0,
+            portCityLinks: portsAt(t) * nCities,
+            milestoneMul: incomeMul,
+            planes: planesAt(t), upkeepBuildings: upkBAt(t),
+            troops,
+        };
+        const r = econRatesFromSnapshot(snap);
+        // Trade income (event-based in the live game — modeled per-port here)
+        let trade = 2.5 * portsAt(t) * (t >= 360 ? 0.85 : 1);
+        // Milestones — same defs & order as econMilestoneTick()
+        for (const m of C.ECON_MILESTONES) {
+            if (reached.has(m.id)) continue;
+            if ((m.cells && cells >= m.cells) || (m.troops && troops >= m.troops)) {
+                reached.add(m.id);
+                if (m.rewardGold) gold += m.rewardGold;
+                if (m.incomeMul) incomeMul *= m.incomeMul;
+            }
+        }
+        const grossNet = r.net + trade;
+        gold += grossNet * (1 - o.spendFraction);        // re-invested share spent
+        while (lumps.length && lumps[0][0] <= t) gold -= lumps.shift()[1];
+        if (gold < 0) gold = 0;
+        if (t3000 === null && gold >= 3000) t3000 = t;
+        if (tNuke === null && gold >= 4000) tNuke = t;   // nuclear_prog tech + nuke_tac
+        if (t === 0 || t === 120 || t === 300 || t === 600 || t === 900) {
+            marks.push({ t, net: grossNet, gold: Math.round(gold), troops: Math.round(troops / 1000) + 'k' });
+        }
+    }
+    return { t3000, tNuke, marks, assumptions: o, milestones: [...reached] };
 }
 
 
@@ -10967,6 +11386,9 @@ function gameFrame() {
         if(pRes < 0) pRes = 0;
         if(eRes < 0) eRes = 0;
     }
+    
+    // TASK-301: economy milestones — once per second, all sides
+    if (frame % 60 === 0) econMilestoneTick();
     
     // Spawn Trade Ships and Trains on interval
     if(frame % GAME_CONSTANTS.TRADE_SHIP_SPAWN_INTERVAL === 0) {
