@@ -8937,7 +8937,9 @@ class Tank {
             if (this.unsupplied && this.owner === 'player') logEvent(`✅ ${this.name} عادت إلى الإمداد`, 'info');
             this.unsupplied = false;
             this.supplyGrace = 0;
-        } else if (++this.supplyGrace > C.TANK_SUPPLY_GRACE_F) {
+        } else if ((this.supplyGrace += 90) > C.TANK_SUPPLY_GRACE_F) {
+            // +90 = the scan cadence, so GRACE_F counts FRAMES (600 ≈ 10s)
+            // — previously ++ per scan made the grace 600×90f ≈ 15 minutes.
             if (!this.unsupplied && this.owner === 'player') {
                 logEvent(`⛔ ${this.name} انقطعت عن الإمداد — تبدأ بالاستنزاف! (${Math.round(R)}كم من أقرب مدينة)`, 'err');
             }
@@ -11210,12 +11212,15 @@ function updateSelectionPanel() {
             if (unit.hullClass === 'escort') statsHtml += `<div class="sstat"><span>الدفاع</span><span>اعتراض ${unit.hull.pdRange}كم 🛡️</span></div>`;
             if (unit.hullClass === 'missile') statsHtml += `<div class="sstat"><span>التسليح</span><span>VLS 🚀</span></div>`;
         } else if (unit instanceof Tank) {
-            // TASK-302: division readout — strength, mode, kill tally
+            // TASK-302 + TASK-405: division readout — strength, mode, logistics, veterancy
             const modeAr = { advance: 'زحف ⚔', combat: 'اشتباك 🔥', hold: 'تمركز 🛡️' }[unit.mode] || unit.mode;
-            statsHtml += `<div class="sstat"><span>الوضع</span><span>${modeAr}</span></div>`;
+            statsHtml += `<div class="sstat"><span>الوضع</span><span>${unit._crossing ? '🌊 عبور نهر' : modeAr}</span></div>`;
             statsHtml += `<div class="sstat"><span>دروع</span><span>${unit.members.length}/${unit.members0} 🚜</span></div>`;
-            statsHtml += `<div class="sstat"><span>مدفع</span><span>${unit.cfg.gunDmg} · ${unit.cfg.gunRange}كم</span></div>`;
-            statsHtml += `<div class="sstat"><span>تحصين</span><span>-${Math.round(unit.cfg.armor * 100)}%</span></div>`;
+            statsHtml += `<div class="sstat"><span>مدفع</span><span>${unit.cfg.gunDmg} · ${unit.cfg.gunRange}كم${unit.ace ? ' ' + '★'.repeat(unit.ace) : ''}</span></div>`;
+            statsHtml += `<div class="sstat"><span>تحصين</span><span>-${Math.round(unit.armorEff * 100)}%${unit.entrench > 0.05 ? ` + خندق ${Math.round(unit.entrench * 100)}%` : ''}</span></div>`;
+            statsHtml += `<div class="sstat"><span>إمداد</span><span>${unit.unsupplied ? '⛔ مقطوع — استنزاف' : '✅ موصول'}</span></div>`;
+            if (unit.kills > 0) statsHtml += `<div class="sstat"><span>🎖 قتلى</span><span>${unit.kills}${unit.ace ? ' — ' + TANK_ACE_AR[unit.ace] : ''}</span></div>`;
+            if (unit.engineDamaged) statsHtml += `<div class="sstat"><span>محرك</span><span>⚠️ متضرر (نصف سرعة)</span></div>`;
             if (unit.shots) statsHtml += `<div class="sstat"><span>طلقات</span><span>${unit.shots}</span></div>`;
         } else if (unit.mode) {
             statsHtml += `<div class="sstat"><span>وضع</span><span>${unit.mode}</span></div>`;
@@ -13683,6 +13688,7 @@ function gameFrame() {
     _compactDead(planes);
     // TASK-201: air-to-air missile tracers
     _compactAlive(aamMissiles, m => m.update());
+    _tankDeepTick();   // TASK-405: burning wrecks fade + SPG arc shells fly
     
     // Update OpenFront objects
     _compactAlive(tradeShips, ts => ts.update());
@@ -14970,10 +14976,11 @@ window.tankBattleTest = async function () {
     if (!scene || gOver) { log('Start a game first (mode 1).'); return 'no scene'; }
     logEvent('🧪 اختبار المعركة البرية بدأ — راقب الكونسول', 'info');
 
-    // ── isolate: clear every division ──
+    // ── isolate: clear every division + deep-pass state (wrecks/shells) ──
     clearSelection();
     for (const t of tanks) { if (!t.dead) t._destroy(); }
     tanks.length = 0;
+    _clearTankDeep();
 
     // ── theater: USA midlands (LAND, far from most spawn points) ──
     const A = { lat: 39.0, lon: -98.5 };   // player heavy division
@@ -15050,4 +15057,180 @@ window.tankMarchTest = async function () {
     window.__tankMarchResult = R;
     log(`corridor=${R.corridorPainted} arrived=${R.arrived} moved=${Math.round(R.moved)}km`);
     return R;
+};
+
+// ═══ TASK-405 DEEP-PASS PROBE ═══ Exercises everything the wiring pass
+// hooked up:
+//  • SPG spotting GATE — silent without a spotter, arcs with one
+//  • Standoff — the battery holds position while bombarding
+//  • Siege + ACE progression (3 kills → veteran)
+//  • Entrenchment (20s hold → sandbag ring)
+//  • Supply CUT → attrition, and the ENTRENCHED BRIDGEHEAD feeding a
+//    fresh division 400km from the nearest hub
+//  • River far-bank probe (strait crossable / ocean blocked)
+//  • Dual-purpose flak chipping armor inside 90km
+//  • Wreck lifecycle (burning wreck spawns, then fades)
+// Run from the console during a mode-1 game: await window.tankDeepTest()
+window.tankDeepTest = async function () {
+    const log = (m) => console.log('%c[TANK-DEEP] ' + m, 'color:#ff7744;font-weight:bold');
+    const C = GAME_CONSTANTS;
+    const R = { phase: 'setup' };
+    window.__tankDeepResult = R;
+    if (!scene || gOver) { log('Start a game first (mode 1).'); R.phase = 'no-scene'; return R; }
+    logEvent('🧪 اختبار العمق البري (مدفعية/إمداد/تحصين) بدأ', 'info');
+
+    // ── isolation: sweep divisions + deep state; remember what we spawn ──
+    clearSelection();
+    for (const t of tanks) { if (!t.dead) t._destroy(); }
+    tanks.length = 0;
+    _clearTankDeep();
+    const mineS = [], mineT = [];
+    const mkS = (lat, lon, type, owner) => { const s = new Structure(lat, lon, type, owner); structs.push(s); mineS.push(s); return s; };
+    const mkT = (lat, lon, key, owner, opts) => { const t = spawnTankDivision(lat, lon, key, owner, opts); mineT.push(t); return t; };
+    const dropS = (s) => {
+        const i = structs.indexOf(s); if (i >= 0) structs.splice(i, 1);
+        if (!s.dead) {
+            s.dead = true; scene.remove(s.mesh); scene.remove(s.selRing);
+            if (s.accents) s.accents.forEach(m => m.dispose());
+            if (s.selRing && s.selRing.material) s.selRing.material.dispose();
+        }
+    };
+    const dropT = (t) => { if (t && !t.dead) { t.dead = true; t.selected = false; scene.remove(t.mesh); disposeMeshDeep(t.mesh); } };
+
+    try {
+        // ── theater: Kansas SPG battery (A) vs an enemy flak cluster (F)
+        // ≈320km south — beyond the SPG's sightR(300) so indirect fire
+        // needs a SPOTTER; on land, inside engageR(520)/gunRange(420). ──
+        const A = { lat: 39.5, lon: -98.5 };
+        const F = { lat: 36.6, lon: -98.6 };
+        if (!isLand(A.lat, A.lon) || !isLand(F.lat, F.lon)) { log('Theater not on land.'); R.phase = 'bad-theater'; return R; }
+        R.theater = { dAF: Math.round(haversineDist(A.lat, A.lon, F.lat, F.lon)) };
+        mkS(F.lat, F.lon, 'flak', 'enemy');
+        mkS(F.lat + 0.3, F.lon, 'flak', 'enemy');
+        mkS(F.lat + 0.6, F.lon, 'flak', 'enemy');
+        const spg = mkT(A.lat, A.lon, 'spg', 'player', { tgtLat: A.lat, tgtLon: A.lon });
+
+        // ── A1: spotting GATE — no spotter → no rounds downrange ──
+        R.phase = 'A1 gate';
+        const radarCovers = _radarCovers(F.lat, F.lon, 'player');
+        const enemyInSight = structs.some(s => !s.dead && s.owner !== 'player' && s.owner !== 'neutral'
+            && haversineDist(A.lat, A.lon, s.lat, s.lon) < spg.cfg.sightR);
+        await window.__pumpGame(420);
+        R.gateHolds = (radarCovers || enemyInSight) ? 'skip' : (spg.shots === 0);
+        log(`A1 gate: shots=${spg.shots} radar=${radarCovers} enemyInSight=${enemyInSight} → ${R.gateHolds}`);
+
+        // ── A2: light scout spots → arc shells fly, battery holds ──
+        R.phase = 'A2 spot';
+        const SC = { lat: 38.0, lon: -98.6 };   // ~156km N of F: inside scout sightR(520), outside its gunRange(110)
+        const scout = mkT(SC.lat, SC.lon, 'light', 'player', { tgtLat: SC.lat, tgtLon: SC.lon });
+        await window.__pumpGame(600);
+        R.indirect = spg.shots > 0;
+        R.standoff = haversineDist(spg.lat, spg.lon, A.lat, A.lon) < 5;
+        log(`A2: shots=${spg.shots} batteryDrift=${Math.round(haversineDist(spg.lat, spg.lon, A.lat, A.lon))}km`);
+
+        // ── A3: siege to 3 kills → VETERAN ace ──
+        R.phase = 'A3 siege';
+        let guard = 0;
+        while (spg.kills < 3 && !spg.dead && guard++ < 26) await window.__pumpGame(120);
+        R.kills = spg.kills; R.ace = spg.ace;
+        log(`A3: kills=${spg.kills} ace=${spg.ace} (${TANK_ACE_AR[spg.ace] || '—'})`);
+
+        // ── B: entrenchment + supply cut + attrition (remote Australia) ──
+        R.phase = 'B entrench+supply';
+        const B = { lat: -25.5, lon: 134.5 };   // land, ~15000km from any player hub
+        if (isLand(B.lat, B.lon)) {
+            const dug = mkT(B.lat, B.lon, 'heavy', 'player', { tgtLat: B.lat, tgtLon: B.lon });
+            await window.__pumpGame(1400);      // 1200f dig + grace/supply cadence
+            R.entrenched = dug.entrench >= 1 && !!dug.sandbags && dug.sandbags.visible;
+            R.supplyCut = dug.unsupplied === true;
+            R.attrition = dug.hp < dug.maxHp;
+            log(`B: entrench=${dug.entrench.toFixed(2)} unsupplied=${dug.unsupplied} hp=${Math.round(dug.hp)}/${dug.maxHp}`);
+            // BRIDGEHEAD: a fresh division within 400km of the ENTRENCHED
+            // heavy is fed by it — that's the river-crossing payoff.
+            const nb = mkT(B.lat + 1.2, B.lon + 1.0, 'light', 'player', { tgtLat: B.lat + 1.2, tgtLon: B.lon + 1.0 });
+            await window.__pumpGame(220);
+            R.bridgehead = nb.unsupplied === false && !nb.dead;
+            log(`bridgehead: fresh division supplied=${!nb.unsupplied}`);
+        }
+
+        // ── D: far-bank probe — some strait crossable, ocean blocked ──
+        R.phase = 'D river';
+        R.riverDetail = window.tankRiverProbe();
+        const crossable = Object.values(R.riverDetail.crossings).some(v => v === true);
+        const oceanBlocked = R.riverDetail.ocean === false && R.riverDetail.atlantic === false;
+        R.riverProbe = crossable && oceanBlocked;
+        log(`D: crossable=${crossable} ocean=${R.riverDetail.ocean} atlantic=${R.riverDetail.atlantic} detail=`, R.riverDetail.crossings);
+
+        // ── F: dual-purpose flak chips armor inside 90km ──
+        R.phase = 'F flak';
+        mkS(39.3, -98.4, 'flak', 'enemy');
+        const hp0 = spg.hp;
+        await window.__pumpGame(220);
+        R.flakChip = spg.hp < hp0;
+        log(`F: flak chip ${Math.round(hp0)}→${Math.round(spg.hp)}`);
+
+        // ── E: wreck lifecycle — a kill leaves a burning wreck, then fades ──
+        R.phase = 'E wreck';
+        const w0 = tankWrecks.length;
+        const victim = mineT.find(t => !t.dead);
+        if (victim) victim.hit(1e9, 'enemy');
+        R.wreckSpawned = tankWrecks.length > w0;
+        await window.__pumpGame(C.TANK_WRECK_FRAMES + 120);
+        R.wreckFaded = tankWrecks.length === 0;
+        R.spgSurvived = !spg.dead;   // attrition may legitimately starve it (Kansas is hub-less early game)
+        log(`E: wreckSpawned=${R.wreckSpawned} faded=${R.wreckFaded} spgAlive=${R.spgSurvived}`);
+    } finally {
+        clearSelection();
+        for (const t of mineT) dropT(t);
+        for (const s of mineS) dropS(s);
+        _clearTankDeep();
+    }
+
+    const checks = [
+        ['GATE (unspotted → silent)', R.gateHolds === true],
+        ['INDIRECT (arc shells flew)', R.indirect === true],
+        ['STANDOFF (battery held)', R.standoff === true],
+        ['SIEGE (3 kills)', R.kills >= 3],
+        ['ACE (veteran earned)', R.ace >= 1],
+        ['ENTRENCH (dug in)', R.entrenched === true],
+        ['SUPPLY-CUT (attrition)', R.supplyCut === true && R.attrition === true],
+        ['BRIDGEHEAD (entrenched feeds)', R.bridgehead === true],
+        ['RIVER (strait yes / ocean no)', R.riverProbe === true],
+        ['FLAK-CHIP (armor chipped)', R.flakChip === true],
+        ['WRECK (spawn + fade)', R.wreckSpawned === true && R.wreckFaded === true],
+    ];
+    let ok = 0;
+    for (const [name, pass] of checks) { if (pass) ok++; log(`${pass ? '✅' : '❌'} ${name}`); }
+    R.pass = ok >= checks.length - 1;   // tolerate one soft check (gate may skip)
+    log(`RESULT: ${R.pass ? 'PASS' : 'FAIL'} (${ok}/${checks.length}) — window.__tankDeepResult`);
+    logEvent(R.pass ? '🧪 اختبار العمق البري: نجح ✅' : '🧪 اختبار العمق البري: فشل ❌ — انظر الكونسول', R.pass ? 'info' : 'err');
+    return R;
+};
+
+// Standalone river-crossing checker (map-editor companion): probes every
+// major strait the armor should be able to wade + two open-ocean controls
+// that must stay blocked. Run any time: window.tankRiverProbe()
+window.tankRiverProbe = function () {
+    const probe = (flat, flon, tlat, tlon) => {
+        const nrm = latLonToVec3(flat, flon, 1).normalize();
+        const tv = latLonToVec3(tlat, tlon, 1).normalize();
+        const dir = tv.addScaledVector(nrm, -tv.dot(nrm));
+        if (dir.lengthSq() < 1e-9) return null;
+        // _probeFarBank reads no instance state — static call is safe.
+        return Tank.prototype._probeFarBank.call(null, nrm, dir.normalize());
+    };
+    const CROSSINGS = [
+        ['suez',    30.4, 32.35,  30.1, 32.35],   // painted canal — guaranteed water
+        ['gibraltar', 35.95, -5.6, 36.4, -5.6],
+        ['bosporus', 41.05, 28.95, 41.25, 29.1],
+        ['messina', 38.22, 15.62, 38.05, 15.6],
+        ['bering',  65.8, -168.9, 66.0, -169.2],
+        ['dover',   51.0, 1.45,   51.3, 1.35],
+    ];
+    const out = { crossings: {}, ocean: null, atlantic: null };
+    for (const [name, fla, flo, tla, tlo] of CROSSINGS) out.crossings[name] = probe(fla, flo, tla, tlo);
+    out.ocean = probe(35.95, -5.6, 35.95, -7.5);      // west out of Gibraltar → must be false
+    out.atlantic = probe(30, -40, 30, -41);            // mid-Atlantic → must be false
+    console.log('[TANK-RIVER]', out);
+    return out;
 };

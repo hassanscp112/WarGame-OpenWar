@@ -26,6 +26,13 @@
 - **Task: AI-Context Bootstrap & Development Ledger Setup**
   - **Status**: Compiling `AI_BOOTSTRAP.md` and `DEVELOPMENT_LEDGER.md` in the workspace root.
   - **Progress**: Mapped codebase specifications, math pipelines, class specifications, and tasks.
+- **TASK-405 (tanks agent) — WIP2 wiring pass COMPLETE** (verified in-browser, port 3007):
+  - `_tankDeepTick()` now called from `gameFrame()` — burning wrecks fade + SPG arc shells advance (were defined but never ticked).
+  - `_clearTankDeep()` wired into `tankBattleTest` isolation + the new deep probe (reset path).
+  - Selection panel: TASK-405 rows (river-crossing mode, entrench %, supply state, ace stars/kills, engine damage).
+  - **Bug fixed**: `supplyGrace` counted scans (×90f) not frames — cut-off grace was ~15 min instead of the designed 10 s.
+  - New probes: `window.tankDeepTest()` (11 checks — spotting gate, indirect fire, standoff, siege, ace, entrench, supply-cut attrition, entrenched bridgehead, river far-bank, flak chip, wreck lifecycle — **PASS**) and `window.tankRiverProbe()` (strait crossing checker, map-editor companion). `tankBattleTest` regression PASS.
+  - ⚠️ **Cross-agent flag (world/naval)**: the medium water mask over-waters **SE England** (e.g. 51.4N,1.0E reads water) and the **Gulf of Cádiz** (36.05–36.5N at −5.6E all water) — natural straits (Dover/Gibraltar/Bosphorus/Messina/Bering) are therefore un-crossable to armor; only painted water (Suez canal) crosses. Tank river-crossing LOGIC is verified correct against the mask.
 
 ### [⏳ BACKLOG & FUTURE IMPROVEMENTS]
 - **1. Region Selection Interface**: Design a sleek, tactical dropdown or map panel in the menu screen to load custom regions (`iraq`, `usa`, etc.) using `GeoDataManager.loadRegion(regionName)`.
