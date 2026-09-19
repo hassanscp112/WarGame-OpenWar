@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Global Missile War 3D</title>
+<link rel="stylesheet" href="/src/style.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/MTLLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/OBJLoader.js"></script>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="/data/geo_provinces.js"></script>
+<script src="/data/provinces_geo.js"></script>
+<script src="/data/province_polygons.js"></script>
+<script src="/data/world_cities_generated.js"></script>
+<script src="/data/geo_fetcher.js"></script>
+<script src="/data/geo_filter.js"></script>
+<script src="/data/geo_renderer.js"></script>
+<script src="/data/geo_manager.js"></script>
+<script>
+window.onerror = function(msg, url, lineNo, columnNo, error) {
+    let ed = document.getElementById('errorDump');
+    if(ed) ed.innerHTML += msg + ' at ' + lineNo + ':' + columnNo + '<br>';
+    return false;
+};
+window.addEventListener('unhandledrejection', function(event) {
+    let ed = document.getElementById('errorDump');
+    if(ed) ed.innerHTML += 'Unhandled Promise: ' + event.reason + '<br>';
+});
+</script>
+</head>
+<body>
+
+<!-- ══════════════════ START MENU ══════════════════ -->
+<div id="menuScreen">
+<h1> MISSILE WAR</h1>
+<p>حرب الصواريخ — الإصدار الخامس</p>
+
+<div class="menuBox">
+    <h3>ضد الكمبيوتر</h3>
+    <select class="mInp" id="diffSelect" style="cursor:pointer">
+        <option value="easy">سهل — تدريب</option>
+        <option value="normal" selected>عادي — معركة</option>
+        <option value="hard">صعب — حرب حقيقية</option>
+        <option value="insane">جنوني — لا رحمة</option>
+    </select>
+    <select class="mInp" id="pCountrySelect" style="cursor:pointer; margin-top:5px;">
+        <option value="usa" selected>دولتك: الولايات المتحدة</option>
+        <option value="russia">دولتك: روسيا</option>
+        <option value="china">دولتك: الصين</option>
+        <option value="europe">دولتك: أوروبا</option>
+        <option value="arabia">دولتك: عالم عربي</option>
+    </select>
+    <select class="mInp" id="eCountrySelect" style="cursor:pointer; margin-top:5px;">
+        <option value="random" selected>العدو: عشوائي (بدون بوتات)</option>
+        <option value="usa">العدو: الولايات المتحدة</option>
+        <option value="russia">العدو: روسيا</option>
+        <option value="china">العدو: الصين</option>
+        <option value="europe">العدو: أوروبا</option>
+        <option value="arabia">العدو: عالم عربي</option>
+    </select>
+    <select class="mInp" id="botCountSelect" style="cursor:pointer; margin-top:5px;">
+        <option value="0" selected>أمم FFA: بدون بوتات</option>
+        <option value="2">٢ بوتات (FFA)</option>
+        <option value="3">٣ بوتات (FFA)</option>
+        <option value="4">٤ بوتات (FFA)</option>
+        <option value="6">٦ بوتات (FFA)</option>
+        <option value="8">٨ بوتات (FFA)</option>
+    </select>
+    <select class="mInp" id="gameModeSelect" style="cursor:pointer; margin-top:5px;">
+        <option value="mode1" selected>الطور الأول: تمدد ورسم (OpenFront)</option>
+        <option value="mode2">الطور الثاني: كلاسيكي (Missile War)</option>
+    </select>
+    <button class="mBtn green" onclick="startVsAI()" style="margin-top:10px;">ابدأ اللعب</button>
+    <div style="font-size:9px;opacity:.6;margin-top:10px;line-height:1.9;letter-spacing:.3px;background:rgba(255,255,255,0.03);border-radius:6px;padding:8px;text-align:right">
+        <b style="color:#88ddff">التحكم 🎮</b><br>
+        • <b>سحب بزر الفأرة الأيسر</b> = تدوير الكرة الأرضية 🌍<br>
+        • <b>نقرة يسار</b> = هجوم / تحديد / بناء ⚔️<br>
+        • <b>نقرة يمين</b> = قائمة الأوامر الدائرية 🎯<br>
+        • <b>1-0</b> = بناء سريع · <b>B</b> غزو بحري · <b>V</b> مدمرة · <b>R</b> وضع القصف · <b>G</b> هجوم · <b>C</b> دولتي<br>
+        • <b>WASD/أسهم</b> = تنقل · <b>Q/E</b> = تكبير · <b>T/Y</b> = نسبة الغزو · <b>F</b> = تحديد الوحدات<br>
+        • <b>وضع القصف [R]</b>: يُظهر مدى المنصات · أنقر للإطلاق المتواصل · <b>[ ]</b> تبديل الصاروخ · <b>X</b> حجم الوابل
+    </div>
+</div>
+
+<div class="menuBox">
+    <h3>لعب أونلاين (Radmin VPN)</h3>
+    <div style="background:rgba(255,255,255,0.05); padding:8px; border-radius:6px; margin-bottom:8px;">
+        <div style="font-size:9px; color:#aaa; margin-bottom:4px; text-align:center;">عنوان السيرفر (IP الـ Radmin للطرف المستضيف)</div>
+        <div style="display:flex; gap:5px;">
+            <input type="text" id="serverUrl" placeholder="localhost" class="mInp" style="font-size:12px; height:28px;">
+            <button class="mBtn blue" onclick="manualConnect()" style="width:auto; height:28px; padding:0 12px; font-size:11px;">توصيل</button>
+        </div>
+    </div>
+    <div id="onlineStatus" style="font-size:9px;text-align:center;padding:4px;color:#555;letter-spacing:1px">⌛ غير متصل</div>
+    <button class="mBtn yellow" id="btnCreate" onclick="createRoom()" disabled>إنشاء غرفة</button>
+    <div class="menuDivider">أو</div>
+    <div style="display:flex;gap:5px">
+        <input class="mInp" id="joinCode" placeholder="كود الغرفة" maxlength="6" style="letter-spacing:5px;font-size:15px">
+        <button class="mBtn green" id="btnJoin" onclick="joinRoom()" disabled style="width:auto;padding:8px 12px;white-space:nowrap">انضم</button>
+    </div>
+    <div id="menuStatus"></div>
+    <div id="roomCodeDisplay" style="display:none"></div>
+</div>
+
+<div class="menuBox">
+    <h3>🛠️ أدوات المطور</h3>
+    <p style="font-size:9px;opacity:.5;letter-spacing:1px;margin-bottom:6px;">محرر الخريطة + أدوات التطوير</p>
+    <button class="mBtn" style="border-color:#ff8800;color:#ff8800;margin-top:5px;" onclick="startDevMode()">🛠️ Dev Mode — محرر الخريطة</button>
+</div>
+</div>
+
+<!-- ══════════════════ GAME SCREEN (NEW UI) ══════════════════ -->
+<div id="selBox" style="display:none; position:fixed; border:2px dashed #0f0; background:rgba(0,255,0,0.1); pointer-events:none; z-index:9999;"></div>
+<div id="gc">
+<canvas id="gameCanvas"></canvas>
+
+<!-- top HUD bar -->
+<div id="topBar">
+    <div class="topSec">
+        <span class="tlabel plbl" id="p1Label">أنت</span>
+        <div class="stat"><span class="sIcon">💰</span><span class="rval gold" id="pGold">0</span></div>
+        <div class="stat troopsStat">
+            <span class="sIcon">🎖️</span>
+            <div class="tBarWrap"><div class="tBar"><div class="tFill" id="pTroopFill"></div></div></div>
+            <span class="rval troops" id="pTroops">0/0</span>
+        </div>
+        <div class="stat"><span class="sIcon">📈</span><span class="rval" id="pIncome" style="color:#00ff88">+0</span></div>
+        <div class="stat"><span class="sIcon">🏙️</span><span class="rval" id="pCit">0</span></div>
+        <div class="stat"><span class="sIcon">🛫</span><span class="rval" id="pBase">0</span></div>
+        <div class="stat"><span class="sIcon">✈️</span><span class="rval" id="pPln">0</span></div>
+    </div>
+    <div id="cInfo">MW v5</div>
+    <div class="topSec right">
+        <button id="btnMute" onclick="SFX.toggleMute()" class="iconBtn" title="الصوت">🔊</button>
+        <span class="tlabel elbl" id="p2Label">العدو</span>
+        <div class="stat"><span class="sIcon">🎖️</span>
+            <div class="tBarWrap"><div class="tBar enemy"><div class="tFill" id="eTroopFill"></div></div></div>
+            <span class="rval troops" id="eTroops">0/0</span>
+        </div>
+        <div class="stat"><span class="sIcon">🏙️</span><span class="rval" id="eCit">0</span></div>
+        <div class="stat"><span class="sIcon">🛫</span><span class="rval" id="eBase">0</span></div>
+        <span class="rval" id="pVP" style="display:none">0</span>
+        <span class="rval" id="eVP" style="display:none">0</span>
+        <span class="rval" id="pDrn" style="display:none">0</span>
+    </div>
+</div>
+
+<!-- build hotbar (OpenFront UnitDisplay port) -->
+<div id="hotbar"></div>
+
+<!-- attack-ratio control bar (bottom center) -->
+<div id="troopPctOverlay">
+    <span class="sword">⚔️</span>
+    <span id="pctLabel">50%</span>
+    <input type="range" id="pctSlider" min="1" max="100" value="50" step="1">
+</div>
+
+<!-- hidden legacy message sinks (mirrored to toasts by ui.js) -->
+<div id="tgtMsg" class="hiddenSink"></div>
+<div id="conqMsg" class="hiddenSink"></div>
+<div id="bldMsg" class="hiddenSink"></div>
+<div id="planeMsg" class="hiddenSink"></div>
+<div id="nukeWarn" style="display:none"></div>
+<div id="onlineBadge">LIVE</div>
+<div id="sideBadge"></div>
+
+<!-- event log -->
+<div id="slog"></div>
+
+<!-- FFA nations leaderboard -->
+<div id="leaderboard"></div>
+
+<!-- selection card -->
+<div id="selPan">
+    <h3 id="selName">—</h3>
+    <div id="selStats"></div>
+    <div class="hbar"><div class="hfill" id="selHp" style="width:100%"></div></div>
+    <div id="selBtns"></div>
+</div>
+
+<!-- city tooltip / panel (mode 2 legacy, kept) -->
+<div id="cityTooltip" style="display:none"><div id="ctName"></div><div id="ctInfo"></div><div class="ctHpBar"><div id="ctHpFill"></div></div></div>
+<div id="cityPanel" style="display:none"><button class="cpClose" onclick="hideCityPanel()">✕</button><div id="cpHeader"></div><div id="cpStats"></div><div class="ctHpBar" style="margin-bottom:4px"><div id="cpHpFill"></div></div><div id="cpActions"></div></div>
+
+<!-- research panel (opened from radial) -->
+<div id="researchPanel">
+    <button class="rpClose" onclick="document.getElementById('researchPanel').classList.remove('open')">✕</button>
+    <h3>🔬 الأبحاث</h3>
+    <div id="techRow"></div>
+    <div class="rpMsg" id="techMsg">اختر بحثاً لبدء التطوير</div>
+</div>
+
+<!-- minimap -->
+<div id="mmap">
+    <div id="mmHeader">MINIMAP — اسحب للتحريك</div>
+    <canvas id="mmC"></canvas>
+</div>
+
+<!-- game over -->
+<div id="go">
+    <h1 id="goT">—</h1>
+    <p id="goM">—</p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">
+        <button class="gbtn" onclick="G.restart()">إعادة</button>
+        <button class="gbtn" style="border-color:#ff4444;color:#ff4444;background:#180000" onclick="backToMenu()">القائمة</button>
+    </div>
+</div>
+
+<div id="errorDump" style="display:none"></div>
+</div><!-- /gc -->
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>

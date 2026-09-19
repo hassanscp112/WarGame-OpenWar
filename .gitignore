@@ -1,0 +1,25 @@
+# Dependencies & build output
+node_modules/
+dist/
+
+# Dev junk
+debug_out.txt
+*.log
+
+# Not used by the game (tank assets)
+Assets/LowPolyWW2GermanTanksFBX/
+Assets/PanzerIV/
+
+# Third-party reference game (re-downloadable; contains proprietary assets)
+OpenFrontIO-main/
+
+# Backups & archives
+gemini_convos_backup/
+gemini_convos_backup.zip
+_dead_archive/
+archive/
+restore_point_pre_dilation/
+
+# Large regenerable data files
+ne_10m_admin_1_label_points.geojson
+recovered.json

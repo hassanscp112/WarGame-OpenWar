@@ -1,0 +1,1398 @@
+// ════════════════════════════════════════════════════════════════════
+//  CONQUEST & OCCUPATION ENGINE
+//  Faithful port of OpenFrontIO's AttackExecution / GameMap conquest model,
+//  adapted from a flat tile grid to a spherical lat/lon grid for the 3D globe.
+//
+//  Exports:
+//    CONQUEST_CFG        — tuning constants (grid size, terrain, combat)
+//    ConquestGrid        — ownership + terrain grid (logic, decoupled from render)
+//    ConquestAttack      — long-running flood-fill conquest (port of AttackExecution)
+//    attackLogic         — per-cell combat resolution (port of Config.attackLogic)
+//    attackTilesPerTick  — conquest speed (port of Config.attackTilesPerTick)
+// ════════════════════════════════════════════════════════════════════
+
+export const CONQUEST_CFG = {
+  // ── Grid resolution ──
+  GRID_W: 7200,           // longitude cells (0.05° each → ~5.5km at equator) — small countries playable
+  GRID_H: 3600,           // latitude cells  (0.05° each)
+  CELL_DEG: 0.05,
+
+  // ── Water dilation (Option 1: thicken rivers/straits for navigation) ──
+  // After building the land mask, expand water features outward by this many
+  // rings. Makes 1-cell rivers/straits navigable. 0 = off.
+  WATER_DILATION_RINGS: 1,
+  // A land cell converts to water only if it has ≥ this many water neighbours
+  // (8-connected). 1 = full dilation (any water neighbour). 2 = gentler.
+  WATER_DILATION_MIN_NEIGHBORS: 1,
+
+  // ── Owner codes ──
+  WATER: 0,
+  NEUTRAL: 1,
+  PLAYER: 2,
+  ENEMY: 3,
+
+  // ── Terrain codes ──
+  T_WATER: 0,
+  T_PLAINS: 1,
+  T_HIGHLAND: 2,
+  T_MOUNTAIN: 3,
+
+  // ── Terrain combat params (ported from OpenFront attackLogic) ──
+  TERRAIN_MAG:   { 1: 80,  2: 100, 3: 120 },
+  TERRAIN_SPEED: { 1: 16.5, 2: 20, 3: 25  },
+
+  // ── Large-empire defense debuff (big defenders are slower/softer) ──
+  DEFENSE_DEBUFF_MIDPOINT: 150000,
+  DEFENSE_DEBUFF_DECAY_RATE: Math.LN2 / 50000,
+  LARGE_EMPIRE_THRESHOLD: 100000,
+
+  // ── Elimination: defender wiped out below this many owned cells ──
+  ELIMINATION_CELL_THRESHOLD: 100,
+  RETREAT_MALUS_PERCENT: 25,
+
+  // ── Economy: how many cells count as one "province" for troop-cap scaling ──
+  CELLS_PER_PROVINCE: 80,
+
+  // ── Render colors (RGBA 0-255) painted into the grid canvas ──
+  // Clean flat OpenFront-style biome palette. The grid canvas is the COMPLETE map.
+  // Design: terrain-aware borders only — ALL land shows its biome color regardless
+  // of owner; player/enemy ownership is shown ONLY via colored frontier outlines.
+  COLOR: {
+    water:    [58, 110, 165, 255],   // ocean blue
+    plains:   [104, 152, 86, 255],   // grass green (temperate)
+    desert:   [214, 196, 142, 255],  // sandy tan (subtropical band)
+    highland: [170, 156, 110, 255],  // khaki / olive
+    mountain: [122, 116, 108, 255],  // gray-brown
+    snow:     [232, 238, 244, 255],  // polar white / tundra
+    player:   [38, 200, 110, 255],   // green — frontier tint
+    enemy:    [220, 70, 70, 255],    // red — frontier tint
+  },
+  // Latitude thresholds for biome selection
+  SNOW_LAT: 62,        // |lat| above this → snow/tundra
+  DESERT_MIN_LAT: 15,  // subtropical desert band
+  DESERT_MAX_LAT: 32,
+
+  // ── Tick throttle: run attack logic every N game frames (6 frames ≈ 10 ticks/sec) ──
+  TICK_INTERVAL: 6,
+  // Max cells a single attack may conquer in one tick (safety cap)
+  MAX_CELLS_PER_TICK: 12,
+};
+
+// ── Owner code ↔ string helpers ──
+// Bots register dynamically (codes 4+): registerOwner('bot0', 4, [r,g,b]).
+const CODE_TO_STR = { 0: 'neutral', 1: 'neutral', 2: 'player', 3: 'enemy' };
+const STR_TO_CODE = { neutral: 1, player: 2, enemy: 3 };
+const OWNER_COLORS = { 2: null, 3: null }; // null → cfg.COLOR.player/enemy fallback
+export function registerOwner(str, code, rgb) {
+  CODE_TO_STR[code] = str;
+  STR_TO_CODE[str] = code;
+  OWNER_COLORS[code] = rgb || null;
+}
+export function clearRegisteredOwners() {
+  for (const code of Object.keys(OWNER_COLORS)) {
+    if (code === '2' || code === '3') continue;
+    const str = CODE_TO_STR[code];
+    delete CODE_TO_STR[code];
+    delete STR_TO_CODE[str];
+    delete OWNER_COLORS[code];
+  }
+}
+function ownerColor(code, cfg) {
+  if (code === cfg.PLAYER) return cfg.COLOR.player;
+  if (code === cfg.ENEMY) return cfg.COLOR.enemy;
+  return OWNER_COLORS[code] || cfg.COLOR.enemy;
+}
+function isOwnedCode(code, cfg) {
+  return code === cfg.PLAYER || code === cfg.ENEMY || OWNER_COLORS[code] != null;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  TERRAIN HEURISTIC DATA
+//  Approximate bounding boxes for major mountain ranges & highland plates.
+//  A cell whose center falls inside a box is tagged Mountain/Highland.
+// ════════════════════════════════════════════════════════════════════
+const MOUNTAIN_RANGES = [
+  // Asia
+  { minLat: 27, maxLat: 40, minLon: 68,  maxLon: 105 }, // Himalayas + Tibetan plateau
+  { minLat: 35, maxLat: 50, minLon: 50,  maxLon: 75  }, // Pamir + Hindu Kush + Tien Shan
+  { minLat: 10, maxLat: 22, minLon: 92,  maxLon: 98  }, // Arakan (Myanmar)
+  { minLat: 25, maxLat: 38, minLon: 126, maxLon: 142 }, // Japan alps
+  { minLat: 3,  maxLat: 20, minLon: 118, maxLon: 128 }, // Philippines (partial)
+  { minLat: 36, maxLat: 44, minLon: 30,  maxLon: 42  }, // Anatolia highlands / Pontic
+  { minLat: 25, maxLat: 40, minLon: 44,  maxLon: 60  }, // Zagros + Alborz (Iran)
+  { minLat: 12, maxLat: 28, minLon: 36,  maxLon: 46  }, // Ethiopian highlands
+  // Europe
+  { minLat: 43, maxLat: 48, minLon: 6,   maxLon: 14  }, // Alps
+  { minLat: 40, maxLat: 46, minLon: -2,  maxLon: 12  }, // Pyrenees + Apennines
+  { minLat: 41, maxLat: 45, minLon: 22,  maxLon: 30  }, // Balkan ranges
+  { minLat: 60, maxLat: 71, minLon: 50,  maxLon: 70  }, // Urals
+  { minLat: 60, maxLat: 70, minLon: 18,  maxLon: 32  }, // Scandinavian mtns
+  { minLat: 42, maxLat: 46, minLon: 38,  maxLon: 50  }, // Caucasus
+  // Africa
+  { minLat: -5, maxLat: 5,  minLon: 28,  maxLon: 42  }, // East African rift
+  { minLat: -35,maxLat: -20,minLon: 16,  maxLon: 30  }, // Drakensberg
+  { minLat: 28, maxLat: 35, minLon: -4,  maxLon: 8   }, // Atlas
+  // Americas
+  { minLat: 35, maxLat: 65, minLon: -150,maxLon: -120}, // Rockies / Alaska range
+  { minLat: 30, maxLat: 50, minLon: -125,maxLon: -110}, // Cascades / Sierra
+  { minLat: -55,maxLat: 8,  minLon: -82, maxLon: -65 }, // Andes (long spine)
+  { minLat: 15, maxLat: 22, minLon: -105,maxLon: -90 }, // Sierra Madre (Mexico)
+  { minLat: 60, maxLat: 70, minLon: -145,maxLon: -120}, // Brooks / Yukon
+  // Oceania
+  { minLat: -40,maxLat: -25,minLon: 145, maxLon: 152 }, // Australian Alps
+  { minLat: -47,maxLat: -40,minLon: 166, maxLon: 174 }, // NZ Southern Alps
+];
+
+const HIGHLAND_BOXES = [
+  { minLat: 45, maxLat: 70, minLon: -180, maxLon: 180 }, // high-latitude subarctic plateaus
+  { minLat: -90,maxLat: -55,minLon: -180, maxLon: 180 }, // Antarctica fringe
+  { minLat: 28, maxLat: 45, minLon: 80,  maxLon: 125 }, // Inner Asia / Gobi steppe
+  { minLat: 8,  maxLat: 18, minLon: -12, maxLon: 10  }, // Sahel transition
+];
+
+// ── Terrain byte → color. Defaults are an EXACT replica of OpenFront's
+// encodeTerrainTile (ColorUtils.ts) with oceanColor #4785b5 from
+// render-settings.json. A mutable OF_PALETTE + OF_USE_FLAT flag let the in-game
+// dev panel override individual band colors (flat) in real time. Byte:
+// bit7 isLand | bit6 isShoreline | bit5 isOcean | bits0-4 magnitude(0-31).
+const OF_OCEAN = [71, 133, 181]; // OpenFront oceanColor #4785b5 (exact)
+// Representative per-band colors (used when OF_USE_FLAT is on). Initialized to
+// OpenFront's mid-band values so the dev picker shows sensible defaults.
+const OF_PALETTE = {
+  ocean:      [71, 133, 181],
+  shoreWater: [100, 143, 255],
+  sand:       [204, 203, 158],
+  plains:     [190, 200, 138],
+  highland:   [220, 203, 158],
+  mountain:   [240, 240, 240],
+};
+const BIOME_BANDS = Object.keys(OF_PALETTE);
+let OF_USE_FLAT = false; // true → flat per-band palette (dev overrides)
+export function setBiomeFlatMode(on) { OF_USE_FLAT = !!on; }
+export function setBiomeBandColor(band, rgb) { if (OF_PALETTE[band]) OF_PALETTE[band] = rgb; }
+export function getBiomeBandColor(band) { return OF_PALETTE[band] ? OF_PALETTE[band].slice() : null; }
+export function getBiomeBands() { return BIOME_BANDS.slice(); }
+function ofTerrainColor(tb) {
+  const isLand = (tb & 0x80) !== 0;
+  const isShoreline = (tb & 0x40) !== 0;
+  const magnitude = tb & 0x1f;
+  // Determine band key first (reused by flat-palette overrides).
+  let band;
+  if (isLand && isShoreline) band = 'sand';
+  else if (isLand) band = magnitude < 10 ? 'plains' : magnitude < 20 ? 'highland' : 'mountain';
+  else if (isShoreline) band = 'shoreWater';
+  else band = 'ocean';
+  if (OF_USE_FLAT) return OF_PALETTE[band];
+  let r, g, b;
+  if (band === 'sand') {
+    // Shore (sand)
+    r = 204; g = 203; b = 158;
+  } else if (band === 'plains') {
+    // Plains
+    r = 190; g = 220 - 2 * magnitude; b = 138;
+  } else if (band === 'highland') {
+    // Highland
+    r = 200 + 2 * magnitude; g = 183 + 2 * magnitude; b = 138 + 2 * magnitude;
+  } else if (band === 'mountain') {
+    // Mountain
+    const v = Math.min(255, 230 + Math.floor(magnitude / 2));
+    r = v; g = v; b = v;
+  } else if (band === 'shoreWater') {
+    // Shoreline water
+    r = 100; g = 143; b = 255;
+  } else {
+    // Deep water — darkens with depth (magnitude)
+    const m = Math.min(magnitude, 10);
+    r = Math.max(0, OF_OCEAN[0] - m);
+    g = Math.max(0, OF_OCEAN[1] - m);
+    b = Math.max(0, OF_OCEAN[2] - m);
+  }
+  return [r, g, b];
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Small math helpers
+// ════════════════════════════════════════════════════════════════════
+function within(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+function sigmoid(value, decayRate, midpoint) {
+  return 1 / (1 + Math.exp(-decayRate * (value - midpoint)));
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  MinHeap — port of OpenFront FlatBinaryHeap (lowest priority dequeued first)
+// ════════════════════════════════════════════════════════════════════
+class MinHeap {
+  constructor(capacity = 1024) {
+    this.pri = new Float32Array(capacity);
+    this.cells = new Int32Array(capacity);
+    this.len = 0;
+  }
+  clear() { this.len = 0; }
+  size() { return this.len; }
+
+  _grow() {
+    const cap = this.pri.length * 2;
+    const np = new Float32Array(cap);
+    const nc = new Int32Array(cap);
+    np.set(this.pri); nc.set(this.cells);
+    this.pri = np; this.cells = nc;
+  }
+
+  enqueue(cell, priority) {
+    if (this.len === this.pri.length) this._grow();
+    let i = this.len++;
+    // sift-up
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (priority >= this.pri[parent]) break;
+      this.pri[i] = this.pri[parent];
+      this.cells[i] = this.cells[parent];
+      i = parent;
+    }
+    this.pri[i] = priority;
+    this.cells[i] = cell;
+  }
+
+  dequeue() {
+    if (this.len === 0) return -1;
+    const top = this.cells[0];
+    const lastPri = this.pri[--this.len];
+    const lastCell = this.cells[this.len];
+    let i = 0;
+    // sift-down
+    while (true) {
+      const left = (i << 1) + 1;
+      if (left >= this.len) break;
+      const right = left + 1;
+      let smallest = left;
+      if (right < this.len && this.pri[right] < this.pri[left]) smallest = right;
+      if (lastPri <= this.pri[smallest]) break;
+      this.pri[i] = this.pri[smallest];
+      this.cells[i] = this.cells[smallest];
+      i = smallest;
+    }
+    this.pri[i] = lastPri;
+    this.cells[i] = lastCell;
+    return top;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  CONQUEST GRID
+//  Owns: land mask, terrain, per-cell owner. Decoupled from rendering.
+// ════════════════════════════════════════════════════════════════════
+export class ConquestGrid {
+  constructor(cfg = CONQUEST_CFG) {
+    this.cfg = cfg;
+    const N = cfg.GRID_W * cfg.GRID_H;
+    this.owner = new Uint8Array(N);      // WATER/NEUTRAL/PLAYER/ENEMY
+    this.terrain = new Uint8Array(N);    // T_WATER/T_PLAINS/T_HIGHLAND/T_MOUNTAIN (gameplay)
+    this.terrainByte = new Uint8Array(N); // raw OpenFront terrain byte per cell (visual source)
+    this._counts = { player: 0, enemy: 0, neutral: 0 };
+
+    // Render surface: a small canvas at grid resolution, upscaled by the caller.
+    this.gridCanvas = document.createElement('canvas');
+    this.gridCanvas.width = cfg.GRID_W;
+    this.gridCanvas.height = cfg.GRID_H;
+    this.gridCtx = this.gridCanvas.getContext('2d');
+    this.gridImage = this.gridCtx.createImageData(cfg.GRID_W, cfg.GRID_H);
+    this._dirty = true;                  // full repaint needed
+    this._dirtyCells = new Set();        // incremental: cell indices changed
+    this._borderCells = new Set();       // cells currently drawn as territory borders
+    this._countsOther = new Map();        // bot owner code → owned cell count (O(1) countCells)
+
+    // Biome canvas: the globe's LAND surface, painted tile-by-tile from terrainByte[]
+    // (one pixel per cell). This REPLACES the old static photo texture — same resolution
+    // as the territory overlay, so it is crisp at max zoom. Painted once at init.
+    this.biomeCanvas = document.createElement('canvas');
+    this.biomeCanvas.width = cfg.GRID_W;
+    this.biomeCanvas.height = cfg.GRID_H;
+    this.biomeCtx = this.biomeCanvas.getContext('2d');
+    this.biomeImage = this.biomeCtx.createImageData(cfg.GRID_W, cfg.GRID_H);
+    this._biomePainted = false;
+  }
+
+  // Rasterize a real-world land-cover equirectangular image, then COLOR-QUANTIZE each
+  // pixel into a flat solid palette color. This converts the photo into a clean
+  // OpenFront-style flat map that still follows REAL biome shapes (Sahara=tan,
+  // Amazon=green, Greenland=white) — not a blurry photo, not blocky cells.
+  setLandCoverImage(img) {
+    const cfg = this.cfg;
+    const W = cfg.GRID_W, H = cfg.GRID_H;
+    const tmp = document.createElement('canvas');
+    tmp.width = W; tmp.height = H;
+    const tctx = tmp.getContext('2d');
+    tctx.imageSmoothingEnabled = true;   // smooth downscale first
+    tctx.drawImage(img, 0, 0, W, H);
+    const src = tctx.getImageData(0, 0, W, H).data;
+
+    // Flat palette (RGBA) — the only colors the map will use.
+    const P = {
+      DEEP:    [24, 52, 100, 255],
+      WATER:   [46, 96, 156, 255],
+      DESERT:  [206, 186, 132, 255],
+      PLAINS:  [106, 156, 86, 255],
+      FOREST:  [74, 124, 64, 255],
+      MOUNTAIN:[126, 106, 86, 255],
+      SNOW:    [232, 236, 240, 255],
+    };
+
+    // Classify one pixel → flat palette color.
+    const classify = (r, g, b) => {
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+      const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+      const sat = mx === 0 ? 0 : (mx - mn) / mx;
+      // 1. Water: blue is the dominant channel
+      if (b >= r && b >= g) return lum < 80 ? P.DEEP : P.WATER;
+      // 2. Snow / ice: very bright + low saturation
+      if (lum > 200 && sat < 0.30) return P.SNOW;
+      // 3. Desert: bright, warm (r >= g >= b), low-moderate saturation
+      if (lum > 150 && r >= g && sat < 0.45) return P.DESERT;
+      // 4. Mountain / barren: dark, warm brown
+      if (lum < 105 && r >= g && g >= b) return P.MOUNTAIN;
+      // 5. Forest: green-dominant + dark
+      if (g > r && g > b && lum < 120) return P.FOREST;
+      // 6. Default: plains (vegetation green)
+      return P.PLAINS;
+    };
+
+    const out = new Uint8ClampedArray(src.length);
+    for (let i = 0; i < src.length; i += 4) {
+      const c = classify(src[i], src[i + 1], src[i + 2]);
+      out[i] = c[0]; out[i + 1] = c[1]; out[i + 2] = c[2]; out[i + 3] = 255;
+    }
+    this.landBase = out;
+    this._dirty = true;                  // force a full repaint with the flat base
+  }
+
+  // ── coordinate conversion ──
+  latLonToCell(lat, lon) {
+    const cfg = this.cfg;
+    // normalize longitude to [-180,180)
+    let l = lon;
+    l = ((l + 180) % 360 + 360) % 360 - 180;
+    const col = Math.min(cfg.GRID_W - 1, Math.max(0, Math.floor((l + 180) / cfg.CELL_DEG)));
+    const la = Math.min(90, Math.max(-90, lat));
+    const row = Math.min(cfg.GRID_H - 1, Math.max(0, Math.floor((90 - la) / cfg.CELL_DEG)));
+    return row * cfg.GRID_W + col;
+  }
+  cellToLatLon(cell) {
+    const cfg = this.cfg;
+    const col = cell % cfg.GRID_W;
+    const row = (cell / cfg.GRID_W) | 0;
+    return {
+      lon: -180 + (col + 0.5) * cfg.CELL_DEG,
+      lat: 90 - (row + 0.5) * cfg.CELL_DEG,
+    };
+  }
+  cellColRow(cell) {
+    const cfg = this.cfg;
+    return { col: cell % cfg.GRID_W, row: (cell / cfg.GRID_W) | 0 };
+  }
+
+  // ── Frontier edges as lat/lon segments for crisp VECTOR border lines ──
+  // Returns { segs:Number[], own:Number[] }: each edge is 4 consecutive numbers in
+  // `segs` (lat1, lon1, lat2, lon2); `own[i]` is the owner code (PLAYER/ENEMY) of the
+  // owned cell that border belongs to. An edge is emitted for EVERY pair of adjacent
+  // cells with different owners, so this outlines each owned region against water,
+  // neutral land, and the opposing side. main.js turns these into 3D LineSegments on
+  // the sphere — razor-sharp at any zoom (like the 3D buildings), unlike texture borders.
+  getFrontierEdges() {
+    const cfg = this.cfg;
+    const W = cfg.GRID_W, H = cfg.GRID_H, D = cfg.CELL_DEG;
+    const owner = this.owner;
+    if (!this._feSegs) { this._feSegs = []; this._feOwn = []; this._feSeen = new Set(); }
+    const segs = this._feSegs, own = this._feOwn, seen = this._feSeen;
+    segs.length = 0; own.length = 0; seen.clear();
+    for (const cell of this._borderCells) {
+      const col = cell % W;
+      const row = (cell / W) | 0;
+      const o = owner[cell];
+      const wLon = -180 + col * D;
+      const eLon = wLon + D;
+      const nLat = 90 - row * D;
+      const sLat = nLat - D;
+      // east neighbour (longitude wraps)
+      const eCell = row * W + (col < W - 1 ? col + 1 : 0);
+      if (owner[eCell] !== o) this._fePush(segs, own, seen, cell, eCell, o, nLat, eLon, sLat, eLon);
+      // west neighbour (longitude wraps)
+      const wCell = row * W + (col > 0 ? col - 1 : W - 1);
+      if (owner[wCell] !== o) this._fePush(segs, own, seen, cell, wCell, o, nLat, wLon, sLat, wLon);
+      // north neighbour (latitude clamps at pole)
+      if (row > 0 && owner[cell - W] !== o) this._fePush(segs, own, seen, cell, cell - W, o, nLat, wLon, nLat, eLon);
+      // south neighbour (latitude clamps at pole)
+      if (row < H - 1 && owner[cell + W] !== o) this._fePush(segs, own, seen, cell, cell + W, o, sLat, wLon, sLat, eLon);
+    }
+    return { segs, own };
+  }
+  // Dedupe: a player↔enemy edge is reachable from both cells; emit it once.
+  // NUMERIC key (a*N + b, N = 25.9M cells → max ~6.7e14 < 2^53): avoids one string
+  // allocation + 2 Set ops on strings per candidate edge on every frontier rebuild.
+  _fePush(segs, own, seen, a, b, o, lat1, lon1, lat2, lon2) {
+    const N = this.cfg.GRID_W * this.cfg.GRID_H;
+    const key = a < b ? a * N + b : b * N + a;
+    if (seen.has(key)) return;
+    seen.add(key);
+    segs.push(lat1, lon1, lat2, lon2);
+    own.push(o);
+  }
+
+  // ── neighbors (4-connected, longitude wraps, latitude clamps at poles) ──
+  neighbors4(cell, out) {
+    const cfg = this.cfg;
+    const col = cell % cfg.GRID_W;
+    const row = (cell / cfg.GRID_W) | 0;
+    let n = 0;
+    if (row > 0)              out[n++] = cell - cfg.GRID_W;          // north
+    if (row < cfg.GRID_H - 1) out[n++] = cell + cfg.GRID_W;          // south
+    out[n++] = row * cfg.GRID_W + (col > 0 ? col - 1 : cfg.GRID_W - 1); // west (wrap)
+    out[n++] = row * cfg.GRID_W + (col < cfg.GRID_W - 1 ? col + 1 : 0); // east (wrap)
+    return n;
+  }
+
+  // ── land mask: caller passes ImageData (RGBA) of a filled land raster ──
+  buildLandMaskFromImageData(imgData) {
+    const cfg = this.cfg;
+    const d = imgData.data;
+    // imgData is expected at GRID_W x GRID_H (1px == 1 cell)
+    for (let i = 0; i < this.owner.length; i++) {
+      const a = d[i * 4 + 3];
+      if (a > 40) {
+        this.owner[i] = cfg.NEUTRAL;
+        this._counts.neutral++;
+      } else {
+        this.owner[i] = cfg.WATER;
+      }
+    }
+    this.buildTerrainHeuristic();
+    this._dirty = true;
+  }
+
+  // ── fallback land mask: test each cell's centre against GeoJSON features via d3.geoContains ──
+  buildLandMaskFromGeoContains(features) {
+    const cfg = this.cfg;
+    const W = cfg.GRID_W, H = cfg.GRID_H;
+    const d3ref = (typeof d3 !== 'undefined') ? d3 : (typeof window !== 'undefined' ? window.d3 : null);
+    if (!d3ref || !d3ref.geoContains) return;
+    // Pre-compute bounding boxes for fast rejection
+    const bboxes = features.map(f => {
+      try { const b = d3ref.geoBounds(f); return [[b[0][0], b[0][1]], [b[1][0], b[1][1]]]; }
+      catch (e) { return null; }
+    });
+    for (let row = 0; row < H; row++) {
+      const lat = 90 - (row + 0.5) * cfg.CELL_DEG;
+      const rowStart = row * W;
+      for (let col = 0; col < W; col++) {
+        const cell = rowStart + col;
+        if (this.owner[cell] === cfg.NEUTRAL) continue; // already land
+        const lon = -180 + (col + 0.5) * cfg.CELL_DEG;
+        // Quick bounding-box pre-filter
+        for (let fi = 0; fi < features.length; fi++) {
+          const bb = bboxes[fi];
+          if (!bb) continue;
+          if (lon < bb[0][0] || lon > bb[1][0] || lat < bb[0][1] || lat > bb[1][1]) continue;
+          // Precise point-in-polygon test
+          if (d3ref.geoContains(features[fi], [lon, lat])) {
+            this.owner[cell] = cfg.NEUTRAL;
+            this._counts.neutral++;
+            break;
+          }
+        }
+      }
+    }
+    this.buildTerrainHeuristic();
+    this._dirty = true;
+  }
+
+  // ── Load corrected OpenFront terrain binary (equirectangular) into terrainByte[] ──
+  // srcW×srcH is the binary's pixel dims (e.g. 4108×1948). Both source and grid are
+  // equirectangular, so each grid cell maps linearly to a source pixel by lat/lon.
+  // This is the SINGLE SOURCE OF TRUTH for both the land mask and the biome colors.
+  loadTerrainFromBin(uint8, srcW, srcH) {
+    const cfg = this.cfg;
+    const W = cfg.GRID_W, H = cfg.GRID_H;
+    const sx = srcW / W;   // source px per grid cell (longitude)
+    const sy = srcH / H;   // source px per grid cell (latitude)
+    const tb = this.terrainByte;
+    for (let row = 0; row < H; row++) {
+      const srcRow = Math.min(srcH - 1, ((row + 0.5) * sy) | 0);
+      const srcRowBase = srcRow * srcW;
+      const rowBase = row * W;
+      for (let col = 0; col < W; col++) {
+        const srcCol = ((col + 0.5) * sx) | 0;   // longitude wraps naturally (0..srcW-1)
+        tb[rowBase + col] = uint8[srcRowBase + srcCol];
+      }
+    }
+  }
+
+  // ── land mask FROM the terrain byte (bit7 = isLand). Replaces GeoJSON rasterization. ──
+  // Now the conquerable land is EXACTLY the visible land — one grid, perfectly synced.
+  buildLandMaskFromTerrain() {
+    const cfg = this.cfg;
+    this._counts.neutral = 0;
+    const tb = this.terrainByte, owner = this.owner;
+    for (let cell = 0; cell < owner.length; cell++) {
+      if ((tb[cell] & 0x80) !== 0) {       // bit7 set → land
+        owner[cell] = cfg.NEUTRAL;
+        this._counts.neutral++;
+      } else {
+        owner[cell] = cfg.WATER;
+      }
+    }
+    this.buildTerrainHeuristic();
+    this._dirty = true;
+  }
+
+  // ── Water dilation: thicken rivers/straits/lakes so they are navigable. ──
+  // Morphological dilation of water cells. For each ring iteration, a LAND cell
+  // becomes WATER if it has ≥ minNeighbors water neighbours (8-connected).
+  //   rings=0           → no change
+  //   rings=1, min=1    → +1 cell around every water feature (rivers → 3 wide)
+  //   rings=1, min=2    → only cells touching water on 2+ sides (gentler coasts)
+  // Longitude wraps; latitude clamps at poles. Recounts neutral cells after.
+  dilateWater(rings = 1, minNeighbors = 1) {
+    if (rings <= 0) return;
+    const cfg = this.cfg;
+    const W = cfg.GRID_W, H = cfg.GRID_H, WATER = cfg.WATER, NEUTRAL = cfg.NEUTRAL;
+    const owner = this.owner;
+    for (let ring = 0; ring < rings; ring++) {
+      const snap = owner.slice();          // snapshot — avoid in-place cascade
+      for (let row = 0; row < H; row++) {
+        const rowBase = row * W;
+        for (let col = 0; col < W; col++) {
+          const cell = rowBase + col;
+          if (snap[cell] === WATER) continue;          // already water
+          let wn = 0;                                   // water-neighbour count
+          for (let dy = -1; dy <= 1; dy++) {
+            const nr = row + dy;
+            if (nr < 0 || nr >= H) continue;
+            for (let dx = -1; dx <= 1; dx++) {
+              if (dx === 0 && dy === 0) continue;
+              const nc = (((col + dx) % W) + W) % W;   // longitude wraps
+              if (snap[nr * W + nc] === WATER) wn++;
+            }
+          }
+          if (wn >= minNeighbors) owner[cell] = WATER;  // convert land → water
+        }
+      }
+    }
+    // Recount neutral land cells (dilation removed some).
+    let n = 0;
+    for (let i = 0; i < owner.length; i++) if (owner[i] === NEUTRAL) n++;
+    this._counts.neutral = n;
+    this._dirty = true;
+  }
+
+  // ── Paint the biome base canvas tile-by-tile from terrainByte[] via ofTerrainColor(). ──
+  // One pixel per cell (7200×3600), NearestFilter upscaled by the caller → crisp at max zoom.
+  // This REPLACES the old static photo texture. Called once at init.
+  paintBiomeBase() {
+    const data = this.biomeImage.data;
+    const tb = this.terrainByte;
+    const owner = this.owner;
+    const WATERC = this.cfg.WATER;
+    for (let cell = 0; cell < tb.length; cell++) {
+      // Paint water where the CONQUERABLE mask (post water-dilation) says water,
+      // not where the raw terrain byte says land. The visible coastline must
+      // EQUAL the conquerable coastline — otherwise the mask is one cell (~5.5km)
+      // smaller than what's on screen and coastal clicks silently no-op.
+      const c = owner[cell] === WATERC ? OF_OCEAN : ofTerrainColor(tb[cell]);
+      const i = cell * 4;
+      data[i] = c[0]; data[i + 1] = c[1]; data[i + 2] = c[2]; data[i + 3] = 255;
+    }
+    this.biomeCtx.putImageData(this.biomeImage, 0, 0);
+    this._biomePainted = true;
+  }
+
+  // ── Fallback biome painter: used only when the OpenFront binary is unavailable. ──
+  // Paints from the latitude/terrain heuristic (this.terrain[] + owner[]) using the
+  // flat COLOR palette, so the globe still gets a clean land surface.
+  paintBiomeFallback() {
+    const cfg = this.cfg;
+    const data = this.biomeImage.data;
+    const owner = this.owner, terrain = this.terrain;
+    const SNOW = cfg.SNOW_LAT, DMIN = cfg.DESERT_MIN_LAT, DMAX = cfg.DESERT_MAX_LAT;
+    const C = cfg.COLOR;
+    for (let cell = 0; cell < owner.length; cell++) {
+      let c;
+      if (owner[cell] === cfg.WATER) {
+        c = C.water;
+      } else {
+        const lat = 90 - ((cell / cfg.GRID_W | 0) + 0.5) * cfg.CELL_DEG;
+        const t = terrain[cell];
+        const al = lat < 0 ? -lat : lat;
+        if (al > SNOW) c = C.snow;
+        else if (t === cfg.T_MOUNTAIN) c = C.mountain;
+        else if (t === cfg.T_HIGHLAND) c = C.highland;
+        else if (al >= DMIN && al <= DMAX) c = C.desert;
+        else c = C.plains;
+      }
+      const i = cell * 4;
+      data[i] = c[0]; data[i + 1] = c[1]; data[i + 2] = c[2]; data[i + 3] = 255;
+    }
+    this.biomeCtx.putImageData(this.biomeImage, 0, 0);
+    this._biomePainted = true;
+  }
+
+  // ── terrain heuristic from latitude bands + known ranges ──
+  buildTerrainHeuristic() {
+    const cfg = this.cfg;
+    for (let cell = 0; cell < this.owner.length; cell++) {
+      if (this.owner[cell] === cfg.WATER) {
+        this.terrain[cell] = cfg.T_WATER;
+        continue;
+      }
+      const { lat, lon } = this.cellToLatLon(cell);
+      let t = cfg.T_PLAINS;
+      // mountain check first
+      for (const r of MOUNTAIN_RANGES) {
+        if (lat >= r.minLat && lat <= r.maxLat && lon >= r.minLon && lon <= r.maxLon) {
+          t = cfg.T_MOUNTAIN; break;
+        }
+      }
+      if (t !== cfg.T_MOUNTAIN) {
+        for (const r of HIGHLAND_BOXES) {
+          if (lat >= r.minLat && lat <= r.maxLat && lon >= r.minLon && lon <= r.maxLon) {
+            t = cfg.T_HIGHLAND; break;
+          }
+        }
+      }
+      this.terrain[cell] = t;
+    }
+  }
+
+  // ── ownership queries ──
+  ownerCodeAtCell(cell) { return this.owner[cell]; }
+  ownerCodeAt(lat, lon) { return this.owner[this.latLonToCell(lat, lon)]; }
+  ownerAt(lat, lon) {
+    const code = this.owner[this.latLonToCell(lat, lon)];
+    if (code === this.cfg.WATER) return 'water'; // distinct from neutral LAND
+    return CODE_TO_STR[code] || 'neutral';
+  }
+  isLandCell(cell) { return this.owner[cell] !== this.cfg.WATER; }
+  terrainAtCell(cell) { return this.terrain[cell]; }
+
+  countCells(ownerStr) {
+    // Player/enemy/neutral: incremental counters. Bots (codes 4+): incremental
+    // Map maintained in conquerCell — O(1). (The previous lazy FULL-GRID scan
+    // ran 26M iterations per call, and countCells is hit from troop growth,
+    // HUD, leaderboard, AI and win checks — billions of iterations/sec with bots.)
+    if (this._counts[ownerStr] != null) return this._counts[ownerStr];
+    const code = STR_TO_CODE[ownerStr];
+    if (!code || code <= 3) return 0;
+    return this._countsOther.get(code) || 0;
+  }
+
+  // Find the nearest cell owned by `ownerStr` to a given lat/lon.
+  // Uses an expanding-ring BFS from the target cell. Returns { cell, lat, lon } or null.
+  // Searches up to maxRing cells outward (default ~50 cells ≈ 2750 km at equator).
+  findNearestOwnedCell(lat, lon, ownerStr, maxRing = 120) {
+    const cfg = this.cfg;
+    const ownerCode = STR_TO_CODE[ownerStr];
+    if (!ownerCode) return null;
+    const startCell = this.latLonToCell(lat, lon);
+    if (this.owner[startCell] === ownerCode) {
+      const ll = this.cellToLatLon(startCell);
+      return { cell: startCell, lat: ll.lat, lon: ll.lon };
+    }
+    const nbuf = new Int32Array(4);
+    const seen = new Set([startCell]);
+    let ring = [startCell];
+    for (let r = 0; r < maxRing && ring.length; r++) {
+      const next = [];
+      for (const cell of ring) {
+        const n = this.neighbors4(cell, nbuf);
+        for (let i = 0; i < n; i++) {
+          const nb = nbuf[i];
+          if (seen.has(nb)) continue;
+          seen.add(nb);
+          if (this.owner[nb] === ownerCode) {
+            const ll = this.cellToLatLon(nb);
+            return { cell: nb, lat: ll.lat, lon: ll.lon };
+          }
+          if (this.owner[nb] !== cfg.WATER) next.push(nb);
+        }
+      }
+      ring = next;
+    }
+    return null;
+  }
+
+  // Find a border cell owned by `attackerStr` that borders a non-attacker land cell.
+  // Prefers a neighbor owned by `preferStr` (e.g. 'player'); falls back to any other land.
+  // Returns { srcCell, dstCell, target } or null.
+  // PRIMARY: iterate _borderCells (small, always current — reliable even for
+  // tiny empires). FALLBACK: random sampling for huge empires where the border
+  // set is large anyway.
+  findFrontlineTarget(attackerStr, preferStr) {
+    const cfg = this.cfg;
+    const attCode = STR_TO_CODE[attackerStr];
+    const preferCode = STR_TO_CODE[preferStr];
+    const nbuf = new Int32Array(4);
+    // ── Primary: border-set scan ──
+    if (this._borderCells && this._borderCells.size > 0) {
+      // Collect matching candidates (up to 64) then pick one at random
+      const cands = [];
+      for (const cell of this._borderCells) {
+        if (this.owner[cell] !== attCode) continue;
+        cands.push(cell);
+        if (cands.length >= 64) break;
+      }
+      if (cands.length > 0) {
+        for (let t = 0; t < 8; t++) {
+          const cell = cands[(Math.random() * cands.length) | 0];
+          const n = this.neighbors4(cell, nbuf);
+          let fallbackDst = -1, fallbackTarget = null;
+          for (let i = 0; i < n; i++) {
+            const nb = nbuf[i];
+            const o = this.owner[nb];
+            if (o === cfg.WATER || o === attCode) continue;
+            if (o === preferCode) return { srcCell: cell, dstCell: nb, target: preferStr };
+            if (fallbackDst < 0) { fallbackDst = nb; fallbackTarget = CODE_TO_STR[o]; }
+          }
+          if (fallbackDst >= 0) return { srcCell: cell, dstCell: fallbackDst, target: fallbackTarget };
+        }
+      }
+    }
+    // ── Fallback: random sampling (original approach) ──
+    const total = this.owner.length;
+    for (let attempt = 0; attempt < 4000; attempt++) {
+      const cell = (Math.random() * total) | 0;
+      if (this.owner[cell] !== attCode) continue;
+      const n = this.neighbors4(cell, nbuf);
+      let fallbackDst = -1, fallbackTarget = null;
+      for (let i = 0; i < n; i++) {
+        const nb = nbuf[i];
+        const o = this.owner[nb];
+        if (o === cfg.WATER || o === attCode) continue;
+        if (o === preferCode) {
+          return { srcCell: cell, dstCell: nb, target: preferStr };
+        }
+        if (fallbackDst < 0) { fallbackDst = nb; fallbackTarget = CODE_TO_STR[o]; }
+      }
+      if (fallbackDst >= 0) {
+        return { srcCell: cell, dstCell: fallbackDst, target: fallbackTarget };
+      }
+    }
+    return null;
+  }
+
+  // ── find nearest NEUTRAL (land) cell to a lat/lon, traversing water if needed ──
+  findNearestLandCell(lat, lon, maxRing = 60) {
+    const cfg = this.cfg;
+    const startCell = this.latLonToCell(lat, lon);
+    if (this.owner[startCell] !== cfg.WATER) {
+      const ll = this.cellToLatLon(startCell);
+      return { cell: startCell, lat: ll.lat, lon: ll.lon };
+    }
+    const nbuf = new Int32Array(4);
+    const seen = new Set([startCell]);
+    let ring = [startCell];
+    for (let r = 0; r < maxRing && ring.length; r++) {
+      const next = [];
+      for (const cell of ring) {
+        const n = this.neighbors4(cell, nbuf);
+        for (let i = 0; i < n; i++) {
+          const nb = nbuf[i];
+          if (seen.has(nb)) continue;
+          seen.add(nb);
+          if (this.owner[nb] !== cfg.WATER) {
+            const ll = this.cellToLatLon(nb);
+            return { cell: nb, lat: ll.lat, lon: ll.lon };
+          }
+          next.push(nb); // traverse through water to reach land
+        }
+      }
+      ring = next;
+    }
+    return null;
+  }
+
+  // ── change ownership of one cell (updates counts + render dirty) ──
+  conquerCell(cell, newOwnerStr) {
+    const cfg = this.cfg;
+    const newCode = STR_TO_CODE[newOwnerStr];
+    const old = this.owner[cell];
+    if (old === newCode) return false;
+    if (old === cfg.WATER) return false;          // can't conquer ocean
+    this.owner[cell] = newCode;
+    // adjust counts (ALL owners — bots live in _countsOther for O(1) reads)
+    if (old === cfg.PLAYER) this._counts.player--;
+    else if (old === cfg.ENEMY) this._counts.enemy--;
+    else if (old === cfg.NEUTRAL) this._counts.neutral--;
+    else if (old > 3) this._countsOther.set(old, (this._countsOther.get(old) || 0) - 1);
+    if (newCode === cfg.PLAYER) this._counts.player++;
+    else if (newCode === cfg.ENEMY) this._counts.enemy++;
+    else if (newCode === cfg.NEUTRAL) this._counts.neutral++;
+    else if (newCode > 3) this._countsOther.set(newCode, (this._countsOther.get(newCode) || 0) + 1);
+    this._dirtyCells.add(cell);
+    return true;
+  }
+
+  // ── seed a circular cluster of cells around a lat/lon as `ownerStr` ──
+  seedCircle(lat, lon, radiusKm, ownerStr) {
+    const cfg = this.cfg;
+    // Snap to nearest land cell if the clicked location falls on water in the grid
+    const probeCell = this.latLonToCell(lat, lon);
+    if (this.owner[probeCell] === cfg.WATER) {
+      const nearest = this.findNearestLandCell(lat, lon, 60);
+      if (nearest) { lat = nearest.lat; lon = nearest.lon; }
+    }
+    const center = this.latLonToCell(lat, lon);
+    const { col: cc, row: cr } = this.cellColRow(center);
+    // radius in cells: ~ each cell ≈ 55km (0.5°). Use lat-adjusted span.
+    const cellDeg = cfg.CELL_DEG;
+    const radiusDeg = radiusKm / 111.12;
+    const spanLat = Math.ceil(radiusDeg / cellDeg) + 1;
+    const spanLon = Math.ceil(radiusDeg / (cellDeg * Math.max(0.25, Math.cos(lat * Math.PI / 180)))) + 1;
+    for (let dr = -spanLat; dr <= spanLat; dr++) {
+      const row = cr + dr;
+      if (row < 0 || row >= cfg.GRID_H) continue;
+      for (let dc = -spanLon; dc <= spanLon; dc++) {
+        let col = (cc + dc) % cfg.GRID_W;
+        if (col < 0) col += cfg.GRID_W;
+        const cell = row * cfg.GRID_W + col;
+        if (this.owner[cell] === cfg.WATER) continue;
+        const { lat: clat, lon: clon } = this.cellToLatLon(cell);
+        // great-circle-ish distance via equirectangular approximation
+        const dy = (clat - lat) * 111.12;
+        const dx = (clon - lon) * 111.12 * Math.cos(lat * Math.PI / 180);
+        if (dx * dx + dy * dy <= radiusKm * radiusKm) {
+          this.conquerCell(cell, ownerStr);
+        }
+      }
+    }
+    // Note: conquerCell() already records changed cells in _dirtyCells, so we use
+    // the incremental render path (the initial full repaint from grid init ensures
+    // the canvas is already painted before any spawn).
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  //  RENDER SYNC
+  //  Updates the grid canvas pixels for dirty cells. Caller draws this canvas
+  //  (scaled) onto the territory texture + strokes country borders on top.
+  // ══════════════════════════════════════════════════════════════════
+  flushRender() {
+    const cfg = this.cfg;
+    const data = this.gridImage.data;
+    const W = cfg.GRID_W;
+    const H = cfg.GRID_H;
+
+    // ── Territory overlay (TRANSPARENT). Biomes are painted on the SAME grid's
+    // biomeCanvas (see paintBiomeBase + main.js applyBiomeGlobeTexture); this canvas
+    // only carries player/enemy territory fills + borders so the biomes show through.
+    //   water / neutral land → fully transparent (biome shows through)
+    //   player → solid green fill
+    //   enemy  → solid red fill
+    const paintCell = (cell) => {
+      const p = cell * 4;
+      const o = this.owner[cell];
+      if (isOwnedCode(o, cfg)) {
+        const c = ownerColor(o, cfg);
+        data[p] = c[0]; data[p + 1] = c[1]; data[p + 2] = c[2]; data[p + 3] = 90;
+      } else {
+        data[p + 3] = 0;   // transparent — biome base shows through
+      }
+    };
+    const clearCell = (cell) => {
+      const p = cell * 4;
+      data[p + 3] = 0;
+    };
+    // ── Territory border: darken owned cells whose neighbor has a different owner ──
+    const isBorderCell = (cell) => {
+      const o = this.owner[cell];
+      if (!isOwnedCode(o, cfg)) return false;
+      const col = cell % W;
+      const row = (cell / W) | 0;
+      if (this.owner[col === W - 1 ? cell - W + 1 : cell + 1] !== o) return true; // east (wrap)
+      if (this.owner[col === 0 ? cell + W - 1 : cell - 1] !== o) return true;     // west (wrap)
+      if (row > 0 && this.owner[cell - W] !== o) return true;                      // north
+      if (row < H - 1 && this.owner[cell + W] !== o) return true;                  // south
+      return false;
+    };
+    // Frontier edge: push an owned border cell harder toward its owner color + darken,
+    // so the territory outline reads as a clear green (player) / red (enemy) line over
+    // the photo biome base.
+    const darkenCell = (cell) => {
+      const o = this.owner[cell];
+      const tint = isOwnedCode(o, cfg) ? ownerColor(o, cfg) : null;
+      const p = cell * 4;
+      if (tint) {
+        // 75% owner tint + 25% current, then ×0.70 for contrast
+        data[p]     = ((data[p]     * 0.25 + tint[0] * 0.75) * 0.70) | 0;
+        data[p + 1] = ((data[p + 1] * 0.25 + tint[1] * 0.75) * 0.70) | 0;
+        data[p + 2] = ((data[p + 2] * 0.25 + tint[2] * 0.75) * 0.70) | 0;
+      } else {
+        data[p]     = (data[p]     * 0.30) | 0;
+        data[p + 1] = (data[p + 1] * 0.30) | 0;
+        data[p + 2] = (data[p + 2] * 0.30) | 0;
+      }
+    };
+
+    let dirtyRect = null; // null = full-canvas copy; otherwise {x,y,w,h}
+
+    if (this._dirty) {
+      // full repaint — territory fills for every cell (ownership shown later via frontier pass)
+      for (let i = 0; i < this.owner.length; i++) {
+        paintCell(i);
+      }
+      // Border-cell detection pass (no texture darkening — crisp vector lines drawn
+      // separately in main.js via getFrontierEdges). We only record which cells are on
+      // the frontier so the overlay stays pure green/red fills with hard vector edges.
+      this._borderCells.clear();
+      for (let row = 0; row < H; row++) {
+        const rowStart = row * W;
+        for (let col = 0; col < W; col++) {
+          const i = rowStart + col;
+          const o = this.owner[i];
+          if (!isOwnedCode(o, cfg)) continue;
+          let border = false;
+          if (this.owner[col === W - 1 ? i - W + 1 : i + 1] !== o) border = true;
+          else if (this.owner[col === 0 ? i + W - 1 : i - 1] !== o) border = true;
+          else if (row > 0 && this.owner[i - W] !== o) border = true;
+          else if (row < H - 1 && this.owner[i + W] !== o) border = true;
+          if (border) this._borderCells.add(i);
+        }
+      }
+      this._dirty = false;
+      this._dirtyCells.clear();
+      // dirtyRect stays null → full putImageData (startup / land-mask rebuild only)
+    } else if (this._dirtyCells.size > 0) {
+      // ── Incremental: repaint dirty cells, then fix borders for affected cells ──
+      // Collect all cells whose border status might have changed: dirty cells + neighbors
+      const recheck = new Set();
+      const nbBuf = [0, 0, 0, 0];
+      for (const cell of this._dirtyCells) {
+        recheck.add(cell);
+        const n = this.neighbors4(cell, nbBuf);
+        for (let k = 0; k < n; k++) recheck.add(nbBuf[k]);
+      }
+      // Step 1: repaint dirty cells (ownership may have changed)
+      for (const cell of this._dirtyCells) {
+        clearCell(cell);
+        paintCell(cell);
+      }
+      // Step 2: restore normal color for all recheck cells (undo prior border darkening)
+      for (const cell of recheck) {
+        paintCell(cell);
+      }
+      // Step 3: update frontier membership for the recheck set (vector lines are drawn
+      // separately, so this is pure bookkeeping — no texture darkening).
+      for (const cell of recheck) {
+        if (isBorderCell(cell)) {
+          this._borderCells.add(cell);
+        } else {
+          this._borderCells.delete(cell);
+        }
+      }
+      // Bounding box of every touched cell → only copy that slice to the canvas.
+      // At 7200x3600 a full putImageData (~104MB) every conquest tick would stutter;
+      // the dirty rect bounds the copy to just the changed region.
+      let minC = W, minR = H, maxC = -1, maxR = -1;
+      for (const cell of recheck) {
+        const c = cell % W;
+        const r = (cell / W) | 0;
+        if (c < minC) minC = c;
+        if (c > maxC) maxC = c;
+        if (r < minR) minR = r;
+        if (r > maxR) maxR = r;
+      }
+      dirtyRect = { x: minC, y: minR, w: maxC - minC + 1, h: maxR - minR + 1 };
+      this._dirtyCells.clear();
+    } else {
+      return false; // nothing changed
+    }
+
+    if (dirtyRect) {
+      this.gridCtx.putImageData(this.gridImage, 0, 0, dirtyRect.x, dirtyRect.y, dirtyRect.w, dirtyRect.h);
+    } else {
+      this.gridCtx.putImageData(this.gridImage, 0, 0);
+    }
+    return true;
+  }
+
+  getCanvas() { return this.gridCanvas; }
+  markDirty() { this._dirty = true; }
+  hasDirty() { return this._dirty || this._dirtyCells.size > 0; }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  COMBAT MATH — faithful port of OpenFront Config.attackLogic
+// ════════════════════════════════════════════════════════════════════
+export function attackLogic(grid, attackTroops, attackerStr, defenderStr, cell, ctx) {
+  const cfg = grid.cfg;
+  const t = grid.terrainAtCell(cell);
+  let mag = cfg.TERRAIN_MAG[t] || 80;
+  let speed = cfg.TERRAIN_SPEED[t] || 16.5;
+
+  // Any OWNED territory (player, legacy enemy, or a registered bot nation)
+  const isBot = (s) => typeof s === 'string' && s.startsWith('bot');
+  const defenderIsPlayer = (defenderStr === 'player' || defenderStr === 'enemy' || isBot(defenderStr));
+
+  // OpenFront: human attacker vs a Bot defender pays 0.7× the terrain magnitude.
+  if (defenderIsPlayer && attackerStr === 'player') {
+    mag *= 0.7;
+  }
+
+  if (defenderIsPlayer) {
+    const defTroops = ctx.getTroops(defenderStr);
+    const defCells = Math.max(1, grid.countCells(defenderStr));
+
+    // large-empire defense debuff
+    const defenseSig = 1 - sigmoid(defCells, cfg.DEFENSE_DEBUFF_DECAY_RATE, cfg.DEFENSE_DEBUFF_MIDPOINT);
+    const largeDefenderSpeedDebuff = 0.7 + 0.3 * defenseSig;
+    const largeDefenderAttackDebuff = 0.7 + 0.3 * defenseSig;
+
+    const attackerCells = grid.countCells(attackerStr);
+    let largeAttackBonus = 1;
+    if (attackerCells > cfg.LARGE_EMPIRE_THRESHOLD) {
+      largeAttackBonus = Math.pow(Math.sqrt(cfg.LARGE_EMPIRE_THRESHOLD / attackerCells), 0.7);
+    }
+    let largeAttackerSpeedBonus = 1;
+    if (attackerCells > cfg.LARGE_EMPIRE_THRESHOLD) {
+      largeAttackerSpeedBonus = Math.pow(cfg.LARGE_EMPIRE_THRESHOLD / attackerCells, 0.6);
+    }
+
+    const defenderTroopLoss = defTroops / defCells;
+    const currentAttackerLoss =
+      within(defTroops / Math.max(1, attackTroops), 0.6, 2) *
+      mag * 0.8 * largeDefenderAttackDebuff * largeAttackBonus;
+    const altAttackerLoss = 1.3 * defenderTroopLoss * (mag / 100);
+    const attackerTroopLoss = 0.6 * currentAttackerLoss + 0.4 * altAttackerLoss;
+
+    return {
+      attackerTroopLoss,
+      defenderTroopLoss,
+      tilesPerTickUsed:
+        within(defTroops / (5 * Math.max(1, attackTroops)), 0.2, 1.5) *
+        speed * largeDefenderSpeedDebuff * largeAttackerSpeedBonus,
+    };
+  } else {
+    // vs neutral wilderness — OpenFront: bots expand at HALF the human cost
+    // (attackerTroopLoss: bot ? mag/10 : mag/5).
+    return {
+      attackerTroopLoss: (attackerStr === 'enemy' || isBot(attackerStr)) ? mag / 10 : mag / 5,
+      defenderTroopLoss: 0,
+      tilesPerTickUsed: within((2000 * Math.max(10, speed)) / Math.max(1, attackTroops), 5, 100),
+    };
+  }
+}
+
+// Conquest speed — port of Config.attackTilesPerTick.
+// Needs the defender's live troop pool (passed via ctx by the caller).
+export function attackTilesPerTickCtx(grid, attackTroops, defenderStr, defenderTroops, numAdjacentEnemyCells) {
+  const isBot = (s) => typeof s === 'string' && s.startsWith('bot');
+  const defenderIsPlayer = (defenderStr === 'player' || defenderStr === 'enemy' || isBot(defenderStr));
+  if (defenderIsPlayer) {
+    return (
+      within(((5 * attackTroops) / Math.max(1, defenderTroops)) * 2, 0.01, 0.5) *
+      numAdjacentEnemyCells * 3
+    );
+  }
+  return numAdjacentEnemyCells * 2;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  CONQUEST ATTACK — port of OpenFront AttackExecution
+//
+//  ctx interface:
+//    getTroops(ownerStr)            → number
+//    addTroops(ownerStr, delta)     → void   (delta may be negative)
+//    onConquerCell(cell, ownerStr)  → void   (optional hook)
+//    onEliminated(conqueror, conquered) → void
+//    log(msg, type)                 → void   (optional)
+// ════════════════════════════════════════════════════════════════════
+export class ConquestAttack {
+  constructor({ grid, owner, target, troops, srcLat, srcLon, dstLat, dstLon, ctx }) {
+    this.grid = grid;
+    this.cfg = grid.cfg;
+    this.owner = owner;                 // 'player' | 'enemy'
+    this.target = target;               // 'player' | 'enemy' | 'neutral'
+    this.ctx = ctx;
+
+    this.troops = Math.max(0, Math.floor(troops));
+    this.active = true;
+    this.retreating = false;
+
+    this.heap = new MinHeap(2048);
+    this.border = new Set();
+    this._nbuf = new Int32Array(4);
+
+    this.tickCount = 0;
+    this._randState = ((this.grid.latLonToCell(srcLat, srcLon) ^ 0x9e3779b9) >>> 0) || 1;
+
+    // init: deduct troops from attacker pool
+    this.ctx.addTroops(this.owner, -this.troops);
+
+    this.srcCell = this.grid.latLonToCell(srcLat, srcLon);
+    this.dstCell = this.grid.latLonToCell(dstLat, dstLon);
+
+    this._init();
+  }
+
+  // small deterministic PRNG (mirrors OpenFront PseudoRandom.nextInt(0,7))
+  _nextInt(lo, hi) {
+    // xorshift32
+    let x = this._randState;
+    x ^= x << 13; x >>>= 0;
+    x ^= x >> 17;
+    x ^= x << 5; x >>>= 0;
+    this._randState = x;
+    const range = hi - lo;
+    return lo + (x % range);
+  }
+
+  _ownerCode(str) { return STR_TO_CODE[str] || 1; }
+
+  _init() {
+  const grid = this.grid;
+  const ownerCode = this._ownerCode(this.owner);
+  const srcOwner = grid.ownerCodeAtCell(this.srcCell);
+
+  // Seed the frontier by BFS from the source through attacker-owned land,
+  // enqueuing any target-owned land we touch. This lets the player click
+  // anywhere in their territory (not just the frontline) and still reach the target.
+  if (srcOwner === ownerCode) {
+    this._seedFrontierFromSource();
+  } else {
+    this._refreshFromBorders();
+  }
+
+  if (this.heap.size() === 0) {
+    // no reachable target tiles — refund and abort
+    console.warn('[CONQUEST ATK] ABORT: heap empty, refunding %d troops', this.troops);
+    this.ctx.addTroops(this.owner, this.troops);
+    this.troops = 0;
+    this.active = false;
+  }
+}
+
+// BFS from srcCell through attacker-owned land, enqueueing target-owned neighbors.
+// Bounded + early-exits once a healthy frontier is found.
+_seedFrontierFromSource() {
+  const grid = this.grid;
+  const ownerCode = this._ownerCode(this.owner);
+  const targetCode = this._ownerCode(this.target);
+  const nbuf = this._nbuf;
+  const seen = new Set([this.srcCell]);
+  const queue = [this.srcCell];
+  let head = 0, guard = 0;
+  while (head < queue.length && guard < 60000) {
+    guard++;
+    const cell = queue[head++];
+    const n = grid.neighbors4(cell, nbuf);
+    for (let i = 0; i < n; i++) {
+      const nb = nbuf[i];
+      const o = grid.ownerCodeAtCell(nb);
+      if (o === targetCode && grid.isLandCell(nb)) {
+        if (!this.border.has(nb)) this._enqueueTargetCell(cell, nb);
+      } else if (o === ownerCode && !seen.has(nb)) {
+        seen.add(nb);
+        queue.push(nb);
+      }
+    }
+    if (this.border.size > 150) break; // enough frontline seeded
+  }
+}
+
+// Enqueue a target cell with OpenFront-style priority (terrain + owned-by-me).
+_enqueueTargetCell(attackerCell, targetCell) {
+  if (this.border.has(targetCell)) return;
+  this.border.add(targetCell);
+  const cfg = this.cfg;
+  const ownerCode = this._ownerCode(this.owner);
+  const t = this.grid.terrainAtCell(targetCell);
+  const mag = cfg.TERRAIN_MAG[t] || 80;
+  // count attacker-owned neighbors of the target cell
+  const nbuf2 = new Int32Array(4);
+  let numOwnedByMe = 0;
+  const m = this.grid.neighbors4(targetCell, nbuf2);
+  for (let j = 0; j < m; j++) {
+    if (this.grid.ownerCodeAtCell(nbuf2[j]) === ownerCode) numOwnedByMe++;
+  }
+  const priority = (this._nextInt(0, 7) + 10) * (1 - numOwnedByMe * 0.5 + mag / 2) + this.tickCount;
+  this.heap.enqueue(targetCell, priority);
+}
+
+  // Rebuild the frontier from all attacker border cells (fallback path)
+  _refreshFromBorders() {
+    this.heap.clear();
+    this.border.clear();
+    const grid = this.grid;
+    const cfg = this.cfg;
+    const ownerCode = this._ownerCode(this.owner);
+    const targetCode = this._ownerCode(this.target);
+    const nbuf = this._nbuf;
+    // Scan a window around destination first for performance, else full grid.
+    // We do a bounded BFS from dstCell over target-owned land to find cells
+    // adjacent to attacker-owned cells.
+    const seen = new Set();
+    const queue = [this.dstCell];
+    seen.add(this.dstCell);
+    // Head-index pattern (NOT queue.shift() — shift is O(n) per pop and made this
+    // BFS O(n²), freezing the main thread on large territories). Same as
+    // _seedFrontierFromSource above.
+    let guard = 0, head = 0;
+    while (head < queue.length && guard < 200000) {
+      guard++;
+      const cell = queue[head++];
+      const n = grid.neighbors4(cell, nbuf);
+      for (let i = 0; i < n; i++) {
+        const nb = nbuf[i];
+        if (seen.has(nb)) continue;
+        const o = grid.ownerCodeAtCell(nb);
+        if (o === ownerCode) {
+          // attacker borders this target cell → enqueue target cell
+          if (grid.ownerCodeAtCell(cell) === targetCode) {
+            this._enqueueTargetCell(nb, cell);
+          }
+        }
+        if (o === targetCode) {
+          seen.add(nb);
+          queue.push(nb);
+        }
+      }
+    }
+  }
+
+  // Port of AttackExecution.addNeighbors: enqueue target-owned land cells
+  // adjacent to `cell`, prioritized by terrain + owned-by-me weighting.
+  _addNeighbors(cell) {
+    const grid = this.grid;
+    const cfg = this.cfg;
+    const ownerCode = this._ownerCode(this.owner);
+    const targetCode = this._ownerCode(this.target);
+    const nbuf = this._nbuf;
+    const nbuf2 = new Int32Array(4);
+    const tickNow = this.tickCount;
+
+    const n = grid.neighbors4(cell, nbuf);
+    for (let i = 0; i < n; i++) {
+      const neighbor = nbuf[i];
+      if (!grid.isLandCell(neighbor)) continue;
+      if (grid.ownerCodeAtCell(neighbor) !== targetCode) continue;
+      if (this.border.has(neighbor)) continue;
+      this.border.add(neighbor);
+
+      // count how many of neighbor's neighbors are owned by attacker
+      let numOwnedByMe = 0;
+      const m = grid.neighbors4(neighbor, nbuf2);
+      for (let j = 0; j < m; j++) {
+        if (grid.ownerCodeAtCell(nbuf2[j]) === ownerCode) numOwnedByMe++;
+      }
+
+      const t = grid.terrainAtCell(neighbor);
+      const mag = cfg.TERRAIN_MAG[t] || 80;
+
+      const priority =
+        (this._nextInt(0, 7) + 10) * (1 - numOwnedByMe * 0.5 + mag / 2) + tickNow;
+
+      this.heap.enqueue(neighbor, priority);
+    }
+  }
+
+  // ── Per-frame tick (call from game loop) ──
+  tick() {
+    if (!this.active) return;
+    const grid = this.grid;
+    const cfg = this.cfg;
+    const ownerCode = this._ownerCode(this.owner);
+    const targetCode = this._ownerCode(this.target);
+    const nbuf = this._nbuf;
+
+    this.tickCount++;
+    if (this.tickCount % cfg.TICK_INTERVAL !== 0) return;
+    if (this.troops < 1) { this._end(); return; }
+
+    // recompute target in case ownership shifted
+    const defenderTroops = this.ctx.getTroops(this.target);
+    const numAdjacent = Math.min(this.border.size, 40) + this._nextInt(0, 5);
+    let numTilesThisTick = attackTilesPerTickCtx(grid, this.troops, this.target, defenderTroops, numAdjacent);
+    numTilesThisTick = Math.min(numTilesThisTick, cfg.MAX_CELLS_PER_TICK);
+
+    let processed = 0;
+    while (numTilesThisTick > 0) {
+      if (this.troops < 1) break;
+      if (this.heap.size() === 0) {
+        // try to refresh frontier from current borders
+        this._refreshFromBorders();
+        if (this.heap.size() === 0) { this._end(); return; }
+      }
+
+      const cell = this.heap.dequeue();
+      this.border.delete(cell);
+
+      // validate: must still be target-owned AND border an attacker cell
+      if (grid.ownerCodeAtCell(cell) !== targetCode) continue;
+      if (!grid.isLandCell(cell)) continue;
+      let onBorder = false;
+      const nn = grid.neighbors4(cell, nbuf);
+      for (let i = 0; i < nn; i++) {
+        if (grid.ownerCodeAtCell(nbuf[i]) === ownerCode) { onBorder = true; break; }
+      }
+      if (!onBorder) continue;
+
+      // resolve combat for this cell
+      const res = attackLogic(grid, this.troops, this.owner, this.target, cell, this.ctx);
+      numTilesThisTick -= Math.max(1, res.tilesPerTickUsed);
+
+      this.troops -= res.attackerTroopLoss;
+      if (this.troops < 0) this.troops = 0;
+      if (this.target !== 'neutral') {
+        this.ctx.addTroops(this.target, -res.defenderTroopLoss);
+      }
+
+      // conquer the cell
+      grid.conquerCell(cell, this.owner);
+      if (this.ctx.onConquerCell) this.ctx.onConquerCell(cell, this.owner);
+
+      // expand frontier into newly adjacent target cells
+      this._addNeighbors(cell);
+
+      processed++;
+      if (processed >= cfg.MAX_CELLS_PER_TICK) break;
+
+      // check elimination
+      if (this.target !== 'neutral' && grid.countCells(this.target) < cfg.ELIMINATION_CELL_THRESHOLD) {
+        this._eliminateDefender();
+        this._end();
+        return;
+      }
+    }
+
+    if (this.troops < 1 || this.heap.size() === 0) {
+      this._end();
+    }
+  }
+
+  _eliminateDefender() {
+    const grid = this.grid;
+    const cfg = this.cfg;
+    const targetCode = this._ownerCode(this.target);
+    const ownerCode = this._ownerCode(this.owner);
+    // take all remaining defender cells
+    for (let cell = 0; cell < grid.owner.length; cell++) {
+      if (grid.owner[cell] === targetCode) {
+        grid.conquerCell(cell, this.owner);
+      }
+    }
+    // OpenFront conquerPlayer: the conquered side loses their ENTIRE remaining
+    // troop pool (previously the loser kept breeding troops with zero territory).
+    if (this.ctx && this.ctx.getTroops && this.ctx.addTroops) {
+      this.ctx.addTroops(this.target, -this.ctx.getTroops(this.target));
+    }
+    if (this.ctx.onEliminated) this.ctx.onEliminated(this.owner, this.target);
+    if (this.ctx.log) {
+      this.ctx.log(`تم القضاء على قوات ${this.target === 'player' ? 'اللاعب' : 'العدو'}!`, 'info');
+    }
+  }
+
+  _end() {
+    // return survivors to attacker pool
+    if (this.troops > 0) {
+      this.ctx.addTroops(this.owner, Math.floor(this.troops));
+    }
+    this.active = false;
+  }
+}
