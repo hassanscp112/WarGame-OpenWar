@@ -14635,12 +14635,20 @@ function _sfxFrame() {
             if (m.dead || m.isSAM) continue;
             let e = _sfxThreats.get(m.id);
             if (!e) {
-                // target-of-player check: only missiles aimed at OUR land
-                // alert us. Unknown (no conquest grid / mask not ready,
-                // e.g. mode 2) stays permissive like v1.
+                // target-of-player check: only missiles aimed at OUR land OR
+                // our fleet (a hostile missile hunting the player's warships
+                // at open sea reads as 'neutral' pixels — one proximity scan
+                // per missile sighting, not per frame). Unknown (no conquest
+                // grid / mask not ready, e.g. mode 2) stays permissive like v1.
                 let aimed = null;
                 if (typeof getPixelOwner === 'function' && typeof conquestGrid !== 'undefined' && conquestGrid && conquestGrid._maskReady)
                     aimed = getPixelOwner(m.tlat, m.tlon) === myRole;
+                if (aimed === false && typeof warships !== 'undefined') {
+                    for (const w of warships) {
+                        if (w.dead || w.owner !== myRole) continue;
+                        if (_econHavNA(w.curLat != null ? w.curLat : w.lat, w.curLon != null ? w.curLon : w.lon, m.tlat, m.tlon) < 200) { aimed = true; break; }
+                    }
+                }
                 e = { pr: m.progress || 0, rate: null, owner: m.owner, mkey: m.mkey, tgtMine: aimed !== false, seen: 0 };
                 _sfxThreats.set(m.id, e);
             } else {
