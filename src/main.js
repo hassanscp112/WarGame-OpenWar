@@ -14467,7 +14467,7 @@ function refreshMarketPanel() {
     // TASK-504 FINISH: show available credit (cap − outstanding principal) —
     // the exact-boundary case (principal $1200 + $800 = cap $2000) reads
     // clearly now instead of the button just going disabled.
-    const avail = Math.max(0, C.ECON_LOAN_MAX_DEBT - L.principal);
+    const avail = Math.max(0, Math.floor(C.ECON_LOAN_MAX_DEBT - L.principal));   // TASK-504 QC: floor — raw principal carries repayment fractions
     if (li) li.textContent = L.owed > 0
         ? `دين قائم $${Math.ceil(L.owed)} — تسديد $${C.ECON_LOAN_REPAY_PS}/ث (ائتمان متاح $${avail})`
         : `ائتمان متاح $${avail} — فائدة ${Math.round((C.ECON_LOAN_INTEREST - 1) * 100)}%`;
