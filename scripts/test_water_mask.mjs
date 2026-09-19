@@ -177,5 +177,69 @@ console.log('\n[G] geoLand late-load — safe re-apply pre-spawn, frozen in-game
   ok(owner(g4.grid, 90, 139) === NEUTRAL, 'G4 subsequent dilation runs geo-gated');
 }
 
+// ═══ H: TASK-506 geo-referenced coast repair ═══
+// Carve a "missing Kent" into the left continent's WEST COAST (a wide
+// terrain-water notch inside the polygon, near the geo edge) + a lake deep
+// in the interior. The repair must restore ONLY the coastal notch — the
+// lake (far from any geo=0), the river (hugging binary land) and the
+// strait (geo=0 ocean) all stay untouched.
+console.log('\n[H] coast repair — coastal notch restored, lake/river/strait untouched');
+{
+  const { grid, geo } = buildWorld();
+  // notch: rows 95-105, cols 40-55 (the west coast is col 40; ocean col ≤39
+  // is geo=0 — interior cells pass BOTH gates: ≥3 from binary land, ≤12 from geo edge)
+  for (let row = 95; row <= 105; row++) {
+    for (let col = 40; col <= 55; col++) grid.terrainByte[row * W + col] = 0x00;
+  }
+  // lake: rows 75-83, cols 70-78 — 9×9 so its center passes gate 1 but is
+  // ~20 rings from any geo=0 cell (gate 2 must exclude it)
+  for (let row = 75; row <= 83; row++) {
+    for (let col = 70; col <= 78; col++) grid.terrainByte[row * W + col] = 0x00;
+  }
+  grid.buildLandMaskFromTerrain(false);
+  // sanity: notch + lake are water before repair
+  ok(owner(grid, 100, 47) === WATER, 'H1 notch carved (water before repair)');
+  ok(owner(grid, 79, 74) === WATER, 'H1 lake carved (water before repair)');
+  grid.setGeoLandRef(geo);   // store only (no dilation ran → no re-apply path)
+  const n = grid.repairCoastFromGeoRef();
+  ok(n > 0, 'H2 repair converted cells (' + n + ')');
+  ok(owner(grid, 100, 47) === NEUTRAL, 'H3 coastal notch restored to land');
+  ok(owner(grid, 79, 74) === WATER, 'H3 interior lake kept as water (gate 2)');
+  ok(owner(grid, 90, 100) === WATER, 'H3 river cells still water (gate 1: hug binary land)');
+  // strait must stay 20 wide (repair never touches geo=0 water)
+  let straitWater = 0;
+  for (let col = 140; col <= 159; col++) if (owner(grid, 90, col) === WATER) straitWater++;
+  ok(straitWater === 20, 'H3 strait untouched by repair');
+  // counts recounted + full repaint queued
+  let manual = 0;
+  for (let i = 0; i < grid.owner.length; i++) if (grid.owner[i] === NEUTRAL) manual++;
+  ok(grid.countCells('neutral') === manual, 'H4 counts recounted after repair');
+  // repaired cells paint as sand (tb=0xC0 → land+shore)
+  const tbv = grid.terrainByte[100 * W + 47];
+  ok((tbv & 0x80) !== 0 && (tbv & 0x40) !== 0, 'H4 repaired cell terrainByte = land+shore (0x' + tbv.toString(16) + ')');
+  // no-op without a geo ref
+  const g2 = buildWorld();
+  ok(g2.grid.repairCoastFromGeoRef() === 0, 'H5 repair is a no-op without a geo ref');
+
+  // class 2 — plain-OCEAN bytes (0x21) inside the polygon repair even when
+  // hugging binary land (Spain's south-coast band pattern); only the
+  // coastal band (≤ MAX_EDGE rings from a geo=0 cell) converts.
+  const g6 = buildWorld();
+  for (let row = 95; row <= 105; row++) {
+    for (let col = 40; col <= 55; col++) g6.grid.terrainByte[row * W + col] = 0x21;  // plain ocean
+  }
+  // a SHORE-WATER strip (0x45 — the water class that hugs land, e.g.
+  // around estuaries) right at the binary coast col 56 — stays water
+  // (gate 1: binary land within 1; not plain-ocean so class 2 never applies)
+  for (let row = 96; row <= 104; row++) g6.grid.terrainByte[row * W + 55] = 0x45;
+  g6.grid.buildLandMaskFromTerrain(false);
+  g6.grid.setGeoLandRef(g6.geo);
+  const n6 = g6.grid.repairCoastFromGeoRef();
+  ok(n6 > 0, 'H6 class-2 (plain ocean in polygon) converted cells (' + n6 + ')');
+  ok(owner(g6.grid, 100, 44) === NEUTRAL, 'H6 ocean byte near coast band repaired');
+  ok(owner(g6.grid, 100, 52) === WATER, 'H6 ocean byte beyond the coastal band stays water (gate 2)');
+  ok(owner(g6.grid, 100, 55) === WATER, 'H6 shore-water bytes hugging land stay water (gate 1)');
+}
+
 console.log('\n═══ RESULT: ' + pass + ' passed, ' + fail + ' failed ═══');
 process.exit(fail ? 1 : 0);

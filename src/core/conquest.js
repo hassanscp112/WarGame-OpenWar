@@ -25,6 +25,22 @@ export const CONQUEST_CFG = {
   // (8-connected). 1 = full dilation (any water neighbour). 2 = gentler.
   WATER_DILATION_MIN_NEIGHBORS: 1,
 
+  // ── TASK-506: geo-referenced COAST REPAIR ──
+  // The OpenFront terrain binary (IoU 76% vs GeoJSON) OVER-WATERS some
+  // coasts — e.g. Kent/SE England is drawn ~25km too far east and Spain's
+  // Costa del Sol ~78km too far north, which keeps Dover/Gibraltar past
+  // the armor wade threshold even with geo-gated dilation. The repair
+  // restores land the GeoJSON country polygons claim, under two gates:
+  //   1. no binary LAND within COAST_REPAIR_MIN_INLAND cells → thin
+  //      features (rivers hugging their banks) are never filled;
+  //   2. a geo=0 (outside-polygon) cell within COAST_REPAIR_MAX_GEO_EDGE
+  //      cells → only the coastal band is restored; inland seas/lakes
+  //      (Great Lakes ≈41 cells from any polygon edge, Nile delta ≈14)
+  //      stay water. Calibrated live: Kent sits at edge-distance 3-5,
+  //      the Thames-mouth chunk at 5, everything worth keeping ≥ 14.
+  COAST_REPAIR_MIN_INLAND: 3,
+  COAST_REPAIR_MAX_GEO_EDGE: 12,
+
   // ── Owner codes ──
   WATER: 0,
   NEUTRAL: 1,
@@ -699,12 +715,89 @@ export class ConquestGrid {
         'Next game initializes geo-gated if GeoJSON loads in time.');
       return false;
     }
-    // Safe pre-spawn re-apply: terrain → mask → geo-gated dilation → biome repaint.
-    this.buildLandMaskFromTerrain();
+    // Safe pre-spawn re-apply: terrain → mask → coast repair → geo-gated
+    // dilation → biome repaint (terrain heuristic already valid — same
+    // terrainByte, skip the 26M-cell recompute).
+    this.buildLandMaskFromTerrain(false);
+    this.repairCoastFromGeoRef();
     this.dilateWater(this.cfg.WATER_DILATION_RINGS, this.cfg.WATER_DILATION_MIN_NEIGHBORS);
     this.paintBiomeBase();
     console.log('[CONQUEST] geoLand late-load: mask re-applied geo-gated (coasts/straits restored to true width)');
     return true;
+  }
+
+  // ── TASK-506: geo-referenced COAST REPAIR (see cfg.COAST_REPAIR_* docs) ──
+  // Restores land the terrain binary over-waters INSIDE country polygons
+  // (missing Kent peninsula, Spain's south coast), leaving rivers (hug
+  // binary land), lakes (deep inside polygons) and the ocean untouched.
+  // Returns the number of cells repaired (0 when no geo ref is set).
+  // Call AFTER the land mask is built and the geo ref is set, BEFORE
+  // dilateWater/paintBiomeBase (repaired cells get tb=0xC0 → sand shore).
+  repairCoastFromGeoRef() {
+    if (!this._geoLand) return 0;
+    const cfg = this.cfg;
+    const W = cfg.GRID_W, H = cfg.GRID_H, WATER = cfg.WATER, NEUTRAL = cfg.NEUTRAL;
+    const geo = this._geoLand, owner = this.owner, tb = this.terrainByte;
+    const MIN_IN = cfg.COAST_REPAIR_MIN_INLAND, MAX_EDGE = cfg.COAST_REPAIR_MAX_GEO_EDGE;
+    const isLandT = (r, c) => (tb[r * W + (((c % W) + W) % W)] & 0x80) !== 0;
+    const isGeoOut = (r, c) => { const cc = ((c % W) + W) % W; return !geo[r * W + cc]; };
+    // Phase 1 — collect candidates (read-only: writes mid-scan would turn
+    // repaired cells into "binary land" and suppress their neighbours —
+    // the first version left a comb pattern of un-repaired stripes).
+    // Two defect classes share the coastal-band gate:
+    //   class 1 — thick missing chunks (Kent): no binary land within MIN_IN
+    //             cells → not a river bank / shore hugging land;
+    //   class 2 — plain-OCEAN bytes (bit5, no land/shore flags) inside the
+    //             polygon (Spain's south coast band): the binary drew open
+    //             ocean where the polygon says land. River mouths carry the
+    //             shoreline flag (0xC0-0xC2) and are never touched.
+    const cand = [];
+    for (let row = 0; row < H; row++) {
+      for (let col = 0; col < W; col++) {
+        const cell = row * W + col;
+        if (owner[cell] !== WATER || !geo[cell]) continue;   // only polygon-interior water
+        const tbv = tb[cell];
+        const plainOcean = (tbv & 0x80) === 0 && (tbv & 0x40) === 0 && (tbv & 0x20) !== 0;
+        if (!plainOcean) {
+          // gate 1: no binary land within MIN_IN cells (Chebyshev) → not a river bank
+          let nearLand = false;
+          for (let dy = -MIN_IN; dy <= MIN_IN && !nearLand; dy++) {
+            const nr = row + dy;
+            if (nr < 0 || nr >= H) continue;
+            for (let dx = -MIN_IN; dx <= MIN_IN; dx++) {
+              if (isLandT(nr, col + dx)) { nearLand = true; break; }
+            }
+          }
+          if (nearLand) continue;
+        }
+        // gate 2: a geo=0 (outside-polygon) cell within MAX_EDGE rings → coastal band
+        let coastal = false;
+        for (let rr = 1; rr <= MAX_EDGE && !coastal; rr++) {
+          for (let dy = -rr; dy <= rr && !coastal; dy++) {
+            const nr = row + dy;
+            if (nr < 0 || nr >= H) continue;
+            for (let dx = -rr; dx <= rr; dx++) {
+              if (Math.max(Math.abs(dy), Math.abs(dx)) !== rr) continue;   // ring cells only
+              if (isGeoOut(nr, col + dx)) { coastal = true; break; }
+            }
+          }
+        }
+        if (!coastal) continue;   // inland sea / lake — keep as water
+        cand.push(cell);
+      }
+    }
+    // Phase 2 — apply all writes after the scan.
+    for (const cell of cand) {
+      owner[cell] = NEUTRAL;
+      tb[cell] = 0xC0;          // land + shoreline → paints as sand
+    }
+    if (cand.length > 0) {
+      let n = 0;
+      for (let i = 0; i < owner.length; i++) if (owner[i] === NEUTRAL) n++;
+      this._counts.neutral = n;
+      this._dirty = true;
+    }
+    return cand.length;
   }
 
   // ── Paint the biome base canvas tile-by-tile from terrainByte[] via ofTerrainColor(). ──
