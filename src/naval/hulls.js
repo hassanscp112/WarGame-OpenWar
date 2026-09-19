@@ -121,12 +121,12 @@ function sonarPing(s, ctx) {
     for (const w of ctx.warships) {
         if (w.dead || w.owner === s.owner || !w.submerged) continue;
         if (ctx.haversineDist(s.curLat, s.curLon, w.curLat, w.curLon) < s.hull.sonarRange) {
-            // TASK-502 (sub sonar ring visibility): fire the ring only on a
-            // FRESH contact (undetected → detected — covers both a cold boat
-            // and one already flaming-datum revealed by its own torpedoes) —
-            // a continuous glow would be noise. Ping ring at the escort,
-            // reveal ring over the boat.
-            if (!w.detected && ctx.sonarPingFX) {
+            // TASK-502 (sub sonar ring visibility): fire the rings only on a
+            // FRESH sonar LOCK (_detectedT was 0 — not the sub's broader
+            // .detected flag: the boat's own subSystems self-scan can set that
+            // on a different 20-frame phase, which used to swallow the ring).
+            // Ping ring at the escort, reveal ring over the boat.
+            if (w._detectedT <= 0 && ctx.sonarPingFX) {
                 ctx.sonarPingFX(s.curLat, s.curLon, 0x66ccff, 0.8);
                 ctx.sonarPingFX(w.curLat, w.curLon, 0x4da6ff, 1.6);
             }
@@ -303,6 +303,7 @@ function subSystems(s, ctx) {
     if (s._revealT > 0) s._revealT--;
     if (s._detectedT > 0) s._detectedT--;
     if ((ctx.frame + s.id) % 20 === 0) {
+        const wasLocked = s._detectedT > 0;   // TASK-502: reveal-ring transition gate
         // enemy ASW escorts
         for (const w of ctx.warships) {
             if (w.dead || w.owner === s.owner || !w.hull.sonarRange) continue;
@@ -317,6 +318,14 @@ function subSystems(s, ctx) {
                 ctx.haversineDist(s.curLat, s.curLon, p.lat, p.lon) < C.SONAR_HELICOPTER_KM) {
                 s._detectedT = C.SUB_DETECT_FRAMES; break;
             }
+        }
+        // TASK-502: this self-scan and the escort's sonarPing run on
+        // independent 20-frame phases — whichever fires FIRST owns the
+        // reveal ring (the other sees _detectedT already set and stays
+        // quiet, so a lock is ringed exactly once). Own boats skip the
+        // blue ring — the red warn ring + log below are their alert.
+        if (!wasLocked && s._detectedT > 0 && ctx.sonarPingFX && s.owner !== ctx.myRole) {
+            ctx.sonarPingFX(s.curLat, s.curLon, 0x4da6ff, 1.6);
         }
     }
     s.detected = !s.submerged || s._detectedT > 0 || s._revealT > 0;

@@ -17395,10 +17395,15 @@ window.navalQATest = async function () {
     const fakePort = (ll) => ({ lat: ll.lat, lon: ll.lon });
     const lastLog = () => { const s = document.getElementById('slog'); return s && s.firstChild ? s.firstChild.textContent : ''; };
     const key = (code, opts = {}) => window.dispatchEvent(new KeyboardEvent('keydown',
-        Object.assign({ code, key: code.replace('Key', '').toLowerCase(), bubbles: true }, opts)));
+        Object.assign({ code, key: code.startsWith('Key') ? code.slice(3).toLowerCase() : code, bubbles: true }, opts)));
 
     // ── 1. KEY HANDLERS (behavioral — the J→L→Z / K→P rebind history) ──
     try {
+        // P/Z/V (and _setMineMode) gate on startSpawnPhase by design — the
+        // probe runs mid-spawn-phase, so lift the gate for the key test and
+        // restore it (the gate itself is exercised by keysClean below).
+        const wasSpawn = window.startSpawnPhase;
+        window.startSpawnPhase = false;
         const keep = fleetStanceIdx;
         key('KeyP');
         R.checks.keyP = lastLog().includes('تشكيل الأسطول') && fleetStanceIdx === (keep + 1) % C.FLEET_STANCES.length;
@@ -17413,6 +17418,7 @@ window.navalQATest = async function () {
         key('KeyV', { repeat: true });
         R.checks.keyVRepeat = warshipBuildClass === before;
         key('Escape');                               // leave modes tidy
+        window.startSpawnPhase = wasSpawn;
         R.checks.keysClean = !mineMode && buildMode !== 'warship';
         log(`keys: P=${R.checks.keyP} Z=${R.checks.keyZ} V-repeat-guard=${R.checks.keyVRepeat} clean=${R.checks.keysClean}`);
     } catch (e) { R.checks.keyP = R.checks.keyZ = R.checks.keyVRepeat = false; R.notes.push('keys: ' + e.message); }
@@ -17462,9 +17468,15 @@ window.navalQATest = async function () {
         const esc = new Warship('player', fakePort(A), A, 'escort');
         const eSub = new Warship('enemy', fakePort({ lat: 8.1, lon: -139.9 }), { lat: 8.1, lon: -139.9 }, 'submarine');
         warships.push(esc, eSub);
+        // PIN both hulls: the constructor scatters spawns up to 280km via
+        // _findWaterNear — un-pinned, the escort can start OUTSIDE its own
+        // 260km sonar dome of the sub (that scattered the first run).
+        esc.curLat = 8; esc.curLon = -140; esc.distTraveled = 0; esc.totalLen = 0;
+        eSub.curLat = 8.1; eSub.curLon = -139.9; eSub.distTraveled = 0; eSub.totalLen = 0;
         await pump(30);                               // settle spawn course picks
         eSub._detectedT = 0; eSub._revealT = 0; eSub.detected = false;
         eSub.curLat = 8.05; eSub.curLon = -139.95;    // inside the 260km ASW dome
+        esc.curLat = 8; esc.curLon = -140;            // re-pin (≤150km wander keeps gap < 260km)
         let rings = 0;
         const orig = NAVAL_CTX.sonarPingFX;
         NAVAL_CTX.sonarPingFX = (...a) => { rings++; return orig(...a); };
