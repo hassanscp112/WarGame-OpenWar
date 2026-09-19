@@ -1,4 +1,4 @@
-import { MCFG, MTAGS, PCFG, DCFG, GAME_CONSTANTS, WORLD_CITIES, SDEFS, ITEM_ICONS, TECH_TREE, BOT_COUNTRIES, BOTS_MAX } from './data/constants.js';
+import { MCFG, MTAGS, PCFG, DCFG, TCFG, GAME_CONSTANTS, WORLD_CITIES, SDEFS, ITEM_ICONS, TECH_TREE, BOT_COUNTRIES, BOTS_MAX } from './data/constants.js';
 import { ConquestGrid, ConquestAttack, CONQUEST_CFG, registerOwner, clearRegisteredOwners, setBiomeFlatMode, setBiomeBandColor, getBiomeBandColor, getBiomeBands, attackLogic, attackTilesPerTickCtx } from './core/conquest.js';
 import { initNewUI, uiToast } from './ui.js';
 window.GEO_DATA_ROADS = [];
@@ -2839,14 +2839,22 @@ function _targetLivePos(kind, obj) {
     const bLon = kind === 'trade' ? obj.dstPort.lon : obj.dstLon;
     return { lat: aLat + (bLat - aLat) * t, lon: aLon + (bLon - aLon) * t };
 }
-// OpenFront-style unit pick: nearest OWN warship (90km) or plane (50km) at a
-// clicked point. Ships get a bigger radius (capital-ship scale ~40 units).
+// OpenFront-style unit pick: nearest OWN warship (90km), tank division
+// (70km — formations spread wide) or plane (50km) at a clicked point.
 function _pickOwnUnitAt(lat, lon) {
     let best = null, bestScore = Infinity;
     for (const w of warships) {
         if (w.dead || w.owner !== myRole) continue;
         const d = haversineDist(lat, lon, w.curLat, w.curLon);
         if (d < 90) { const s = d / 90; if (s < bestScore) { bestScore = s; best = w; } }
+    }
+    for (const t of tanks) {
+        if (t.dead || t.owner !== myRole) continue;
+        const d = haversineDist(lat, lon, t.lat, t.lon);
+        if (d < GAME_CONSTANTS.TANK_PICK_R_KM) {
+            const s = d / GAME_CONSTANTS.TANK_PICK_R_KM + 0.08;
+            if (s < bestScore) { bestScore = s; best = t; }
+        }
     }
     for (const p of planes) {
         if (p.dead || p.owner !== myRole) continue;
@@ -3289,6 +3297,14 @@ window.__ffaProbe = {
         tgt: w.target ? w.target.kind : null, shells: w.shells.length,
         patrol: [Math.round(w.patrolLat * 10) / 10, Math.round(w.patrolLon * 10) / 10],
         pos: [Math.round(w.curLat * 10) / 10, Math.round(w.curLon * 10) / 10]
+    })),
+    // TASK-302: tank division live state
+    tanks: () => tanks.map(t => ({
+        owner: t.owner, key: t.key, hp: Math.round(t.hp), mode: t.mode, shots: t.shots,
+        vehicles: `${t.members.length}/${t.members0}`,
+        tgt: t.target ? t.target.kind : null,
+        march: [Math.round(t.tgtLat * 10) / 10, Math.round(t.tgtLon * 10) / 10],
+        pos: [Math.round(t.lat * 10) / 10, Math.round(t.lon * 10) / 10]
     })),
     // missile mode state
     missileMode: () => ({
@@ -5524,6 +5540,7 @@ function init3D() {
 
     preloadAssets();
     loadAircraftModels();   // TASK-201: GLB registry (async, per-aircraft fallback)
+    loadTankModels();       // TASK-302: WW2 tank FBX registry (async, procedural fallback)
     
     // Initialize Geo-Renderer (for enhanced geographic data)
     GEO_RENDERER.init(scene, camera);
@@ -5644,6 +5661,7 @@ window.addEventListener('resize', () => {
 let _id=0;
 let structs=[], missiles=[], planes=[], drones=[], aamMissiles=[], exps=[], particles=[];
 let tradeShips=[], trains=[], troopCohorts=[], transportShips=[], warships=[];
+let tanks=[];   // TASK-302: armored divisions (mobile land units)
 let eBuiltPorts = 0;
 function _enemyPortCost() { return Math.floor(GAME_CONSTANTS.PORT_BASE_COST * Math.pow(1.5, eBuiltPorts)); }
 window.paintExpansions=[];
@@ -6879,6 +6897,28 @@ class Missile {
             conquestGrid.applyDevastation(this.lat, this.lon, Math.max(30, rad * (0.9 + 0.5 * dm)), Math.min(1.6, (0.4 + (cfg.dmg || 50) / 400) * dm));
         }
         if (SFX && SFX.exp) SFX.exp(rad, cfg.type === 'nuke');
+        // TASK-302 + TASK-202 fix: blasts hit enemy HULLS (×2 anti-ship) and
+        // enemy ARMOR — every missile type strikeable vs fleets and divisions.
+        // Anti-armor scale: cluster bomblets are THE tank busters (CBU-97 is
+        // literally an anti-armor weapon), thermobaric burns them out, nukes
+        // erase them, generic blast washes over armor (×0.6 before armor).
+        {
+            for (const w of warships) {
+                if (w.dead || w.owner === this.owner) continue;
+                if (haversineDist(this.lat, this.lon, w.curLat, w.curLon) < blastR + 8) {
+                    w.hit(dmg * GAME_CONSTANTS.NAVAL_MISSILE_DMG_MUL);
+                }
+            }
+            if (typeof tanks !== 'undefined' && tanks.length) {
+                const tmul = this.mkey === 'cluster' ? 1.6 : this.mkey === 'thermobaric' ? 1.2 : this.mkey === 'nuke_tac' ? 3.0 : GAME_CONSTANTS.TANK_MISSILE_DMG_MUL;
+                for (const t of tanks) {
+                    if (t.dead || t.owner === this.owner) continue;
+                    if (haversineDist(this.lat, this.lon, t.lat, t.lon) < blastR + 10) {
+                        t.hit(dmg * tmul, this.owner);
+                    }
+                }
+            }
+        }
 
         if (this.mkey === 'cluster') {
             // CBU-97: 8 bomblets pepper the footprint — wider total coverage
@@ -6953,6 +6993,10 @@ class Missile {
     // TASK-204 anti-troop: damage committed troop cohorts inside radiusUnits
     // (world units). Cluster is the shredder (troopMul 3.2), thermobaric burns
     // formations, others cause incidental casualties.
+    // (TASK-302 drive-by fix: the old warship loop here referenced blastR/dmg
+    // — locals of explode() — so it NEVER ran without a ReferenceError that
+    // silently aborted the rest of explode(). Hull + tank blast damage now
+    // lives IN explode() where those values are in scope.)
     _hitTroops(dmgPer, radiusUnits) {
         if (!troopCohorts.length || dmgPer <= 0) return;
         for (const tc of troopCohorts) {
@@ -6969,17 +7013,6 @@ class Missile {
                 }
             }
         }
-        // TASK-202 naval strike: blasts hit enemy hulls at ×2 anti-ship scale
-        // (missile cruisers + player bombardment can now sink fleets; a
-        // direct cruise hit ≈ 180 dmg vs a 1000hp destroyer).
-        for (const w of warships) {
-            if (w.dead || w.owner === this.owner) continue;
-            if (haversineDist(this.lat, this.lon, w.curLat, w.curLon) < blastR) {
-                w.hp -= dmg * GAME_CONSTANTS.NAVAL_MISSILE_DMG_MUL;
-                if (w.hp <= 0 && !w.dead) w._sink();
-            }
-        }
-        if (this.isSAM && this.tgt) this.tgt.dead = true;
     }
 }
 
@@ -7506,10 +7539,19 @@ class Plane {
         if (!this.gndTgt || this.gndTgt.dead) {
             this.gndTgt = null;
             let best = null, bestD = 300;
+            const _cas = (this.cfg.role === 'cas' || this.cfg.role === 'heli');
             for (const s of structs) {
                 if (s.dead || s.owner === this.owner) continue;
                 const d = haversineDist(this.tlat, this.tlon, s.lat, s.lon);
                 if (d < bestD) { bestD = d; best = s; }
+            }
+            // TASK-302: enemy armor is a prime ground target — CAS (A-10/
+            // Apache) hunts divisions with a priority multiplier
+            for (const t of tanks) {
+                if (t.dead || t.owner === this.owner) continue;
+                let d = haversineDist(this.tlat, this.tlon, t.lat, t.lon);
+                if (_cas) d *= 0.55;
+                if (d < bestD) { bestD = d; best = t; }
             }
             this.gndTgt = best;
             if (!best) { this.mode = 'patrol'; return; }   // nothing to strike here
@@ -7551,6 +7593,7 @@ class Plane {
             if (s.dead || s.owner === this.owner) continue;
             if (haversineDist(aim.lat, aim.lon, s.lat, s.lon) < R) s.hit(90);
         }
+        _tankBlast(aim.lat, aim.lon, R, 90, this.owner);   // TASK-302: armor under the stick
         for (let i = 0; i < 6; i++) {
             spawnExp(aim.lat + rnd(-0.2, 0.2), aim.lon + rnd(-0.25, 0.25), rnd(3, 6), '#ffaa44');
         }
@@ -7561,7 +7604,8 @@ class Plane {
     // A-10 / heli (CAS): anti-armor precision — missiles + the gun, hard-target bonus.
     _precisionStrike(t) {
         const HARD = { launcher: 1, sam: 1, himars: 1, ciws: 1, iron_dome: 1, nuke_plant: 1 };
-        t.hit(HARD[t.type] ? 190 : 120);
+        if (t.isTank) t.hit(170, this.owner);                    // TASK-302: tank-buster loadout
+        else t.hit(HARD[t.type] ? 190 : 120);
         spawnExp(t.lat, t.lon, 4, '#ffcc66');
         if (SFX && SFX.exp) SFX.exp(30);
         if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(t.lat, t.lon, 12, 0.7);
@@ -7569,7 +7613,8 @@ class Plane {
 
     // Fighters / multirole: light standoff AGM pop at a single target.
     _lightStrike(t) {
-        t.hit(55);
+        if (t.isTank) t.hit(45, this.owner);                     // TASK-302: AGMs glance off armor
+        else t.hit(55);
         spawnExp(t.lat, t.lon, 3, '#ffdd88');
         if (SFX && SFX.exp) SFX.exp(20);
         if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(t.lat, t.lon, 10, 0.5);
@@ -7602,6 +7647,7 @@ class Plane {
                 if (s.dead || s.owner === this.owner) continue;
                 if (haversineDist(t.lat, t.lon, s.lat, s.lon) < 26) s.hit(16);
             }
+            _tankBlast(t.lat, t.lon, 26, 16, this.owner);   // TASK-302: sweeping fire vs armor
             spawnExp(t.lat + rnd(-0.08, 0.08), t.lon + rnd(-0.1, 0.1), 2.5, '#ffaa55');
             if (SFX && SFX.gun) SFX.gun();
             if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(t.lat, t.lon, 15, 0.4);
@@ -8015,6 +8061,9 @@ class Drone {
         for (const w of warships) {
             if (!w.dead && w.owner !== owner) out.push({ kind: 'warship', obj: w });
         }
+        for (const t of tanks) {   // TASK-302: Reapers/kamikazes hunt armor columns
+            if (!t.dead && t.owner !== owner) out.push({ kind: 'tank', obj: t });
+        }
         return out;
     }
     _acquire() {
@@ -8034,6 +8083,7 @@ class Drone {
         if (!o || o.dead) return null;
         if (t.kind === 'struct') return { lat: o.lat, lon: o.lon };
         if (t.kind === 'warship') return { lat: o.curLat !== undefined ? o.curLat : (o.lat || 0), lon: o.curLon !== undefined ? o.curLon : (o.lon || 0) };
+        if (t.kind === 'tank') return { lat: o.lat, lon: o.lon };   // TASK-302
         if (t.kind === 'cohort' && o.mesh) { const ll = vec3ToLatLon(o.mesh.position); return { lat: ll.lat, lon: ll.lon }; }
         return null;
     }
@@ -8216,6 +8266,370 @@ function launchDrone(owner, key, at, opts = {}) {
     return out.length ? out : null;
 }
 window.launchDrone = launchDrone;   // navy agent: call this from your carriers
+
+// ═══════════════════════════════════════════════════════════════════
+//  TASK-302: LAND UNITS — TANK DIVISIONS
+//  A division = a formation of N vehicles sharing one hp pool (vehicles
+//  visually knock out as hp drops). Divisions march on LAND toward their
+//  ordered objective, auto-engage enemy armor/structures/cohorts inside
+//  engageR, and paint a SPEARHEAD CORRIDOR of territory while advancing
+//  through non-owned land (mode 1) — armor is the army's breakthrough arm.
+//  Damage model: armor flat-reduces everything incoming; guns hit armor
+//  flat, structures × structMul, troops × troopMul; battles + wrecks paint
+//  conquestGrid.applyDevastation.
+// ═══════════════════════════════════════════════════════════════════
+const TANK_FBX_BASE = 'Assets/LowPolyWW2GermanTanksFBX/Low Poly German Tanks - FBX Files/';
+const TANK_FBX_MANIFEST = {
+    // key  → { dir, fbx, len }  len = real hull length in METERS (mapped to
+    // globe units so a Tiger visibly out-sizes a Leichttraktor).
+    light:  { dir: 'Leichttraktor', fbx: 'Leichttraktor.fbx', len: 4.5 },
+    medium: { dir: 'Pz-III-J',      fbx: 'Pz-III-J.fbx',      len: 5.9 },
+    heavy:  { dir: 'Pz-VI-Tiger',   fbx: 'Pz-VI Tiger.fbx',   len: 6.3 },
+};
+const TANK_MODELS = {};   // key → { group:THREE.Group (normalized, +Z nose), lenUnits }
+const _tankLenToUnits = (lenMeters) => 8 + 5 * Math.min(1, Math.max(0, (lenMeters - 4.5) / 2));
+
+function loadTankModels() {
+    if (typeof THREE === 'undefined' || !THREE.FBXLoader) return;   // CDN missing → procedural fallback
+    const loader = new THREE.FBXLoader();
+    const texLoader = new THREE.TextureLoader();
+    for (const key in TANK_FBX_MANIFEST) {
+        const e = TANK_FBX_MANIFEST[key];
+        const base = encodeURI(TANK_FBX_BASE + e.dir + '/');
+        loader.load(base + encodeURI(e.fbx), (obj) => {
+            try {
+                const bb = new THREE.Box3().setFromObject(obj);
+                const size = new THREE.Vector3(); bb.getSize(size);
+                const longest = Math.max(size.x, size.z);
+                if (longest < 0.0001) return;                        // degenerate model → skip
+                const lenUnits = _tankLenToUnits(e.len);
+                obj.scale.setScalar(lenUnits / longest);
+                // Align the long horizontal axis to +Z (the game's lookAt
+                // forward) so divisions drive nose-first.
+                if (size.x > size.z) obj.rotation.y = Math.PI / 2;
+                // The pack ships one colorAtlas.png per tank — apply it to
+                // every material (UVs are atlas-mapped in the FBX).
+                texLoader.load(base + 'colorAtlas.png', (tex) => {
+                    obj.traverse(o => {
+                        if (o.isMesh && o.material) {
+                            const mats = Array.isArray(o.material) ? o.material : [o.material];
+                            mats.forEach(m => {
+                                m.map = tex;
+                                m.needsUpdate = true;
+                                if (m.emissive) m.emissive.setHex(0x111111);
+                            });
+                        }
+                    });
+                }, undefined, () => { /* atlas missing → untextured FBX still fine */ });
+                const wrap = new THREE.Group();
+                wrap.add(obj);
+                TANK_MODELS[key] = { group: wrap, lenUnits };
+                console.log('[TANK] model ready:', key, '→', e.fbx);
+            } catch (err) { console.warn('[TANK] model rejected:', key, err.message); }
+        }, undefined, () => { /* folder absent (gitignored) — procedural fallback stays */ });
+    }
+}
+
+// One vehicle: FBX clone when the pack loaded, else a low-poly procedural
+// tank (hull + tracks + turret + gun, nose +Z). Owner accent = pennant +
+// ground ring, matching the game's dark-body/bright-accent language.
+function buildTankModel(key, acc) {
+    const g = new THREE.Group();
+    const reg = TANK_MODELS[key];
+    if (reg) {
+        g.add(reg.group.clone(true));
+    } else {
+        const body = key === 'heavy' ? LP.CONCRETE : key === 'light' ? LP.LIGHT : LP.METAL;
+        const gunLen = key === 'heavy' ? 4.0 : key === 'medium' ? 3.2 : 2.4;
+        _M(g, _box(2.4, 1.0, 6.2), _sm(body), 0, 0.95, 0);                     // hull
+        _M(g, _box(2.7, 0.6, 6.6), _sm(LP.DARK), 0, 0.32, 0);                  // skirt band
+        _M(g, _box(0.6, 0.7, 6.7), _sm(LP.TIRE), -1.15, 0.35, 0);              // left track
+        _M(g, _box(0.6, 0.7, 6.7), _sm(LP.TIRE), 1.15, 0.35, 0);               // right track
+        _M(g, _box(1.8, 0.8, 2.6), _sm(body), 0, 1.85, -0.4);                  // turret
+        _M(g, _cyl(0.1, 0.1, gunLen, 6), _sm(LP.DARK), 0, 1.95, 0.7 + gunLen / 2 - 0.4, Math.PI / 2, 0, 0); // main gun (+Z)
+        _M(g, _box(0.55, 0.3, 0.55), _sm(LP.DARK), 0, 2.4, -1.25);             // cupola
+    }
+    // Owner accents (per-instance materials — disposed with the division)
+    _M(g, _cyl(0.05, 0.05, 1.7, 4), _sm(LP.METAL), 0.8, 2.1, -1.5);           // pennant mast
+    _M(g, _box(0.75, 0.45, 0.05), _am(acc), 1.18, 2.6, -1.5, 0, 0, 0.4);      // pennant
+    _M(g, _cyl(1.9, 1.9, 0.07, 12), _am(acc), 0, 0.14, 0.5);                  // ground ring
+    return g;
+}
+
+// Area anti-armor damage helper (planes' carpet/gunship pulses etc.)
+function _tankBlast(lat, lon, radiusKm, dmg, fromOwner) {
+    if (!tanks.length) return;
+    for (const t of tanks) {
+        if (t.dead || t.owner === fromOwner) continue;
+        if (haversineDist(lat, lon, t.lat, t.lon) < radiusKm) t.hit(dmg, fromOwner);
+    }
+}
+
+// Scratch vectors for tank movement math (tangent-plane stepping)
+const _tkV1 = new THREE.Vector3();
+const _tkV2 = new THREE.Vector3();
+const _tkV3 = new THREE.Vector3();
+const _tkV4 = new THREE.Vector3();
+
+class Tank {
+    // O(1) land probe: conquest grid when ready (mode 1), else the GeoJSON
+    // polygon scan (placement-time only — per-frame tank steps MUST use the
+    // grid path or the geoContains loop would eat the frame budget).
+    static LAND_OK(lat, lon) {
+        if (window.gameMode === 'mode1' && conquestGrid && conquestGrid._maskReady) {
+            return conquestGrid.ownerAt(lat, lon) !== 'water';
+        }
+        return isLand(lat, lon);
+    }
+    constructor(lat, lon, key, owner, opts = {}) {
+        const C = GAME_CONSTANTS;
+        this.id = ++_id;
+        this.owner = owner;
+        this.key = TCFG[key] ? key : 'medium';
+        this.cfg = TCFG[this.key];
+        this.name = this.cfg.name;
+        this.hp = this.cfg.hp; this.maxHp = this.cfg.hp;
+        this.dead = false; this.selected = false;
+        this.isTank = true;
+        this.mode = 'hold';            // 'advance' | 'combat' | 'hold'
+        this.lat = lat; this.lon = lon;
+        this.tgtLat = opts.tgtLat !== undefined ? opts.tgtLat : lat;
+        this.tgtLon = opts.tgtLon !== undefined ? opts.tgtLon : lon;
+        this.target = null;            // { kind:'tank'|'struct'|'cohort', obj }
+        this.fireCd = this.cfg.fireRate >> 1;
+        this.retargetT = this.id % 30;
+        this.shots = 0;
+        this._radius = EARTH_RADIUS + C.TANK_ALT;
+        this._faceVec = null;
+        this._lastDir = null;
+        // Division formation: wedge of N vehicles (lead front), sharing one group
+        const acc = ownerHexColor(owner);
+        this.mesh = new THREE.Group();
+        this.members = [];
+        for (let i = 0; i < this.cfg.tanks; i++) {
+            const m = buildTankModel(this.key, acc);
+            const row = Math.ceil(i / 2), side = i % 2 === 0 ? -1 : 1;
+            m.position.set(i === 0 ? 0 : side * (2.4 + row * 0.35), 0, i === 0 ? 0 : -3.1 * row);
+            this.mesh.add(m);
+            this.members.push(m);
+        }
+        this.mesh.scale.setScalar(this.cfg.scale);
+        this.mesh.position.copy(latLonToVec3(lat, lon, this._radius));
+        scene.add(this.mesh);
+        this.members0 = this.members.length;   // full-strength count (attrition math)
+        // Selection ring (yellow halo flat on the ground around the division)
+        if (!GEO_CACHE['tankSelRing']) GEO_CACHE['tankSelRing'] = new THREE.RingGeometry(15, 17, 26);
+        this.selRing = new THREE.Mesh(GEO_CACHE['tankSelRing'],
+            new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.DoubleSide, transparent: true, opacity: 0.85 }));
+        this.selRing.rotation.x = -Math.PI / 2;
+        this.selRing.position.y = 0.4;
+        this.selRing.visible = false;
+        this.mesh.add(this.selRing);
+    }
+    get type() { return 'tank_' + this.key; }
+    get pos() { return this.mesh.position; }
+
+    // Player/bot move order — the division marches there over LAND.
+    setMoveTarget(lat, lon) {
+        this.tgtLat = lat; this.tgtLon = lon;
+        this._faceVec = null;
+    }
+
+    // Public damage API (parity with Structure.hit / Warship.hit) — armor
+    // flat-reduces everything: shells, missile blasts, bombs.
+    hit(dmg) {
+        if (this.dead) return;
+        this.hp -= dmg * (1 - this.cfg.armor);
+        this._syncMembers();
+        if (this.hp <= 0) this._destroy();
+    }
+
+    _destroy() {
+        this.dead = true;
+        spawnExp(this.lat, this.lon, 6, '#ff7733');
+        _spawnCrater(this.lat, this.lon, GAME_CONSTANTS.TANK_WRECK_DEV_R);   // burning wreck scar
+        if (conquestGrid && conquestGrid.applyDevastation) {
+            conquestGrid.applyDevastation(this.lat, this.lon, GAME_CONSTANTS.TANK_WRECK_DEV_R, 0.8);
+        }
+        if (this.selRing && this.selRing.material) this.selRing.material.dispose();
+        scene.remove(this.mesh);
+        disposeMeshDeep(this.mesh);
+        if (this.owner === 'player') logEvent(`💥 دُمرت ${this.name} لدينا!`, 'err');
+        else if (this.owner === myRole) logEvent(`💥 دُمرت فرقة حليفة!`, 'err');
+        else logEvent(`💥 أُبيدت فرقة مدرعة معادية ${_ownerName(this.owner)}!`, 'info');
+    }
+
+    // Visual attrition: knock out individual vehicles as the hp pool drops
+    _syncMembers() {
+        const frac = Math.max(0, this.hp / this.maxHp);
+        const alive = Math.max(1, Math.ceil(this.members0 * frac));
+        while (this.members.length > alive && this.members.length > 1) {
+            const m = this.members.pop();
+            spawnExp(this.lat, this.lon, 2.5, '#ff9944');
+            this.mesh.remove(m);
+        }
+    }
+
+    // ── targeting (every 30 frames, staggered) ──
+    _retarget() {
+        const R = this.cfg.engageR;
+        let best = null, bestD = Infinity;
+        // Priority 1: enemy armor (tank duels decide breakthroughs)
+        for (const t of tanks) {
+            if (t.dead || t.owner === this.owner) continue;
+            const d = haversineDist(this.lat, this.lon, t.lat, t.lon);
+            if (d < bestD) { bestD = d; best = { kind: 'tank', obj: t }; }
+        }
+        if (!best || bestD > R) {
+            best = null; bestD = R;
+            // Priority 2: enemy structures (armor shreds buildings)
+            for (const s of structs) {
+                if (s.dead || s.owner === this.owner || s.owner === 'neutral') continue;
+                const d = haversineDist(this.lat, this.lon, s.lat, s.lon);
+                if (d < bestD) { bestD = d; best = { kind: 'struct', obj: s }; }
+            }
+        }
+        if (!best) {
+            // Priority 3: enemy troop cohorts in the open
+            for (const tc of troopCohorts) {
+                if (tc.dead || tc.owner === this.owner) continue;
+                const ll = vec3ToLatLon(tc.mesh.position);
+                const d = haversineDist(this.lat, this.lon, ll.lat, ll.lon);
+                if (d < bestD) { bestD = d; best = { kind: 'cohort', obj: tc }; }
+            }
+        }
+        this.target = best;
+    }
+    _validateTarget() {
+        const t = this.target;
+        if (!t) return;
+        const p = this._posOf(t);
+        if (!p || haversineDist(this.lat, this.lon, p.lat, p.lon) > this.cfg.engageR) this.target = null;
+    }
+    _posOf(t) {
+        const o = t.obj;
+        if (!o || o.dead) return null;
+        if (t.kind === 'cohort' && o.mesh) { const ll = vec3ToLatLon(o.mesh.position); return { lat: ll.lat, lon: ll.lon }; }
+        return { lat: o.lat, lon: o.lon };
+    }
+
+    // ── gunnery: flat direct-fire tracer (tank engagement) ──
+    _fire(t, tp) {
+        const dmg = this.cfg.gunDmg;
+        const muzzle = this.mesh.position.clone().addScaledVector(this.mesh.position.clone().normalize(), 4);
+        _tracer(muzzle, latLonToVec3(tp.lat, tp.lon, EARTH_RADIUS + 2), 0xffcc55);
+        spawnExp(this.lat, this.lon, 1.2, '#ffee99');   // muzzle flash
+        this.fireCd = this.cfg.fireRate;
+        this.shots++;
+        if (t.kind === 'tank') {
+            t.obj.hit(dmg);
+        } else if (t.kind === 'cohort') {
+            const kill = Math.floor(dmg * this.cfg.troopMul * 12);
+            t.obj.troops -= kill;
+            if (t.obj.troops <= 0 && !t.obj.dead) {
+                t.obj.dead = true;
+                scene.remove(t.obj.mesh);
+                if (t.obj.mesh.material) t.obj.mesh.material.dispose();
+            }
+        } else {
+            t.obj.hit(dmg * this.cfg.structMul);
+        }
+        if (SFX && SFX.gun) SFX.gun();
+    }
+
+    // ── movement: tangent-plane step with coast avoidance ──
+    _stepToward(tLat, tLon, km) {
+        if (this._tryStep(tLat, tLon, km, 0)) return true;
+        for (const a of [0.7, -0.7, 1.4, -1.4, 2.1, -2.1]) {
+            if (this._tryStep(tLat, tLon, km, a)) return true;   // follow the coastline
+        }
+        return false;
+    }
+    _tryStep(tLat, tLon, km, ang) {
+        const n = _tkV1.copy(this.mesh.position).normalize();
+        const tgt = _tkV2.copy(latLonToVec3(tLat, tLon, 1)).normalize();
+        const d = _tkV3.copy(tgt).addScaledVector(n, -tgt.dot(n));
+        if (d.lengthSq() < 1e-9) return false;
+        d.normalize();
+        if (ang) d.applyAxisAngle(n, ang);
+        const arc = km / 6371;   // km → radians on the unit sphere
+        const next = _tkV4.copy(n).multiplyScalar(Math.cos(arc)).addScaledVector(d, Math.sin(arc));
+        const ll = vec3ToLatLon(next);
+        if (!Tank.LAND_OK(ll.lat, ll.lon)) return false;
+        this.lat = ll.lat; this.lon = ll.lon;
+        this.mesh.position.copy(next.clone().multiplyScalar(this._radius));
+        this._lastDir = d.clone();
+        return true;
+    }
+
+    _advance() {
+        const C = GAME_CONSTANTS;
+        const d = haversineDist(this.lat, this.lon, this.tgtLat, this.tgtLon);
+        if (d <= 40) { this.mode = 'hold'; return; }   // arrived — hold ground, keep scanning
+        if (this._stepToward(this.tgtLat, this.tgtLon, Math.min(this.cfg.speed, d))) {
+            this.mode = 'advance';
+            // SPEARHEAD: divisions advancing through non-owned land claim a
+            // corridor behind them — armor opens the way for the army.
+            if (window.gameMode === 'mode1' && conquestGrid && (frame + this.id) % C.TANK_CORRIDOR_EVERY === 0) {
+                const o = getPixelOwner(this.lat, this.lon);
+                if (o !== this.owner && o !== 'water') {
+                    paintCircleOnLandDirect(this.lat, this.lon, C.TANK_CORRIDOR_R_KM, this.owner);
+                }
+            }
+        } else {
+            this.mode = 'hold';   // boxed in by water — hold
+        }
+    }
+
+    _face(tp) {
+        const n = _tkV3.copy(this.mesh.position).normalize();
+        const tv = _tkV4.copy(latLonToVec3(tp.lat, tp.lon, 1)).normalize();
+        this._faceVec = tv.addScaledVector(n, -tv.dot(n)).normalize().clone();
+    }
+    _orient() {
+        const nrm = _tkV1.copy(this.mesh.position).normalize();
+        this.mesh.up.copy(nrm);
+        const look = this._faceVec || this._lastDir;
+        if (look) {
+            // lookAt aims +Z at a point ahead along the facing — models are
+            // built nose-+Z, so divisions drive/engage nose-first.
+            _tkV2.copy(nrm).multiplyScalar(this._radius).addScaledVector(look, 20);
+            this.mesh.lookAt(_tkV2);
+        }
+    }
+
+    // ── main tick (60fps logic) ──
+    update() {
+        if (this.dead) return;
+        const C = GAME_CONSTANTS;
+        if (this.selRing) this.selRing.visible = !!this.selected;
+        if (this.fireCd > 0) this.fireCd--;
+        if (--this.retargetT <= 0) { this.retargetT = 30; this._retarget(); }
+        else this._validateTarget();
+        const t = this.target;
+        const tp = t ? this._posOf(t) : null;
+        if (tp && haversineDist(this.lat, this.lon, tp.lat, tp.lon) <= this.cfg.gunRange) {
+            this.mode = 'combat';
+            this._face(tp);
+            if (this.fireCd <= 0) this._fire(t, tp);
+            // Tank battles paint devastation — pounded ground falls faster
+            if ((frame + this.id) % 90 === 0 && conquestGrid && conquestGrid.applyDevastation) {
+                conquestGrid.applyDevastation(this.lat, this.lon, C.TANK_BATTLE_DEV_R, 0.2);
+            }
+        } else {
+            if (tp) this._faceVec = null;   // out of gun range: re-face the march axis
+            this._advance();
+        }
+        this._orient();
+    }
+}
+
+// Central spawn (caps enforced by callers): player click-path + bots + online sync
+function spawnTankDivision(lat, lon, key, owner, opts = {}) {
+    const d = new Tank(lat, lon, key, owner, opts);
+    tanks.push(d);
+    return d;
+}
 
 // TASK-204 launch-point picker — silo/rail from the nearest READY launcher,
 // or a SUBSURFACE pop-up from the nearest owned PORT when the sea approach
@@ -9781,6 +10195,14 @@ function applyOpponentAction(action) {
     if(action.type === 'spawn_plane') {
         planes.push(new Plane(action.lat, action.lon, PCFG[action.ptype], oS));
     }
+    if (action.type === 'tank_spawn') {
+        // TASK-302: remote armor deployment — mirror the division locally
+        if (TCFG[action.tkey]) spawnTankDivision(action.lat, action.lon, action.tkey, oS, { tgtLat: action.tlat, tgtLon: action.tlon });
+    }
+    if (action.type === 'tank_move') {
+        const t = tanks.find(q => q.owner === oS && q.id === action.tid);
+        if (t && !t.dead) t.setMoveTarget(action.tlat, action.tlon);
+    }
     if (action.type === 'troop_attack') {
         troopCohorts.push(new TroopCohort(
             action.slat, action.slon,
@@ -10215,12 +10637,13 @@ function getSelectedUnits() {
     return {
         planes: planes.filter(p => p.selected && p.owner === myRole && !p.dead),
         warships: warships.filter(w => w.selected && w.owner === myRole && !w.dead),
+        tanks: tanks.filter(t => t.selected && t.owner === myRole && !t.dead),
         structs: structs.filter(s => s.selected && s.owner === myRole && !s.dead)
     };
 }
 
 function clearSelection() {
-    [...structs, ...planes, ...warships].forEach(e => e.selected = false);
+    [...structs, ...planes, ...warships, ...tanks].forEach(e => e.selected = false);
     document.getElementById('selPan').style.display = 'none';
     attackMoveMode = false;
     document.getElementById('tgtMsg').style.display = 'none';
@@ -10245,13 +10668,13 @@ function _refreshCommandCard() {
 
 function updateSelectionPanel() {
     let sel = getSelectedUnits();
-    let total = sel.planes.length + sel.structs.length + sel.warships.length;
+    let total = sel.planes.length + sel.structs.length + sel.warships.length + sel.tanks.length;
     if(total === 0) { document.getElementById('selPan').style.display = 'none'; return; }
     
     document.getElementById('selPan').style.display = 'block';
     
     if(total === 1) {
-        let unit = sel.planes[0] || sel.warships[0] || sel.structs[0];
+        let unit = sel.planes[0] || sel.warships[0] || sel.tanks[0] || sel.structs[0];
         const structNames = {
             city: 'مدينة', port: 'ميناء تجاري', factory: 'مصنع حربي', airport: 'مطار عسكري',
             launcher: 'منصة إطلاق', radar: 'رادار', sam: 'SAM باتريوت', flak: 'مضاد FLAK',
@@ -10306,6 +10729,14 @@ function updateSelectionPanel() {
             if (unit.hullClass === 'drone') statsHtml += `<div class="sstat"><span>الأسراب</span><span>${drones.filter(d => !d.dead && d.home === unit).length}/${unit.hull.swarmCap} 🛩️</span></div>`;
             if (unit.hullClass === 'escort') statsHtml += `<div class="sstat"><span>الدفاع</span><span>اعتراض ${unit.hull.pdRange}كم 🛡️</span></div>`;
             if (unit.hullClass === 'missile') statsHtml += `<div class="sstat"><span>التسليح</span><span>VLS 🚀</span></div>`;
+        } else if (unit instanceof Tank) {
+            // TASK-302: division readout — strength, mode, kill tally
+            const modeAr = { advance: 'زحف ⚔', combat: 'اشتباك 🔥', hold: 'تمركز 🛡️' }[unit.mode] || unit.mode;
+            statsHtml += `<div class="sstat"><span>الوضع</span><span>${modeAr}</span></div>`;
+            statsHtml += `<div class="sstat"><span>دروع</span><span>${unit.members.length}/${unit.members0} 🚜</span></div>`;
+            statsHtml += `<div class="sstat"><span>مدفع</span><span>${unit.cfg.gunDmg} · ${unit.cfg.gunRange}كم</span></div>`;
+            statsHtml += `<div class="sstat"><span>تحصين</span><span>-${Math.round(unit.cfg.armor * 100)}%</span></div>`;
+            if (unit.shots) statsHtml += `<div class="sstat"><span>طلقات</span><span>${unit.shots}</span></div>`;
         } else if (unit.mode) {
             statsHtml += `<div class="sstat"><span>وضع</span><span>${unit.mode}</span></div>`;
         }
@@ -10316,6 +10747,7 @@ function updateSelectionPanel() {
         let info = [];
         if(sel.planes.length) info.push(`✈ ${sel.planes.length} طائرة`);
         if(sel.warships.length) info.push(`🚢 ${sel.warships.length} سفينة`);
+        if(sel.tanks.length) info.push(`🚜 ${sel.tanks.length} فرقة`);
         if(sel.structs.length) info.push(`🏗 ${sel.structs.length} مبنى`);
         document.getElementById('selStats').innerHTML = 
             `<div class="sstat"><span>${info.join(' | ')}</span></div>`;
@@ -10441,6 +10873,12 @@ window.addEventListener('keydown', e => {
         return;
     }
 
+    // H: tank division slot (hotbar) — TASK-302
+    if (e.code === 'KeyH' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        if (window.__hotbarKey) window.__hotbarKey('H');
+        return;
+    }
+
     // T / Y: attack ratio down / up (OpenFront attackRatioDown/Up)
     if (e.code === 'KeyT' || e.code === 'KeyY') {
         const cur = window.__UI_API ? window.__UI_API.troopPct() : 50;
@@ -10468,14 +10906,15 @@ window.addEventListener('keydown', e => {
         return;
     }
 
-    // F: select all my planes + warships (OpenFront selectAllWarships analogue)
+    // F: select all my planes + warships + tank divisions (OpenFront selectAllWarships analogue)
     if (e.code === 'KeyF' && !e.repeat) {
         clearSelection();
-        let n = 0, m = 0;
+        let n = 0, m = 0, k = 0;
         planes.forEach(p => { if (p.owner === myRole && !p.dead) { p.selected = true; n++; } });
         warships.forEach(w => { if (w.owner === myRole && !w.dead) { w.selected = true; m++; } });
+        tanks.forEach(t => { if (t.owner === myRole && !t.dead) { t.selected = true; k++; } });
         updateSelectionPanel();
-        logEvent(`تم تحديد ${n} طائرة ✈️${m ? ` و ${m} مدمرة ⚓` : ''} — انقر الخريطة لإصدار الأوامر`, 'info');
+        logEvent(`تم تحديد ${n} طائرة ✈️${m ? ` و ${m} مدمرة ⚓` : ''}${k ? ` و ${k} فرقة مدرعة 🚜` : ''} — انقر الخريطة لإصدار الأوامر`, 'info');
         return;
     }
 
@@ -10742,6 +11181,18 @@ window.addEventListener('click', async e => {
             logEvent(`⛵ اتجهت ${selShips.length} مدمرة إلى نقطة الدورية الجديدة`, 'info');
             return;
         }
+        // TASK-302: tank division orders — land click = march order (the
+        // division fights anything hostile en route and paints its corridor)
+        const selTanks = tanks.filter(t => t.selected && !t.dead && t.owner === myRole);
+        if (selTanks.length && isLand(loc.lat, loc.lon)) {
+            selTanks.forEach((t, idx) => {
+                const off = idx === 0 ? 0 : (idx % 2 === 0 ? 1 : -1) * Math.ceil(idx / 2) * 0.2;
+                t.setMoveTarget(loc.lat + off * 0.45, loc.lon - off * 0.45);   // spread the divisions
+                if (isOnline) sendAction({ type: 'tank_move', tid: t.id, tlat: t.tgtLat, tlon: t.tgtLon });
+            });
+            logEvent(`🚜 اتجهت ${selTanks.length} فرقة مدرعة نحو الهدف — ستشق طريقها وتقاتل ما يعترضها`, 'info');
+            return;
+        }
         if (selPlanes.length) {
             const tOwner = isLand(loc.lat, loc.lon) ? getPixelOwner(loc.lat, loc.lon) : 'water';
             const enemyLand = tOwner !== 'water' && tOwner !== myRole;
@@ -10804,6 +11255,35 @@ window.addEventListener('click', async e => {
     }
 
     if(buildMode) {
+        // ── TANK DIVISION: mobile land unit — click LAND to set its march
+        //    objective. Class comes from the hotbar H cycle (tankBuildClass);
+        //    the division rolls out of the nearest own WAR FACTORY. ──
+        if (buildMode === 'tank') {
+            const C = GAME_CONSTANTS;
+            const cfg = TCFG[tankBuildClass] || TCFG.medium;
+            if (!isLand(loc.lat, loc.lon)) {
+                document.getElementById('bldMsg').textContent = `${cfg.name} تُنشر على اليابسة! انقر نقطة برية باتجاه الهدف.`;
+                return;
+            }
+            if (pRes < cfg.cost) { document.getElementById('bldMsg').textContent = 'لا توجد موارد كافية!'; return; }
+            const mineSame = tanks.reduce((n, t) => n + (!t.dead && t.owner === 'player' && t.key === tankBuildClass ? 1 : 0), 0);
+            if (mineSame >= cfg.cap) { document.getElementById('bldMsg').textContent = `الحد الأقصى لـ${cfg.name} نشط (${cfg.cap})! 🚜`; return; }
+            const mineTotal = tanks.reduce((n, t) => n + (!t.dead && t.owner === 'player' ? 1 : 0), 0);
+            if (mineTotal >= C.TANK_CAP_TOTAL) { document.getElementById('bldMsg').textContent = `الحد الأقصى للفرق المدرعة نشط (${C.TANK_CAP_TOTAL})! 🚜`; return; }
+            const fac = structs.filter(s => !s.dead && s.owner === 'player' && s.type === 'factory')
+                .sort((a, b) => haversineDist(a.lat, a.lon, loc.lat, loc.lon) - haversineDist(b.lat, b.lon, loc.lat, loc.lon))[0];
+            if (!fac) { document.getElementById('bldMsg').textContent = 'تحتاج مصنع حرب لنشر المدرعات! 🏭'; return; }
+            pRes -= cfg.cost;
+            spawnTankDivision(fac.lat, fac.lon, tankBuildClass, 'player', { tgtLat: loc.lat, tgtLon: loc.lon });
+            if (isOnline) sendAction({ type: 'tank_spawn', lat: fac.lat, lon: fac.lon, tkey: tankBuildClass, tlat: loc.lat, tlon: loc.lon });
+            spawnExp(fac.lat, fac.lon, 3, '#ffcc66');
+            logEvent(`🏭 ${cfg.icon} ${cfg.name} خرجت من المصنع! ($${cfg.cost})`, 'info');
+            buildMode = null;
+            document.getElementById('bldMsg').textContent = 'جاهز';
+            if (window.__refreshHotbar) window.__refreshHotbar();
+            updateHUD();
+            return;
+        }
         // ── WARSHIP: mobile naval unit — click WATER to set its patrol point.
         //    Hull class comes from the hotbar V cycle (warshipBuildClass). ──
         if (buildMode === 'warship') {
@@ -11278,7 +11758,7 @@ function initWorld(difficulty, pCountryKey='usa', eCountryKey='random', gameMode
 
     structs = []; missiles = []; planes = []; drones = []; aamMissiles = []; exps = []; particles = [];
     tradeShips = []; trains = []; troopCohorts = []; transportShips = []; warships = [];
-    window.paintExpansions = [];
+tanks = [];   // TASK-302
     conquestGrid = null; activeAttacks = [];   // reset conquest system for new game
 
     // Build the conquest grid early so the flat land/water map is visible during
@@ -12534,6 +13014,48 @@ function runAI() {
             _spendRes(riv, PCFG[pick.k].cost);
         }
     }
+
+    // 6. AI LAND FORCES (TASK-302): rivals with a war factory field tank
+    //    divisions and drive them at the frontline — armor spearheads paint
+    //    corridors the troops can exploit, and shred what they reach.
+    if (window.gameMode === 'mode1' && frame % GAME_CONSTANTS.AI_TICK_RATE === 0) {
+        for (const riv of _rivals()) {
+            const myTanks = tanks.reduce((n, t) => n + (!t.dead && t.owner === riv.str ? 1 : 0), 0);
+            // Purchase: weighted mix (lights early, Tigers when rich).
+            // Bots don't build factories (section 3 builds base/launcher/
+            // airport/port) — fall back to their base as the muster point.
+            if (myTanks < GAME_CONSTANTS.TANK_AI_CAP && _resOf(riv) > 900 && Math.random() < 0.25) {
+                const fac = structs.find(s => !s.dead && s.owner === riv.str && s.type === 'factory')
+                    || structs.find(s => !s.dead && s.owner === riv.str && s.type === 'base');
+                if (fac) {
+                    const roll = Math.random();
+                    const k = roll < 0.4 ? 'light' : roll < 0.8 ? 'medium' : 'heavy';
+                    const cfg = TCFG[k];
+                    if (_resOf(riv) >= cfg.cost + 300) {
+                        // muster at the base, fan out to a spread holding point
+                        // (the frontal re-aim below re-tasks them as the line moves)
+                        spawnTankDivision(fac.lat, fac.lon, k, riv.str,
+                            { tgtLat: fac.lat + rnd(-0.5, 0.5), tgtLon: fac.lon + rnd(-0.5, 0.5) });
+                        _spendRes(riv, cfg.cost);
+                    }
+                }
+            }
+            // Re-aim existing divisions at the current frontline (it moves)
+            if (myTanks > 0 && frame % (GAME_CONSTANTS.AI_TICK_RATE * 6) === 0 && conquestGrid && conquestGrid._maskReady) {
+                let tgt = null;
+                for (const other of _rivals()) {
+                    if (other.str === riv.str) continue;
+                    const fr = conquestGrid.findFrontlineTarget(riv.str, other.str);
+                    if (fr) { const ll = conquestGrid.cellToLatLon(fr.srcCell); tgt = ll; break; }
+                }
+                if (tgt) {
+                    for (const t of tanks) {
+                        if (!t.dead && t.owner === riv.str) t.setMoveTarget(tgt.lat + rnd(-0.3, 0.3), tgt.lon + rnd(-0.3, 0.3));
+                    }
+                }
+            }
+        }
+    }
 }
 
 // Fixed-timestep game loop: logic always runs at exactly 60 ticks/sec of GAME
@@ -12680,6 +13202,7 @@ function gameFrame() {
     _compactAlive(tradeShips, ts => ts.update());
     _compactAlive(transportShips, ts => ts.update());
     _compactAlive(warships, w => w.update());
+    _compactAlive(tanks, t => t.update());   // TASK-302: armored divisions
     _compactAlive(drones, d => d.update());   // TASK-202 swarm drones
     _compactAlive(trains, t => t.update());
     _compactAlive(troopCohorts, tc => tc.update());
@@ -12948,6 +13471,7 @@ function backToMenu() {
     tradeShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
     transportShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
     warships.forEach(w => { if(w.mesh) { scene.remove(w.mesh); disposeMeshDeep(w.mesh); } w.shells.forEach(sh => scene.remove(sh.mesh)); });
+    tanks.forEach(t => { if(t.mesh) { scene.remove(t.mesh); disposeMeshDeep(t.mesh); } if(t.selRing && t.selRing.material) t.selRing.material.dispose(); });   // TASK-302
     drones.forEach(d => { if(d.mesh) { scene.remove(d.mesh); disposeMeshDeep(d.mesh); } });
     trains.forEach(t => { if(t.mesh) { scene.remove(t.mesh); disposeMeshDeep(t.mesh); } if(t.pathLine) { scene.remove(t.pathLine); disposeMeshDeep(t.pathLine); } });
     troopCohorts.forEach(tc => { if(tc.mesh) { scene.remove(tc.mesh); disposeMeshDeep(tc.mesh); } });
@@ -12960,6 +13484,7 @@ function backToMenu() {
     cleanupTerritory();
     structs = []; missiles = []; planes = []; drones = []; exps = []; particles = [];
     tradeShips = []; trains = []; troopCohorts = []; transportShips = []; warships = [];
+    tanks = [];   // TASK-302
     transients = []; craterDecals = [];
     isOnline = false;
     document.getElementById('go')?.classList.remove('show');
@@ -13320,6 +13845,10 @@ window.__UI_API = {
             const hull = GAME_CONSTANTS.HULL_CLASSES[warshipBuildClass];
             logEvent(`${hull.icon} وضع النشر: ${hull.name} ($${cost}، الحد ${hull.cap}) — انقر نقطة بحرية قرب مينائك · اضغط V للتبديل`, 'info');
         }
+        else if (type === 'tank') {
+            const cfg = TCFG[tankBuildClass];
+            logEvent(`${cfg.icon} وضع الانتشار: ${cfg.name} ($${cost}، الحد ${cfg.cap}) — انقر أرضاً باتجاه الهدف · اضغط H للتبديل`, 'info');
+        }
         else logEvent(`🏗️ وضع البناء: ${SDEFS[type] ? SDEFS[type].name : type} ($${cost}) — انقر موقعاً داخل أراضيك`, 'info');
     },
     fireMissileAt: (mtype, lat, lon) => {
@@ -13360,6 +13889,10 @@ window.__UI_API = {
         if (type === 'warship') {   // TASK-202: fleet slot prices the ARMED hull class
             const h = GAME_CONSTANTS.HULL_CLASSES[warshipBuildClass];
             return h ? h.cost : (SDEFS.warship ? SDEFS.warship.cost : 0);
+        }
+        if (type === 'tank') {       // TASK-302: armor slot prices the ARMED division class
+            const c = TCFG[tankBuildClass];
+            return c ? c.cost : (SDEFS.tank ? SDEFS.tank.cost : 0);
         }
         return SDEFS[type] ? SDEFS[type].cost : 0;
     },
@@ -13406,6 +13939,9 @@ window.__UI_API = {
 // ════════════════════════════════════════════════════════════════════════
 const HULL_ORDER = ['destroyer', 'escort', 'missile', 'drone', 'carrier', 'transport'];
 let warshipBuildClass = 'destroyer';
+// TASK-302: tank division classes cycle on repeated H while the slot is armed
+const TANK_ORDER = ['light', 'medium', 'heavy'];
+let tankBuildClass = 'medium';
 
 const HOTBAR_SLOTS = [
     { key: '1', type: 'city',       icon: '🏙️', label: 'مدينة',  tip: 'يرفع سقف القوات +25k' },
@@ -13420,6 +13956,7 @@ const HOTBAR_SLOTS = [
     { key: '0', type: 'nuke_plant', icon: '☢️', label: 'مفاعل',  tip: 'دخل ضخم متأخر' },
     { key: 'V', type: 'warship',    icon: '🛳️', label: 'أسطول',  tip: 'V للتبديل: مدمرة/فرقاطة/طراد/درون/حاملة/إنزال — انقر ماءً للنشر' },
     { key: 'N', type: 'drone',     icon: '🛸', label: 'درون',   tip: 'وضع الدرونات — أنقر الخريطة لنشر أسراب/استطلاع/صائدة صواريخ' },
+    { key: 'H', type: 'tank',      icon: '🚜', label: 'مدرعات',  tip: 'H للتبديل: استطلاع/قتال/اختراق — انقر أرضاً لنشر الفرقة من أقرب مصنع حربي' },
 ];
 
 function _buildHotbarDom() {
@@ -13462,6 +13999,13 @@ window.__refreshHotbar = function () {
             el.querySelector('.hicon').textContent = hull.icon;
             el.querySelector('.hname').textContent = hull.name;
             el.querySelector('.hcnt').textContent = `${count}/${hull.cap}`;
+        } else if (slot.type === 'tank') {
+            // TASK-302: live slot = the armed division class (H cycling)
+            const cfg = TCFG[tankBuildClass];
+            const same = tanks.reduce((n, t) => n + (!t.dead && t.owner === 'player' && t.key === tankBuildClass ? 1 : 0), 0);
+            el.querySelector('.hicon').textContent = cfg.icon;
+            el.querySelector('.hname').textContent = cfg.name;
+            el.querySelector('.hcnt').textContent = `${same}/${cfg.cap}`;
         } else if (slot.type === 'drone') {
             count = drones.reduce((n, d) => n + (!d.dead && d.owner === 'player' ? 1 : 0), 0);
             el.querySelector('.hcnt').textContent = count;
@@ -13497,6 +14041,15 @@ window.__hotbarKey = function (key) {
         warshipBuildClass = HULL_ORDER[(i + 1) % HULL_ORDER.length];
         const hull = GAME_CONSTANTS.HULL_CLASSES[warshipBuildClass];
         logEvent(`⚓ الهيكل التالي: ${hull.icon} ${hull.name} ($${hull.cost}، الحد ${hull.cap}) — ${hull.tip || 'انقر ماءً للنشر'}`, 'info');
+        window.__refreshHotbar();
+        return;
+    }
+    // H CYCLES TANK CLASSES while the armor slot is armed (TASK-302)
+    if (slot.type === 'tank' && buildMode === 'tank') {
+        const i = TANK_ORDER.indexOf(tankBuildClass);
+        tankBuildClass = TANK_ORDER[(i + 1) % TANK_ORDER.length];
+        const cfg = TCFG[tankBuildClass];
+        logEvent(`🚜 الفرقة التالية: ${cfg.icon} ${cfg.name} ($${cfg.cost}، الحد ${cfg.cap}) — ${cfg.tip}`, 'info');
         window.__refreshHotbar();
         return;
     }
@@ -13884,5 +14437,128 @@ window.navalBattleTest = async function () {
     R.pass = ok >= 6;   // transport may legitimately survive if sunk early by missiles
     log(`RESULT: ${R.pass ? 'PASS' : 'FAIL'} (${ok}/${checks.length} checks) — window.__navalTestResult`);
     logEvent(R.pass ? '🧪 اختبار البحرية: نجح ✅' : '🧪 اختبار البحرية: فشل ❌ — انظر الكونسول', R.pass ? 'info' : 'err');
+    return R;
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+//  TASK-302: TANK SYSTEM PROBES
+//  tankCheck()      — model sanity: every class builds, mesh counts, source
+//  tankBattleTest() — two divisions engage: shots fired, hp drops, one
+//                    destroyed, devastation painted. Uses __pumpGame so it
+//                    works in hidden tabs (RAF-starved) like the naval test.
+// ═══════════════════════════════════════════════════════════════════════
+window.tankCheck = function () {
+    const out = {};
+    for (const key of Object.keys(TCFG)) {
+        try {
+            const m = buildTankModel(key, 0x00aaff);
+            let n = 0;
+            m.traverse(o => { if (o.isMesh) n++; });
+            m.updateMatrixWorld(true);
+            const bb = new THREE.Box3().setFromObject(m);
+            const size = new THREE.Vector3(); bb.getSize(size);
+            // Nose diagnostic: the gun barrel protrudes at the FRONT — the
+            // bbox extends further from the origin on the nose side (+Z).
+            const back = Math.abs(bb.min.z), front = Math.abs(bb.max.z);
+            out[key] = {
+                meshes: n,
+                src: TANK_MODELS[key] ? 'fbx' : 'procedural',
+                len: +Math.max(size.x, size.z).toFixed(1),
+                registry: !!TANK_MODELS[key],
+                nose: front > back * 1.15 ? '+Z ✓' : back > front * 1.15 ? '-Z (BACKWARDS)' : 'symmetric'
+            };
+            m.traverse(o => { if (o.isMesh && o.material && o.material.userData && o.material.userData.accent) o.material.dispose(); });
+        } catch (e) { out[key] = 'ERR: ' + e.message; }
+    }
+    out._caps = { total: GAME_CONSTANTS.TANK_CAP_TOTAL };
+    out._cfg = Object.keys(TCFG).map(k => `${k}:${TCFG[k].cost}$/hp${TCFG[k].hp}/gun${TCFG[k].gunDmg}`);
+    console.log('[TANK-CHECK]', out);
+    return out;
+};
+
+window.tankBattleTest = async function () {
+    const log = (m) => console.log('%c[TANK-TEST] ' + m, 'color:#ffaa44;font-weight:bold');
+    if (!scene || gOver) { log('Start a game first (mode 1).'); return 'no scene'; }
+    logEvent('🧪 اختبار المعركة البرية بدأ — راقب الكونسول', 'info');
+
+    // ── isolate: clear every division ──
+    clearSelection();
+    for (const t of tanks) { if (!t.dead) t._destroy(); }
+    tanks.length = 0;
+
+    // ── theater: USA midlands (LAND, far from most spawn points) ──
+    const A = { lat: 39.0, lon: -98.5 };   // player heavy division
+    const B = { lat: 38.2, lon: -97.5 };   // enemy medium division (~125km apart)
+    if (!isLand(A.lat, A.lon) || !isLand(B.lat, B.lon)) { log('Theater not on land?!'); return 'bad theater'; }
+    const p = spawnTankDivision(A.lat, A.lon, 'heavy', 'player', { tgtLat: B.lat, tgtLon: B.lon });
+    const e = spawnTankDivision(B.lat, B.lon, 'medium', 'enemy', { tgtLat: A.lat, tgtLon: A.lon });
+
+    const devBefore = (window.__ffaProbe && conquestGrid) ? window.__ffaProbe.devAt(A.lat, A.lon) : 0;
+    const R = { t: 0, engaged: false, hpDropped: false, destroyed: false, shots: 0,
+                devPainted: false, attrition: false, pass: false, notes: [] };
+    window.__tankTestResult = R;
+
+    // Phase 1: 6s — guns open up
+    await window.__pumpGame(360);
+    R.t = 6;
+    R.shots = p.shots + e.shots;
+    R.engaged = R.shots > 0;
+    R.hpDropped = (p.hp < p.maxHp) || (e.hp < e.maxHp);
+    R.attrition = (p.members.length < p.members0) || (e.members.length < e.members0);
+    log(`t=6s shots=${R.shots} pHp=${Math.round(p.hp)}/${p.maxHp} eHp=${Math.round(e.hp)}/${e.maxHp} modes=${p.mode}/${e.mode}`);
+    if (!R.engaged) R.notes.push('no shots in 6s — check engage/gun ranges');
+
+    // Phase 2: up to 60s — fight to the finish
+    let steps = 0;
+    while (steps < 27 && !p.dead && !e.dead) {
+        await window.__pumpGame(120);
+        steps++;
+    }
+    R.t = 6 + steps * 2;
+    R.destroyed = p.dead || e.dead;
+    R.shots = p.shots + e.shots;
+    // re-sample attrition at the END (t=6s may predate the first knock-outs)
+    R.attrition = (p.members.length < p.members0) || (e.members.length < e.members0);
+    if (conquestGrid && window.__ffaProbe) {
+        const devAfter = window.__ffaProbe.devAt(A.lat, A.lon);
+        R.devPainted = devAfter > devBefore + 0.01;
+    }
+    log(`t=${R.t}s destroyed=${R.destroyed} (pDead=${p.dead}, eDead=${e.dead}) totalShots=${R.shots} dev=${R.devPainted}`);
+
+    // ── verdict ──
+    const checks = [
+        ['ENGAGE (guns fired)', R.engaged],
+        ['DAMAGE (hp dropped)', R.hpDropped],
+        ['KILL (a division destroyed)', R.destroyed],
+        ['DEVASTATION (battle painted)', R.devPainted],
+        ['ATTRITION (vehicles knocked out)', R.attrition],
+    ];
+    let ok = 0;
+    for (const [name, pass] of checks) { if (pass) ok++; log(`${pass ? '✅' : '❌'} ${name}`); }
+    R.pass = ok >= 4;
+    log(`RESULT: ${R.pass ? 'PASS' : 'FAIL'} (${ok}/${checks.length}) — window.__tankTestResult`);
+    logEvent(R.pass ? '🧪 اختبار المدرعات: نجح ✅' : '🧪 اختبار المدرعات: فشل ❌ — انظر الكونسول', R.pass ? 'info' : 'err');
+    return R;
+};
+
+// Corridor/march probe: a light division crossing neutral land must paint a
+// spearhead corridor (mode 1, grid ready). Gracefully skips if the whole
+// path already belongs to the player.
+window.tankMarchTest = async function () {
+    const log = (m) => console.log('%c[TANK-MARCH] ' + m, 'color:#aaff44;font-weight:bold');
+    if (!scene || gOver) { log('Start a game first (mode 1).'); return 'no scene'; }
+    if (!conquestGrid || !conquestGrid._maskReady) { log('No conquest grid yet.'); return 'no grid'; }
+    clearSelection();
+    const A = { lat: 41.5, lon: -101.0 }, B = { lat: 43.0, lon: -95.5 };
+    if (!isLand(A.lat, A.lon) || !isLand(B.lat, B.lon)) { log('Theater not on land.'); return 'bad theater'; }
+    const midOwnerBefore = getPixelOwner((A.lat + B.lat) / 2, (A.lon + B.lon) / 2);
+    if (midOwnerBefore === 'player') { log('Path already player-owned — corridor unverifiable here. SKIP(ok).'); return 'skip-owned'; }
+    const d = spawnTankDivision(A.lat, A.lon, 'light', 'player', { tgtLat: B.lat, tgtLon: B.lon });
+    await window.__pumpGame(700);   // ~11s × 1.9km/f ≈ 1250km — enough to arrive
+    const mid = getPixelOwner((A.lat + B.lat) / 2, (A.lon + B.lon) / 2);
+    const arrived = haversineDist(d.lat, d.lon, B.lat, B.lon) < 60;
+    const R = { corridorPainted: mid === 'player', arrived, moved: haversineDist(d.lat, d.lon, A.lat, A.lon) > 50, dead: d.dead };
+    window.__tankMarchResult = R;
+    log(`corridor=${R.corridorPainted} arrived=${R.arrived} moved=${Math.round(R.moved)}km`);
     return R;
 };
