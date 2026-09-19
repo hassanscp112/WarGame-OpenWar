@@ -324,6 +324,11 @@ export class ConquestGrid {
     this._dirty = true;                  // full repaint needed
     this._dirtyCells = new Set();        // incremental: cell indices changed
     this._borderCells = new Set();       // cells currently drawn as territory borders
+    // TASK-506 OPTIMIZE: scratch buffers reused across incremental flushes
+    // (the flush path runs on every conquest tick — the old code allocated a
+    // fresh Set + Array per call; classic churn at 10 ticks/s × N attacks).
+    this._recheckScratch = new Set();
+    this._nbScratch = new Int32Array(4);
     this._countsOther = new Map();        // bot owner code → owned cell count (O(1) countCells)
     this._devastation = new Float32Array(cfg.GRID_W * cfg.GRID_H);  // TASK-102 blast-weakening layer
     this._devCursor = 0;                  // rotating decay cursor (legacy, kept for API compat)
@@ -1267,8 +1272,9 @@ export class ConquestGrid {
     } else if (this._dirtyCells.size > 0) {
       // ── Incremental: repaint dirty cells, then fix borders for affected cells ──
       // Collect all cells whose border status might have changed: dirty cells + neighbors
-      const recheck = new Set();
-      const nbBuf = [0, 0, 0, 0];
+      const recheck = this._recheckScratch;
+      recheck.clear();
+      const nbBuf = this._nbScratch;
       for (const cell of this._dirtyCells) {
         recheck.add(cell);
         const n = this.neighbors4(cell, nbBuf);

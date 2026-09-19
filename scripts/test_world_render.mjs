@@ -35,8 +35,9 @@ class CanvasTexture { constructor(img) { this.image = img; this.needsUpdate = fa
 class SphereGeometry { constructor(...a) { this.args = a; } dispose() { this.disposed = true; } }
 class RingGeometry { constructor(...a) { this.args = a; } dispose() { this.disposed = true; } }
 class BufferGeometry {
-  constructor() { this.attributes = {}; }
+  constructor() { this.attributes = {}; this.drawRange = { start: 0, count: Infinity }; }
   setAttribute(n, a) { this.attributes[n] = a; return this; }
+  setDrawRange(s, c) { this.drawRange.start = s; this.drawRange.count = c; }
   computeBoundingSphere() {}
   dispose() { this.disposed = true; }
 }
@@ -219,8 +220,10 @@ console.log('\n[B] world/render.js — overlay/frontier/flash/heat/rings/reset')
   ok(WORLD.state.frontierLine instanceof LineSegments, 'B2 frontier line built after throttle');
   ok(WORLD.state.frontierLine.visible === true, 'B2 frontier visible');
   const { segs } = grid.getFrontierEdges();
-  const vCount = WORLD.state.frontierLine.geometry.attributes.position.array.length / 3;
-  ok(vCount === (segs.length / 4) * 2, 'B2 frontier vertex count matches edges (' + vCount + ' verts)');
+  // TASK-506: geometry is persistent + drawRange-sized (grow-only buffers) —
+  // the RENDERED vertex count lives in drawRange, not array.length.
+  const vCount = WORLD.state.frontierLine.geometry.drawRange.count;
+  ok(vCount === (segs.length / 4) * 2, 'B2 frontier drawRange matches edges (' + vCount + ' verts of cap ' + (WORLD.state.frontierLine.geometry.attributes.position.array.length / 3) + ')');
 
   // B3 — capture flash pool
   WORLD.onCellConquered(cell, 'player');

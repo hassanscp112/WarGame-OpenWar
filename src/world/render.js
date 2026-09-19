@@ -171,6 +171,10 @@ export function createWorldRender(deps) {
   }
 
   // ── crisp vector territory borders (was rebuildFrontierLines in main.js) ──
+  // TASK-506 OPTIMIZE: one persistent geometry + grow-only Float32Arrays +
+  // drawRange — the old path allocated positions+colors AND disposed/rebuilt
+  // the BufferGeometry on every 150ms rebuild (at large empires that's
+  // megabytes of churn per rebuild + fresh GPU buffers each time).
   function rebuildFrontierLines() {
     const THREE = THREEref();
     const grid = deps.grid();
@@ -181,11 +185,27 @@ export function createWorldRender(deps) {
     if (n === 0) { if (S.frontierLine) S.frontierLine.visible = false; return; }
 
     const R = deps.R() + 3.0;   // just above the overlay (+2.0) — never z-fights
-    const positions = new Float32Array(n * 6);
-    const colors = new Float32Array(n * 6);
     const pCol = CONQUEST_CFG.COLOR.player, eCol = CONQUEST_CFG.COLOR.enemy;
     const PLAYER = CONQUEST_CFG.PLAYER, ENEMY = CONQUEST_CFG.ENEMY;
     const bots = deps.bots();
+    if (!S.frontierLine) {
+      const geo = new THREE.BufferGeometry();
+      const mat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.95, depthWrite: false });
+      S.frontierLine = new THREE.LineSegments(geo, mat);
+      S.frontierLine.renderOrder = 2;   // above the territory overlay (1)
+      S.frontierLine.frustumCulled = false;   // drawRange ≠ array bounds — culling must not clip it
+      scene.add(S.frontierLine);
+      S.flCap = 0;
+    }
+    // grow-only capacity (1.5× headroom to amortize regrowth)
+    if (n * 2 > S.flCap) {
+      S.flCap = Math.max(256, Math.ceil(n * 2 * 1.5));
+      S.flPos = new Float32Array(S.flCap * 3);
+      S.flCol = new Float32Array(S.flCap * 3);
+      S.frontierLine.geometry.setAttribute('position', new THREE.BufferAttribute(S.flPos, 3));
+      S.frontierLine.geometry.setAttribute('color', new THREE.BufferAttribute(S.flCol, 3));
+    }
+    const positions = S.flPos, colors = S.flCol;
     for (let i = 0; i < n; i++) {
       const lat1 = segs[i * 4], lon1 = segs[i * 4 + 1];
       const lat2 = segs[i * 4 + 2], lon2 = segs[i * 4 + 3];
@@ -209,21 +229,11 @@ export function createWorldRender(deps) {
       colors[i * 6] = cr; colors[i * 6 + 1] = cg; colors[i * 6 + 2] = cb;
       colors[i * 6 + 3] = cr; colors[i * 6 + 4] = cg; colors[i * 6 + 5] = cb;
     }
-
-    if (!S.frontierLine) {
-      const geo = new THREE.BufferGeometry();
-      const mat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.95, depthWrite: false });
-      S.frontierLine = new THREE.LineSegments(geo, mat);
-      S.frontierLine.renderOrder = 2;   // above the territory overlay (1)
-      scene.add(S.frontierLine);
-    }
-    // Dispose the OLD geometry — GL buffers are only freed by dispose()
-    S.frontierLine.geometry.dispose();
-    const geo2 = new THREE.BufferGeometry();
-    geo2.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geo2.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    S.frontierLine.geometry = geo2;
-    S.frontierLine.geometry.computeBoundingSphere();
+    const geo = S.frontierLine.geometry;
+    geo.attributes.position.needsUpdate = true;
+    geo.attributes.color.needsUpdate = true;
+    geo.setDrawRange(0, n * 2);
+    geo.computeBoundingSphere();
     S.frontierLine.visible = true;
   }
 
@@ -300,6 +310,9 @@ export function createWorldRender(deps) {
   }
 
   // ── frontline HEAT glow — pulsing additive line over recent combat ──
+  // TASK-506 OPTIMIZE: same persistent-buffer + drawRange pattern as the
+  // frontier lines (this rebuilds every 20 frames — allocation churn hit
+  // hardest here once the heat map sits at its 24k-cell cap in total war).
   function _updateHeatLine(scene, THREE) {
     const grid = deps.grid();
     const segs = grid ? grid.getHotEdges() : null;
@@ -314,9 +327,15 @@ export function createWorldRender(deps) {
       S.heatLine.renderOrder = 3;
       S.heatLine.frustumCulled = false;
       scene.add(S.heatLine);
+      S.heatCap = 0;
     }
     const R = deps.R() + 4.0;   // above the frontier lines (+3)
-    const positions = new Float32Array(n * 6);
+    if (n * 2 > S.heatCap) {
+      S.heatCap = Math.max(256, Math.ceil(n * 2 * 1.5));
+      S.heatPos = new Float32Array(S.heatCap * 3);
+      S.heatLine.geometry.setAttribute('position', new THREE.BufferAttribute(S.heatPos, 3));
+    }
+    const positions = S.heatPos;
     for (let i = 0; i < n; i++) {
       const lat1 = segs[i * 4], lon1 = segs[i * 4 + 1];
       const lat2 = segs[i * 4 + 2], lon2 = segs[i * 4 + 3];
@@ -329,19 +348,21 @@ export function createWorldRender(deps) {
       positions[i * 6 + 4] = R * Math.cos(phi);
       positions[i * 6 + 5] = R * sp * Math.sin(th);
     }
-    S.heatLine.geometry.dispose();
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    S.heatLine.geometry = geo;
+    S.heatLine.geometry.attributes.position.needsUpdate = true;
+    S.heatLine.geometry.setDrawRange(0, n * 2);
     S.heatLine.visible = true;
   }
 
   // ── drone selection rings (TASK-406 audit #15 companion) ────────────
+  // TASK-506 OPTIMIZE: scratch Set reused across frames (was a fresh Set
+  // allocation per call — this runs every render frame).
   function updateDroneRings(drones, frame) {
     const THREE = THREEref();
     const scene = deps.scene();
     if (!scene || !THREE) return;
-    const alive = new Set();
+    if (!S._ringAlive) S._ringAlive = new Set();
+    const alive = S._ringAlive;
+    alive.clear();
     for (const d of drones) {
       if (d.dead || !d.selected) continue;
       alive.add(d.id);
@@ -421,6 +442,9 @@ export function createWorldRender(deps) {
       }
     }
     S.droneRings.clear();
+    S._ringAlive = null;
+    S.flPos = null; S.flCol = null; S.flCap = 0;
+    S.heatPos = null; S.heatCap = 0;
     if (S.texture) S.texture.dispose();
     if (S.devTexture) S.devTexture.dispose();
     S.texture = null; S.devTexture = null;

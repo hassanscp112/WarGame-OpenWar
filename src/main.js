@@ -40,6 +40,11 @@ function buildConquestCtx() {
         else if (isBotStr(o)) { const b = botByStr(o); if (b) b.troops = Math.max(0, b.troops + d); }
         else eTroops += d;
     },
+    // TASK-506 MORALE: ConquestAttack feeds both sides' losses here; attackLogic
+    // reads getMorale for the ±15% effectiveness swing (conquest.js had the hooks
+    // since TASK-406 but nothing fed them — morale was permanently 1).
+    getMorale: (o) => moraleGet(o),
+    onLosses: (o, n) => moraleAddLosses(o, n),
     // OpenFront PlayerExecution: when a tile flips owner, structures standing on
     // it are CAPTURED by the tile's new owner (level kept). Previously null — a
     // captured enemy port kept spawning enemy trade ships and paying enemy gold forever.
@@ -71,6 +76,96 @@ function buildConquestCtx() {
     log: logEvent,
   };
 }
+
+// ═════════════════════════════════════════════════════════════════════
+//  TASK-506 — MORALE v1 (recent-loss ratio → troop effectiveness ±15%)
+//  conquest.js's attackLogic has consumed ctx.getMorale since TASK-406,
+//  but no provider existed — morale was permanently neutral (×1). This
+//  block feeds it: every combat loss decays into a per-side "recent
+//  losses" pool (half-life 20s); pressure p = L / (L + troops + floor)
+//  maps to morale m:
+//      p ≤ 0.10  → 1.15 … 1.00   (fresh army — momentum bonus)
+//      0.10–0.30 → 1.00 … 0.85   (attrition drag)
+//      p ≥ 0.30  → 0.85 floor    (broken — bleed more, conquer slower)
+//  The swing applies to BOTH attack speed and per-tile losses (see
+//  attackLogic's mA / mD factors) for the player AND every bot equally.
+// ═════════════════════════════════════════════════════════════════════
+const MORALE_CFG = {
+    HALF_LIFE_S: 20,     // recent losses halve every 20 s
+    POOL_FLOOR: 5000,    // keeps tiny armies from insta-breaking on one skirmish
+    P_CALM: 0.10,        // pressure at/below this → morale ≥ 1.0 band
+    P_BROKEN: 0.30,      // pressure at/above this → 0.85 floor
+    MAX: 1.15, MIN: 0.85,
+};
+const moraleState = { loss: {} };   // side → exponentially-decayed recent losses
+
+function moraleAddLosses(side, n) {
+    if (!side || !(n > 0)) return;
+    moraleState.loss[side] = (moraleState.loss[side] || 0) + n;
+}
+
+// 1×/s from the render loop (frame % 60) — decays every side's pool.
+function moraleTick() {
+    const k = Math.pow(0.5, 1 / MORALE_CFG.HALF_LIFE_S);
+    for (const s of Object.keys(moraleState.loss)) {
+        moraleState.loss[s] *= k;
+        if (moraleState.loss[s] < 1) delete moraleState.loss[s];
+    }
+}
+
+// PURE pressure → morale map (probe-replayable without a live game).
+function moraleFromPressure(p) {
+    if (p <= 0) return MORALE_CFG.MAX;
+    if (p <= MORALE_CFG.P_CALM) return 1 + (MORALE_CFG.MAX - 1) * (1 - p / MORALE_CFG.P_CALM);
+    if (p >= MORALE_CFG.P_BROKEN) return MORALE_CFG.MIN;
+    const t = (p - MORALE_CFG.P_CALM) / (MORALE_CFG.P_BROKEN - MORALE_CFG.P_CALM);
+    return 1 - (1 - MORALE_CFG.MIN) * t;
+}
+
+function moraleGet(side) {
+    const L = moraleState.loss[side] || 0;
+    if (L <= 0) return MORALE_CFG.MAX;
+    const T = conquestCtx ? Math.max(0, conquestCtx.getTroops(side)) : 0;
+    return moraleFromPressure(L / (L + T + MORALE_CFG.POOL_FLOOR));
+}
+
+// ── morale badge (player): 🚩 ±N% inside the troops stat, like the econ
+//    debt badge — lazy DOM, dirty-write on displayed-percent change. ──
+let _moraleShown = null;
+function _moraleBadgeUpdate() {
+    let el = document.getElementById('moraleBadge');
+    const inGame = window.gameMode === 'mode1' && conquestCtx && !window.startSpawnPhase;
+    if (!inGame) {
+        if (el) el.style.display = 'none';
+        _moraleShown = null;
+        return;
+    }
+    const m = moraleGet(myRole);
+    const pct = Math.round((m - 1) * 100);
+    if (!el) {
+        const t = document.getElementById('pTroops');
+        const host = (t && t.closest && t.closest('.stat')) || document.body;
+        el = document.createElement('span');
+        el.id = 'moraleBadge';
+        host.appendChild(el);
+    }
+    el.style.display = '';
+    if (_moraleShown === pct) return;   // dirty-flag: write DOM only on change
+    _moraleShown = pct;
+    const cls = m >= 1.08 ? '#7fff9e' : (m >= 0.95 ? '#9db4c8' : (m >= 0.88 ? '#ffb056' : '#ff5a5a'));
+    el.textContent = (pct > 0 ? '🚩+' + pct + '%' : (pct < 0 ? '🚩' + pct + '%' : '🚩±0%'));
+    el.style.color = cls;
+    const L = Math.round(moraleState.loss[myRole] || 0);
+    el.title = `الروح المعنوية: ${pct > 0 ? '+' : ''}${pct}% — تتأثر بالخسائر الأخيرة (خسائر حديثة: ${L.toLocaleString('en')} جندي)`;
+}
+
+function _moraleReset() {
+    moraleState.loss = {};
+    _moraleShown = null;
+    const el = document.getElementById('moraleBadge');
+    if (el) el.style.display = 'none';
+}
+window.__morale = { state: moraleState, cfg: MORALE_CFG, get: moraleGet, add: moraleAddLosses, tick: moraleTick, fromPressure: moraleFromPressure };
 
 // Flip a structure to its captor: clone its material (shared cache materials must
 // not be re-tinted in place) and repaint mesh + selection ring in the new color.
@@ -11211,6 +11306,7 @@ function cleanupTerritory() {
     // capture flashes, frontline heat + drone rings are ALL owned by the world
     // render layer now — one reset call disposes everything (no orphan meshes).
     WORLD_RENDER.reset();
+    _moraleReset();   // TASK-506: clear recent-loss pools + hide the badge
     _disposeLineMesh(borderLinesMesh); borderLinesMesh = null;
     _disposeLineMesh(provinceBorderMesh); provinceBorderMesh = null;
     _disposeLineMesh(cityPointsMesh); cityPointsMesh = null;
@@ -15619,6 +15715,13 @@ function loop(now) {
     // pulse + drone selection rings (all safe no-ops before their meshes exist).
     WORLD_RENDER.tickVfx(frame);
     WORLD_RENDER.updateDroneRings(drones, frame);
+
+    // TASK-506: morale upkeep — decay pools 1×/s + player badge refresh
+    // (badge writes are dirty-flagged inside; this is the only call site).
+    if (frame % 60 === 0) {
+        moraleTick();
+        _moraleBadgeUpdate();
+    }
 
     _applyKeyboardNavigation();
     _applyKeyboardZoom();
