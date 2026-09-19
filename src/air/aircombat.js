@@ -55,6 +55,7 @@ export const AirCombat = {
             : kind === 'tank' ? C.AIR_KILL_TANK : C.AIR_KILL_XP_STRUCT;
         p.kills++;
         p.xp += xp;
+        if (kind === 'drone' && W.airStats) W.airStats.droneKills++;   // TASK-401 stat
         const nl = this.vetLevel(p.xp, C);
         if (nl > (p.vetLevel || 0)) {
             p.vetLevel = nl;
@@ -594,9 +595,9 @@ export class AirWreck {
         if (this.dead) return;
         this.life--;
         if (this.life <= 0) { this._end(); return; }
-        // gravity toward the globe + drag
+        // gravity toward the globe + drag (radial is OUTWARD — pull is negative)
         _v1.copy(this.pos).normalize();
-        this.vel.addScaledVector(_v1, 0.35).multiplyScalar(0.985);
+        this.vel.addScaledVector(_v1, -0.35).multiplyScalar(0.985);
         this.pos.add(this.vel);
         // ground impact → crash explosion
         if (this.pos.length() < W.EARTH_RADIUS + 2) {

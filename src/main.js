@@ -6669,7 +6669,8 @@ class Structure {
         if (this.fireRange > 0 && frame % 2 === 1 && this.reload === 0 && this.empT <= 0) {
             for (const p of planes) {
                 if (p.dead || p.parked || p.owner === this.owner) continue;
-                const engageR = Math.min(this.fireRange, airDetectRange(null, p));
+                let engageR = Math.min(this.fireRange, airDetectRange(null, p));
+                if (p.cfg.napOfEarth) engageR *= GAME_CONSTANTS.AIR_HELI_DETECT_MULT;   // TASK-401: nap-of-earth — ground AA sees helis at half range
                 if (haversineDist(this.lat, this.lon, p.lat, p.lon) >= engageR) continue;
                 if (this.type === 'flak' || this.type === 'ciws') {
                     // Barrage: direct probabilistic damage — fast jets jink through
@@ -6687,9 +6688,19 @@ class Structure {
                     if (SFX && SFX.gun) SFX.gun();
                 } else {
                     // sam / iron_dome: guided interceptor at the aircraft
-                    fireSAMPlane(this, p);
+                    // TASK-401 nap-of-earth: helis hug the deck — SAM lock
+                    // breaks half the time (battery still cycles its reload)
+                    if (p.cfg.napOfEarth && Math.random() < GAME_CONSTANTS.AIR_HELI_SAM_MISS) {
+                        spawnExp(p.lat + rnd(-0.05, 0.05), p.lon + rnd(-0.06, 0.06), 1.5, '#888888');   // broken-lock puff
+                        window.__airStats.samLockMisses++;
+                    } else {
+                        // TASK-401 RWR: lock tone warns player crews as the battery fires
+                        if (p.owner === myRole && SFX && SFX.rwr) SFX.rwr();
+                        p.rwrT = GAME_CONSTANTS.AIR_RWR_FRAMES;
+                        fireSAMPlane(this, p);
+                        window.__airStats.samAtPlanes++;
+                    }
                     this.reload = this.maxReload;
-                    window.__airStats.samAtPlanes++;
                 }
                 break;   // one engagement per cycle
             }
@@ -7038,13 +7049,8 @@ class Missile {
     }
 }
 
-// P9 FIX: Pre-allocated scratch vectors for parked plane orbit math (avoids ~10 Vector3/frame per plane)
-const _parkV1 = new THREE.Vector3();
-const _parkV2 = new THREE.Vector3();
-const _parkV3 = new THREE.Vector3();
-const _parkV4 = new THREE.Vector3();
-const _parkV5 = new THREE.Vector3();
-const _parkV6 = new THREE.Vector3();
+// P9 FIX (historical): parked-orbit scratch vectors lived here — moved to
+// the AirCombat module (src/air/aircombat.js) with parkedTick in TASK-401.
 
 // ═══════════════════════════════════════════════════════════════════
 //  TASK-201: AIR COMBAT CORE — stealth-aware detection, AAM tracer
@@ -7118,6 +7124,7 @@ function _spawnFlares(plane) {
 class AAM {
     constructor(shooter, tgt) {
         this.owner = shooter.owner; this.tgt = tgt; this.dead = false;
+        this.src = shooter;   // TASK-401: kill credit → veterancy (module awardKill)
         this.pos = shooter.pos.clone();
         this.speed = GAME_CONSTANTS.AIR_AAM_SPEED;
         this.life = 110;   // frames before self-destruct (fuel exhaustion)
@@ -7128,7 +7135,7 @@ class AAM {
         p += (1 - Math.min(1, d / C.AIR_AAM_RANGE)) * 0.20;                     // closer = deadlier
         if (!shooter.cfg.allAspect && !_isBehind(shooter, tgt)) p -= 0.25;      // rear-aspect seekers
         else if (shooter.cfg.allAspect) p += 0.05;
-        p += (shooter.cfg.turnRate - tgt.cfg.turnRate) * 1.2;                   // agility edge
+        p += (shooter.cfg.turnRate - (tgt.cfg.turnRate || 0)) * 1.2;          // agility edge (drones have none — NaN guard)
         p -= tgt.cfg.spd * 0.02;                                                // fast targets jink
         if (tgt.cfg.role === 'stealth') p *= 0.45;                              // B-2 low observable
         if (tgt.pkey === 'su57' || tgt.pkey === 'f22') p *= 0.7;
@@ -7137,7 +7144,7 @@ class AAM {
         if (tgt.parked) p = 0.95;                                               // sitting duck on the ramp
         this.pKill = Math.max(0.05, Math.min(0.92, p));
         this.willHit = Math.random() < this.pKill;
-        this.dmg = C.AIR_AAM_DMG * (shooter.cfg.gunCaliber >= 1 ? 1 : 0.8);
+        this.dmg = C.AIR_AAM_DMG * (shooter.cfg.gunCaliber >= 1 ? 1 : 0.8) * AirCombat.vetDmgMul(shooter);   // TASK-401: veteran shooters hit harder
         // visual: slim white tracer
         if (!GEO_CACHE['aamBody']) {
             const g = new THREE.CylinderGeometry(0.22, 0.22, 3.4, 5);
@@ -7178,6 +7185,7 @@ class AAM {
             t.hit(this.dmg, this.owner);
             spawnExp(t.lat, t.lon, 4, '#ff8844');
             if (SFX && SFX.exp) SFX.exp(30);
+            if (t.dead) AirCombat.awardKill(this.src, AirCombat.killKind(t), AIRW);   // TASK-401 veterancy
         } else {
             spawnExp(t.lat, t.lon, 1.5, '#888888');   // near miss
         }
@@ -7213,6 +7221,7 @@ const AIRW = {
     haversineDist,
     rnd,
     vec3ToLatLon,
+    spawnExp,   // module strike methods + AirWreck ground-impact boom
     airDetectRange: (o, t) => airDetectRange(o, t),
     isBehind: _isBehind,
     gunTracer: _spawnGunTracer,
@@ -7256,6 +7265,9 @@ class Plane {
         this.flares = (cfg && cfg.flares) || 0; this.maxFlares = this.flares;
         this.airTgt = null;        // current dogfight target
         this.gndTgt = null;        // current strike target
+        // TASK-401: veterancy state (kills → XP → levels; AirCombat module)
+        this.xp = 0; this.kills = 0; this.vetLevel = 0;
+        this._airC = GAME_CONSTANTS;   // constants handle for AirCombat.W_C
         this.gunT = 0;             // gun burst cooldown
         this.strikeCd = 0;         // weapon-release cooldown (per pass)
         this.overshootT = 0;       // post-pass fly-through (breaks orbit lock)
@@ -7348,55 +7360,10 @@ class Plane {
         if (this.selRing) this.selRing.visible = !!this.selected;
 
         if (this.parked) {
-             if (this.baseStruct && !this.baseStruct.dead) {
-                 // ── TASK-201: rearm + refuel on the ramp ──
-                 const C = GAME_CONSTANTS;
-                 if (this.fuel < this.maxFuel) this.fuel = Math.min(this.maxFuel, this.fuel + this.maxFuel / C.AIR_REARM_FUEL_FRAMES);
-                 if (this.fuel >= this.maxFuel * 0.9) this._rtbForFuel = false;   // re-arm the one-shot warn after topping up
-                 if (this.maxAa > 0) this.aaAmmo = Math.min(this.maxAa, this.aaAmmo + this.maxAa / C.AIR_REARM_AMMO_FRAMES);
-                 if (this.maxAg > 0) this.agAmmo = Math.min(this.maxAg, this.agAmmo + this.maxAg / C.AIR_REARM_AMMO_FRAMES);
-                 if (this.maxGun > 0) this.gunAmmo = Math.min(this.maxGun, this.gunAmmo + this.maxGun / C.AIR_REARM_AMMO_FRAMES);
-                 if (this.maxFlares > 0) this.flares = Math.min(this.maxFlares, this.flares + this.maxFlares / C.AIR_REARM_AMMO_FRAMES);
-                 this.rearmedFlag = this.fuel >= this.maxFuel * 0.99 && this.aaAmmo >= this.maxAa * 0.99 &&
-                     this.agAmmo >= this.maxAg * 0.99 && this.gunAmmo >= this.maxGun * 0.99 && this.flares >= this.maxFlares * 0.99;
-                 // AI air wings auto-scramble once fueled/armed (offline bots only)
-                 if (!isOnline && this.owner !== myRole && this.rearmedFlag && frame >= (this.scrambleAt || 0)) {
-                     this._botScramble();
-                 }
-                 // P9 FIX: Use scratch vectors — zero allocations per frame
-                 const bPos = _parkV1.copy(this.baseStruct.pos).normalize();
-                 const angle = (frame + (this.id * 100)) * 0.03;
-                 
-                 // Tangent basis (computed once, reused for both current and ahead)
-                 const right = _parkV2.set(0,1,0).cross(bPos);
-                 if(right.lengthSq() < 0.01) right.set(1,0,0).cross(bPos);
-                 right.normalize();
-                 const up = _parkV3.copy(bPos).cross(right).normalize();
-                 
-                 // Current orbit position
-                 const cosA = Math.cos(angle) * 3, sinA = Math.sin(angle) * 3;
-                 this.pos.copy(bPos).multiplyScalar(EARTH_RADIUS + 50.0);
-                 this.pos.add(_parkV4.copy(right).multiplyScalar(cosA));
-                 this.pos.add(_parkV5.copy(up).multiplyScalar(sinA));
-                 
-                 this.mesh.position.copy(this.pos);
-                 this.mesh.up.copy(bPos);
-                 this.prevPos = this.prevPos ? this.prevPos.copy(this.pos) : this.pos.clone();
-                 
-                 // Ahead position (for lookAt orientation) — reuse scratch vectors
-                 const aheadAngle = angle + 0.1;
-                 const cosA2 = Math.cos(aheadAngle) * 3, sinA2 = Math.sin(aheadAngle) * 3;
-                 _parkV6.copy(bPos).multiplyScalar(EARTH_RADIUS + 50.0);
-                 _parkV6.add(_parkV4.copy(right).multiplyScalar(cosA2));
-                 _parkV6.add(_parkV5.copy(up).multiplyScalar(sinA2));
-                 
-                 this.mesh.lookAt(_parkV6);
-                 if (this.modelSrc === 'obj') this.mesh.rotateY(Math.PI/2);
-                 this.mesh.visible = true; 
-                 
-             } else {
-                 this.parked = false; // base destroyed, launch into free patrol
-             }
+             // TASK-401: the whole parked branch (rearm/refuel on the ramp,
+             // bot auto-scramble, holding orbit) now lives in the AirCombat
+             // module — parkedTick(this, AIRW) is a 1:1 behavioral port.
+             AirCombat.parkedTick(this, AIRW);
              return;
         }
 
@@ -7427,13 +7394,16 @@ class Plane {
                 q.cfg.role === 'awacs' && haversineDist(this.lat, this.lon, q.lat, q.lon) < 800);
         }
 
-        // air-combat: scan (staggered) + weapons (fast cadence)
-        if (frame % 15 === this.id % 15) this._dogfightScan();
-        if (frame % 4 === this.id % 4) this._dogfightWeapons();
+        // air-combat: scan (staggered) + weapons (fast cadence) — TASK-401:
+        // these now live in the AirCombat module (src/air/aircombat.js)
+        AirCombat.tickRefuel(this, AIRW);                    // tanker/AWACS top-up
+        AirCombat.squadronSteer(this, AIRW);                 // wingman echelon station-keeping
+        if (frame % 15 === this.id % 15) AirCombat.dogfightScan(this, AIRW);
+        if (frame % 4 === this.id % 4) AirCombat.dogfightWeapons(this, AIRW);
 
         // strike tick scans structs — staggered per-plane for perf (steering
         // persists between ticks via tlat/tlon)
-        if (this.mode === 'attack' && frame % 4 === this.id % 4) this._strikeTick();
+        if (this.mode === 'attack' && frame % 4 === this.id % 4) AirCombat.strikeTick(this, AIRW);
 
         // Dogfight steering overrides the mission heading while engaged
         // (except during a post-burst overshoot fly-through).
@@ -7441,12 +7411,15 @@ class Plane {
             this.tlat = this.airTgt.lat; this.tlon = this.airTgt.lon;
         }
 
-        let targetVec = latLonToVec3(this.tlat, this.tlon, EARTH_RADIUS + 50.0); 
+        // TASK-401 doctrine altitudes: helis transit LOW, AWACS/tankers HIGH
+        // (PCFG alt; parkedTick uses the same field).
+        const ALT = this.cfg.alt || 50;
+        let targetVec = latLonToVec3(this.tlat, this.tlon, EARTH_RADIUS + ALT); 
         let dist = this.pos.distanceTo(targetVec);
 
         if (this.mode === 'return') {
             if (this.baseStruct && !this.baseStruct.dead) {
-                targetVec = latLonToVec3(this.baseStruct.lat, this.baseStruct.lon, EARTH_RADIUS + 50.0);
+                targetVec = latLonToVec3(this.baseStruct.lat, this.baseStruct.lon, EARTH_RADIUS + ALT);
                 dist = this.pos.distanceTo(targetVec);
                 if (dist < 2) {
                     this.parked = true;
@@ -7471,13 +7444,13 @@ class Plane {
         // heavy airframes (only bites when maneuvering near the target).
         slerpSpeed *= (0.55 + this.cfg.turnRate * 1.8);
         
-        let curVec = curNormalized.clone().lerp(targetNormalized, slerpSpeed).normalize().multiplyScalar(EARTH_RADIUS + 50.0);
+        let curVec = curNormalized.clone().lerp(targetNormalized, slerpSpeed).normalize().multiplyScalar(EARTH_RADIUS + ALT);
         this.lat = vec3ToLatLon(curVec).lat; this.lon = vec3ToLatLon(curVec).lon;
         
         this.mesh.position.copy(curVec);
         this.mesh.up.copy(curVec).normalize();
         
-        let aheadVec = curVec.clone().normalize().lerp(targetNormalized, 0.1).normalize().multiplyScalar(EARTH_RADIUS + 50.0);
+        let aheadVec = curVec.clone().normalize().lerp(targetNormalized, 0.1).normalize().multiplyScalar(EARTH_RADIUS + ALT);
         this.mesh.lookAt(aheadVec);
         
         // OBJ jets nose +X; GLB/proxy already fly +Z
@@ -7487,6 +7460,8 @@ class Plane {
         this.pos.copy(curVec);
         // light contrail
         if (Math.random() < 0.12) createTrailMesh(curVec);
+        // TASK-401: afterburner / wingtip contrails / damage smoke (module)
+        AirCombat.vfxTick(this, AIRW);
     }
 
     // ═══ TASK-201: combat methods ═══
@@ -7497,12 +7472,14 @@ class Plane {
         this.flares--;
         window.__airStats.flaresUsed++;
         _spawnFlares(this);
-        return Math.random() < GAME_CONSTANTS.AIR_FLARE_DECOY;
+        // TASK-401: veterans dispense smarter decoys (+chance per level)
+        return Math.random() < GAME_CONSTANTS.AIR_FLARE_DECOY + (this.vetLevel || 0) * GAME_CONSTANTS.AIR_VET_DECOY_PER_LVL;
     }
 
     hit(dmg, by) {
         if (this.dead) return;
-        this.hp -= dmg;
+        // TASK-401: veterans juke — incoming damage scales down per level
+        this.hp -= dmg * (1 - (this.vetLevel || 0) * GAME_CONSTANTS.AIR_VET_EVADE_PER_LVL);
         if (by) this.lastHitBy = by;
         if (this.hp <= 0) this.down(by);
     }
@@ -7512,6 +7489,8 @@ class Plane {
         this.dead = true;
         window.__airStats.planesDowned++;
         spawnExp(this.lat, this.lon, 9, '#ff8833');
+        AirCombat.spawnWreck(this, AIRW);   // TASK-401: burning hulk falls
+        AirCombat.leaderDown(this, AIRW);   // TASK-401: wingman takes command
         if (SFX && SFX.exp) SFX.exp(60);
         if (this.owner === myRole) logEvent(`💥 أسقط العدو طائرتنا ${this.cfg.name}!`, 'err');
         else if (by === myRole) logEvent(`🎉 أسقطنا ${this.cfg.name} للعدو!`, 'info');
@@ -7525,6 +7504,8 @@ class Plane {
         this.dead = true;
         window.__airStats.planesDowned++;
         spawnExp(this.lat, this.lon, 7, '#ffaa00');
+        AirCombat.spawnWreck(this, AIRW);   // TASK-401: hulk falls out of the sky
+        AirCombat.leaderDown(this, AIRW);   // dead leader → wingman takes over
         if (this.owner === myRole) logEvent(`⛽ ${this.cfg.name}: نفد الوقود — تحطمت!`, 'err');
         scene.remove(this.mesh);
         disposeMeshDeep(this.mesh);
@@ -7532,205 +7513,13 @@ class Plane {
         if (this.selRing && this.selRing.material) this.selRing.material.dispose();
     }
 
-    // ── Air-to-air target acquisition ──
-    _dogfightScan() {
-        const C = GAME_CONSTANTS;
-        this.airTgt = null;
-        if (this.cfg.role === 'awacs') {
-            // AWACS never fights — it flees contacts toward its base
-            for (const q of planes) {
-                if (q.dead || q.owner === this.owner || q.parked) continue;
-                if (haversineDist(this.lat, this.lon, q.lat, q.lon) < 250) {
-                    this.mode = 'return';
-                    break;
-                }
-            }
-            return;
-        }
-        if (this.aaAmmo <= 0 && this.gunAmmo <= 0) return;   // toothless
-        // Fighters/interceptors hunt; everything else defends only when
-        // an enemy is right on top of them (bombers press on to the target).
-        const aggressive = this.cfg.role === 'air' || this.cfg.role === 'intercept';
-        let best = null, bestD = Infinity;
-        for (const q of planes) {
-            if (q.dead || q.owner === this.owner || q.parked) continue;
-            const d = haversineDist(this.lat, this.lon, q.lat, q.lon);
-            const dr = airDetectRange(this, q);
-            if (d >= dr) continue;                       // stealth gate
-            if (!aggressive) {
-                const defensiveR = (q.airTgt === this) ? 160 : C.AIR_GUN_RANGE;
-                if (d >= defensiveR) continue;
-            }
-            if (d < bestD) { bestD = d; best = q; }
-        }
-        this.airTgt = best;
-    }
-
-    // ── Air-to-air weapons: AAM salvos + gun passes ──
-    _dogfightWeapons() {
-        const C = GAME_CONSTANTS;
-        const t = this.airTgt;
-        if (!t || t.dead) return;
-        const d = haversineDist(this.lat, this.lon, t.lat, t.lon);
-        // AAM launch: within envelope, aspect allows, cooldown ready
-        if (d < C.AIR_AAM_RANGE && this.aaAmmo > 0 && this.fireT <= 0) {
-            if (this.cfg.allAspect || _isBehind(this, t) || d < C.AIR_GUN_RANGE) {
-                const salvo = Math.max(1, Math.min(this.cfg.aamCount || 1, this.aaAmmo));
-                for (let i = 0; i < salvo; i++) aamMissiles.push(new AAM(this, t));
-                this.aaAmmo -= salvo;
-                this.fireT = 110;
-                if (SFX && SFX.launch) SFX.launch('small');
-                return;
-            }
-        }
-        // Gun pass: close + aligned down the shooter's nose
-        if (d < C.AIR_GUN_RANGE && this.gunAmmo > 0 && this.gunT <= 0 && this.cfg.gunCaliber > 0) {
-            const fwd = _airV1.copy(this.pos).sub(this.prevPos || this.pos);
-            if (fwd.lengthSq() > 1e-9) {
-                fwd.normalize();
-                const toT = _airV2.copy(t.pos).sub(this.pos).normalize();
-                const align = fwd.dot(toT);
-                if (align > 0.75) {
-                    const burst = Math.min(35, this.gunAmmo);
-                    this.gunAmmo -= burst;
-                    t.hit(burst * C.AIR_GUN_BURST_DMG * this.cfg.gunCaliber * align / 10, this.owner);
-                    window.__airStats.gunBursts++;
-                    _spawnGunTracer(this.pos, t.pos);
-                    if (SFX && SFX.gun) SFX.gun();
-                    this.gunT = 22;
-                    this.overshootT = 40;   // fly through, then re-attack
-                }
-            }
-        }
-    }
-
-    // ── Air-to-ground: role-differentiated strike runs ──
-    _strikeTick() {
-        const C = GAME_CONSTANTS;
-        // acquire / validate the ground target near the ordered point
-        if (!this.gndTgt || this.gndTgt.dead) {
-            this.gndTgt = null;
-            let best = null, bestD = 300;
-            const _cas = (this.cfg.role === 'cas' || this.cfg.role === 'heli');
-            for (const s of structs) {
-                if (s.dead || s.owner === this.owner) continue;
-                const d = haversineDist(this.tlat, this.tlon, s.lat, s.lon);
-                if (d < bestD) { bestD = d; best = s; }
-            }
-            // TASK-302: enemy armor is a prime ground target — CAS (A-10/
-            // Apache) hunts divisions with a priority multiplier
-            for (const t of tanks) {
-                if (t.dead || t.owner === this.owner) continue;
-                let d = haversineDist(this.tlat, this.tlon, t.lat, t.lon);
-                if (_cas) d *= 0.55;
-                if (d < bestD) { bestD = d; best = t; }
-            }
-            this.gndTgt = best;
-            if (!best) { this.mode = 'patrol'; return; }   // nothing to strike here
-        }
-        const t = this.gndTgt;
-        const d = haversineDist(this.lat, this.lon, t.lat, t.lon);
-        const role = this.cfg.role;
-
-        if (this.pkey === 'gunship') { this._gunshipOrbit(t, d); return; }
-
-        // pass steering (gunship orbits instead — handled above)
-        if (this.overshootT <= 0) { this.tlat = t.lat; this.tlon = t.lon; }
-
-        const releaseRange = role === 'ground' ? C.AIR_STRIKE_RANGE_BOMBER
-            : (role === 'cas' || role === 'heli') ? C.AIR_STRIKE_RANGE_CAS
-            : C.AIR_STRIKE_RANGE_DEFAULT;
-        if (d > releaseRange || this.strikeCd > 0) return;
-
-        if (this.agAmmo >= 1) {
-            if (role === 'ground') this._carpetBomb(t);
-            else if (role === 'cas') this._precisionStrike(t);
-            else this._lightStrike(t);
-            this.agAmmo -= 1;
-            this.strikeCd = 150;
-            this.overshootT = 55;
-            window.__airStats.strikeRuns++;
-        } else if (this.gunAmmo > 0 && this.cfg.gunCaliber > 0 && role !== 'ground') {
-            this._gunStrafe(t);   // dry on ordnance → gun harassment
-        } else {
-            this.mode = 'return';   // Winchester → RTB to rearm
-            if (this.owner === myRole) logEvent(`🔙 ${this.cfg.name}: نفد الذخيرة — عودة للتسليح`, 'info');
-        }
-    }
-
-    // Bomber (Su-24): area carpet — a stick of bombs across the footprint.
-    _carpetBomb(aim) {
-        const R = 28;   // km blast footprint
-        for (const s of structs) {
-            if (s.dead || s.owner === this.owner) continue;
-            if (haversineDist(aim.lat, aim.lon, s.lat, s.lon) < R) s.hit(90);
-        }
-        _tankBlast(aim.lat, aim.lon, R, 90, this.owner);   // TASK-302: armor under the stick
-        for (let i = 0; i < 6; i++) {
-            spawnExp(aim.lat + rnd(-0.2, 0.2), aim.lon + rnd(-0.25, 0.25), rnd(3, 6), '#ffaa44');
-        }
-        if (SFX && SFX.exp) SFX.exp(50);
-        if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(aim.lat, aim.lon, R, 1.3);
-    }
-
-    // A-10 / heli (CAS): anti-armor precision — missiles + the gun, hard-target bonus.
-    _precisionStrike(t) {
-        const HARD = { launcher: 1, sam: 1, himars: 1, ciws: 1, iron_dome: 1, nuke_plant: 1 };
-        if (t.isTank) t.hit(170, this.owner);                    // TASK-302: tank-buster loadout
-        else t.hit(HARD[t.type] ? 190 : 120);
-        spawnExp(t.lat, t.lon, 4, '#ffcc66');
-        if (SFX && SFX.exp) SFX.exp(30);
-        if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(t.lat, t.lon, 12, 0.7);
-    }
-
-    // Fighters / multirole: light standoff AGM pop at a single target.
-    _lightStrike(t) {
-        if (t.isTank) t.hit(45, this.owner);                     // TASK-302: AGMs glance off armor
-        else t.hit(55);
-        spawnExp(t.lat, t.lon, 3, '#ffdd88');
-        if (SFX && SFX.exp) SFX.exp(20);
-        if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(t.lat, t.lon, 10, 0.5);
-    }
-
-    // Dry bomberless gun harassment for aircraft still packing rounds.
-    _gunStrafe(t) {
-        const burst = Math.min(30, this.gunAmmo);
-        this.gunAmmo -= burst;
-        t.hit(burst * GAME_CONSTANTS.AIR_GUN_BURST_DMG * this.cfg.gunCaliber / 12);
-        _spawnGunTracer(this.pos, t.pos);
-        if (SFX && SFX.gun) SFX.gun();
-        if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(t.lat, t.lon, 8, 0.3);
-        this.strikeCd = 90;
-        window.__airStats.strikeRuns++;
-    }
-
-    // AC-130 gunship: sustained orbit — pulses damage around the aim point.
-    _gunshipOrbit(t, d) {
-        const C = GAME_CONSTANTS;
-        if (frame % 30 === this.id % 30) {
-            const a = frame * 0.02 + this.id;
-            this.tlat = t.lat + Math.cos(a) * 0.25;
-            this.tlon = t.lon + Math.sin(a) * 0.25;
-        }
-        if (d > C.AIR_GUNSHIP_ORBIT + 15 || this.strikeCd > 0) return;
-        if (this.agAmmo >= 0.25) {
-            this.agAmmo -= 0.25;
-            for (const s of structs) {
-                if (s.dead || s.owner === this.owner) continue;
-                if (haversineDist(t.lat, t.lon, s.lat, s.lon) < 26) s.hit(16);
-            }
-            _tankBlast(t.lat, t.lon, 26, 16, this.owner);   // TASK-302: sweeping fire vs armor
-            spawnExp(t.lat + rnd(-0.08, 0.08), t.lon + rnd(-0.1, 0.1), 2.5, '#ffaa55');
-            if (SFX && SFX.gun) SFX.gun();
-            if (conquestGrid && conquestGrid.applyDevastation) conquestGrid.applyDevastation(t.lat, t.lon, 15, 0.4);
-            window.__airStats.strikeRuns++;
-            this.strikeCd = 40;   // ~0.7s between pulses = sustained rain
-            if (this.agAmmo < 0.25) {
-                this.mode = 'return';
-                if (this.owner === myRole) logEvent(`🔙 ${this.cfg.name}: نفد الذخيرة — عودة للتسليح`, 'info');
-            }
-        }
-    }
+    // ═══ TASK-401: _dogfightScan / _dogfightWeapons / _strikeTick /
+    // _carpetBomb / _precisionStrike / _lightStrike / _gunStrafe /
+    // _gunshipOrbit MOVED to the AirCombat module (src/air/aircombat.js) —
+    // update() calls AirCombat.dogfightScan/dogfightWeapons/strikeTick
+    // through the AIRW bridge. New module-only behavior: SEAD anti-rad
+    // passes, squadron concentration, veterancy multipliers, doctrine
+    // release ranges, 30f-cached strike target scans.
 
     // AI (offline bots): launch from the ramp into a CAP or strike mission.
     _botScramble() {
@@ -10804,6 +10593,7 @@ function updateSelectionPanel() {
             statsHtml += `<div class="sstat"><span>💥 جو-أرض</span><span>${Math.floor(unit.agAmmo)}/${unit.maxAg}</span></div>`;
             statsHtml += `<div class="sstat"><span>🔫 رشاش</span><span>${Math.floor(unit.gunAmmo)}/${unit.maxGun}</span></div>`;
             statsHtml += `<div class="sstat"><span>✨ شعلات</span><span>${Math.floor(unit.flares)}/${unit.maxFlares}</span></div>`;
+            statsHtml += `<div class="sstat"><span>⭐ رتبة</span><span>${AIR_VET_NAMES[unit.vetLevel || 0]}${unit.kills ? ' · ' + unit.kills + '⚔' : ''}</span></div>`;
         } else if (unit instanceof Warship) {
             statsHtml += `<div class="sstat"><span>الوضع</span><span>${unit.invading ? 'إنزال ⚔' : unit.mode}</span></div>`;
             if (unit.hullClass === 'transport') statsHtml += `<div class="sstat"><span>القوات</span><span>${Math.floor(unit.troops).toLocaleString('en')}</span></div>`;
@@ -10884,6 +10674,9 @@ window.orderPlanesAt = function(mode, lat, lon) {
         p.gndTgt = null;   // re-acquire near the new aim point
         if (isOnline) sendAction({ type: 'plane_move', ptype: p.pkey, pid: p.id, tlat: p.tlat, tlon: p.tlon, mode });
     });
+    // TASK-401: a multi-plane order forms a squadron — highest-XP leads,
+    // wingmen fly echelon and concentrate on the leader's bandit
+    AirCombat.formSquadron(sel.planes, AIRW);
     logEvent(`تم توجيه ${sel.planes.length} طائرة: ${mode}`, 'info');
 };
 // (legacy per-plane right-click order handler removed — replaced by radial menu)
@@ -11834,6 +11627,7 @@ function initWorld(difficulty, pCountryKey='usa', eCountryKey='random', gameMode
     missiles.forEach(m => { if(m.mesh) { scene.remove(m.mesh); disposeMeshDeep(m.mesh); } });
     planes.forEach(p => { if(p.mesh) { scene.remove(p.mesh); disposeMeshDeep(p.mesh); } if(p.selRing) { scene.remove(p.selRing); disposeMeshDeep(p.selRing); } });
     aamMissiles.forEach(m => { if(m.mesh) { scene.remove(m.mesh); if(m.mesh.material) _recycleMat(m.mesh.material); } });   // TASK-201 AAM tracers
+    AirCombat.clearWrecks();                          // TASK-401 falling wrecks
     exps.forEach(e => { scene.remove(e); disposeMeshDeep(e); });
     particles.forEach(p => { scene.remove(p); disposeMeshDeep(p); });
     tradeShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
@@ -13278,13 +13072,17 @@ function gameFrame() {
     
     // In-place compaction (swap-and-pop) — avoids per-frame array allocation/GC
     _compactAlive(missiles, m => m.update());
-    _compactAlive(drones, d => d.update());          // TASK-204 drone system
+    // (AUDIT FIX #3 + TASK-401 re-check: drones are updated EXACTLY ONCE per
+    // tick — in the OpenFront block below. The duplicate line that used to
+    // sit here doubled speed/fuel/scan cadence + CPU.)
     _updateTransients();                             // tracers / debris / EMP rings
     _updateCraters();                                // fading impact scars
     for (let p of planes) p.update();
     _compactDead(planes);
-    // TASK-201: air-to-air missile tracers
+    // TASK-201: air-to-air missile tracers (+ TASK-401 ArmShots ride the
+    // same pipeline — the module pushes them into aamMissiles)
     _compactAlive(aamMissiles, m => m.update());
+    AirCombat.tickWrecks(AIRW);                      // TASK-401: falling wrecks
     
     // Update OpenFront objects
     _compactAlive(tradeShips, ts => ts.update());
@@ -13559,6 +13357,7 @@ function backToMenu() {
     missiles.forEach(m => { if(m.mesh) { scene.remove(m.mesh); disposeMeshDeep(m.mesh); } });
     planes.forEach(p => { if(p.mesh) { scene.remove(p.mesh); disposeMeshDeep(p.mesh); } if(p.selRing) { scene.remove(p.selRing); disposeMeshDeep(p.selRing); } });
     aamMissiles.forEach(m => { if(m.mesh) { scene.remove(m.mesh); if(m.mesh.material) _recycleMat(m.mesh.material); } });   // TASK-201 AAM tracers
+    AirCombat.clearWrecks();                          // TASK-401 falling wrecks
     tradeShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
     transportShips.forEach(ts => { if(ts.mesh) { scene.remove(ts.mesh); disposeMeshDeep(ts.mesh); } if(ts.pathLine) { scene.remove(ts.pathLine); disposeMeshDeep(ts.pathLine); } });
     warships.forEach(w => { if(w.mesh) { scene.remove(w.mesh); disposeMeshDeep(w.mesh); } w.shells.forEach(sh => scene.remove(sh.mesh)); });
